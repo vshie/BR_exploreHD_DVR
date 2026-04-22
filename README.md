@@ -20,8 +20,8 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 ### Manual image from `.tar` (on the Pi or another Linux host)
 
 ```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.5.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.5 (or your build tag)
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.6.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.6 (or your build tag)
 ```
 
 Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.
@@ -41,6 +41,7 @@ Then register the extension in BlueOS pointing at that image, or run with the sa
 | `BOOT_MIN_SLEEP_S` | `20` | Minimum sleep before loadavg gate |
 | `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
+| `EXTERNAL_STORAGE_DEVICE` | _(unset)_ | Optional explicit partition to mount at `/mnt/usb` (e.g. `/dev/nvme0n1p1`) if auto-detection does not pick your drive |
 
 ## Recording layout
 
@@ -48,7 +49,7 @@ Then register the extension in BlueOS pointing at that image, or run with the sa
 /app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/seg_00001.ts
 ```
 
-USB mirror uses `/mnt/usb/BR_exploreHD_DVR/` as the root instead of `/app/recordings` when eligible.
+When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
 
 ## API (short)
 

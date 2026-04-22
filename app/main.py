@@ -20,6 +20,7 @@ import usb_storage
 from boot_manager import SEGMENT_SECONDS_DEFAULT, run_boot_sequence
 from mcm_client import DEFAULT_MCM_BASE, list_h264_rtsp_streams
 from recorder import RecorderManager
+from settings_store import load_settings, save_settings
 from system_telemetry import get_all_telemetry, get_disk_free_mb
 
 logging.basicConfig(level=logging.INFO)
@@ -97,10 +98,14 @@ def _boot_worker():
                 return
             segment_ns = int(os.environ.get("SEGMENT_SECONDS", str(SEGMENT_SECONDS_DEFAULT))) * 1_000_000_000
             mgr = RecorderManager(sr, streams, segment_ns, _disk_free_for_session, on_disk_critical=_on_disk_critical)
+            auto_rec = bool(load_settings().get("auto_record_on_boot", True))
             with _state_lock:
                 manager = mgr
-                boot_stage = "recording"
-            mgr.start_all()
+                boot_stage = "recording" if auto_rec else "standby"
+            if auto_rec:
+                mgr.start_all()
+            else:
+                logger.info("auto_record_on_boot is false; recorders created but not started (standby)")
         except Exception as e:
             logger.exception("Boot worker failed")
             with _state_lock:
@@ -132,7 +137,7 @@ def register_service():
             "description": "Multi-camera MPEG-TS recorder for exploreHD / MCM RTSP streams",
             "icon": "mdi-video-box-multiple",
             "company": "Blue Robotics",
-            "version": "1.0.5",
+            "version": "1.0.6",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -159,6 +164,10 @@ def route_status():
     usb_free = usb.get("free_mb") if usb.get("mounted") else None
     telem = get_all_telemetry(recording_ok=recording, usb_disk_free_mb=usb_free)
     warn_streams = len(snap) > 0 and len(snap) < 4
+    try:
+        auto_boot = bool(load_settings().get("auto_record_on_boot", True))
+    except Exception:
+        auto_boot = True
     resp = jsonify(
         {
             "boot_stage": stage,
@@ -166,6 +175,7 @@ def route_status():
             "recording": recording,
             "stopped_by_user": stopped_by_user,
             "disk_stopped": _disk_stopped,
+            "auto_record_on_boot": auto_boot,
             "streams_count": len(snap),
             "streams_warning": warn_streams,
             "session_root": sr,
@@ -199,6 +209,31 @@ def route_streams():
             }
         )
     return jsonify(out)
+
+
+@app.route("/settings", methods=["GET"])
+def route_settings_get():
+    try:
+        return jsonify(load_settings())
+    except Exception as e:
+        logger.exception("settings get failed")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/settings", methods=["POST"])
+def route_settings_post():
+    data = request.get_json(silent=True) or {}
+    try:
+        updates: Dict[str, Any] = {}
+        if "auto_record_on_boot" in data:
+            updates["auto_record_on_boot"] = bool(data["auto_record_on_boot"])
+        if not updates:
+            return jsonify({"success": False, "message": "No recognized fields"}), 400
+        merged = save_settings(updates)
+        return jsonify({"success": True, "settings": merged})
+    except Exception as e:
+        logger.exception("settings post failed")
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route("/start", methods=["POST"])

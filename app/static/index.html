@@ -54,6 +54,12 @@
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn.primary { border-color: var(--acc); color: var(--acc); }
     .btn.danger { border-color: var(--err); color: var(--err); }
+    .btn.latched {
+      border-color: var(--ok);
+      color: var(--ok);
+      box-shadow: inset 0 0 0 1px var(--ok);
+      background: #13251c;
+    }
     .expand { cursor: pointer; user-select: none; color: var(--acc); }
     .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
     .modal { background: var(--card); border: 1px solid var(--bd); border-radius: 12px; padding: 20px; max-width: 480px; width: 92%; }
@@ -83,6 +89,9 @@
     <div v-else-if="status.recording" class="banner ok">
       Recording active ({{ status.streams_count }} stream<span v-if="status.streams_count!==1">s</span>).
     </div>
+    <div v-else-if="status.boot_stage === 'standby'" class="banner">
+      <strong>Standby</strong> — auto-record on boot is off. Press <strong>Start / resume</strong> when you want to record (setting is saved on the recordings drive).
+    </div>
     <div v-else-if="status.boot_stage && status.boot_stage !== 'recording'" class="banner">
       Boot: {{ status.boot_stage }}…
     </div>
@@ -91,6 +100,16 @@
       <div class="row" style="margin-bottom:12px">
         <button class="btn" @click="stopRec" :disabled="!status.cams?.length">Stop all</button>
         <button class="btn primary" @click="startRec" :disabled="!status.cams?.length && status.boot_error">Start / resume</button>
+        <button
+          type="button"
+          class="btn"
+          :class="{ latched: status.auto_record_on_boot !== false }"
+          :disabled="settingsSaving"
+          @click="toggleAutoRecordOnBoot"
+          :title="'Saved to ' + (status.storage?.recording_base || '') + '/.br_explorehd_dvr_settings.json'"
+        >
+          Auto-record on boot: {{ (status.auto_record_on_boot === false) ? 'OFF' : 'ON' }}
+        </button>
         <span class="muted">Session: {{ status.session_id || '—' }}</span>
       </div>
       <div class="grid">
@@ -204,6 +223,7 @@ createApp({
       liveErr: '',
       _live: null,
       _liveStarting: false,
+      settingsSaving: false,
       days: [],
       expanded: {},
       selectedDates: [],
@@ -430,6 +450,24 @@ createApp({
       this.clearDays();
       await this.loadRec();
       if (j.skipped?.length) alert('Some days skipped: ' + JSON.stringify(j.skipped));
+    },
+    async toggleAutoRecordOnBoot() {
+      var cur = this.status.auto_record_on_boot !== false;
+      this.settingsSaving = true;
+      try {
+        const r = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_record_on_boot: !cur }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
+        await this.tick();
+      } catch (e) {
+        alert((e && e.message) ? e.message : String(e));
+      } finally {
+        this.settingsSaving = false;
+      }
     },
     async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
     async startRec() { await fetch('/start', { method: 'POST' }); this.tick(); this.loadStreams(); },
