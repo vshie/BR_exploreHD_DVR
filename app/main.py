@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.20"
+VERSION = "1.0.21"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
