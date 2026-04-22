@@ -17,6 +17,15 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 2. Bind host path: `/usr/blueos/extensions/br_explorehd_dvr` → `/app/recordings`.
 3. Use **host network** and **privileged** so MCM (`127.0.0.1:6020`) and RTSP (`127.0.0.1:8554`) are reachable and USB drives can be mounted.
 
+### Manual image from `.tar` (on the Pi or another Linux host)
+
+```bash
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.0.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.0
+```
+
+Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.
+
 ## MCM prerequisites
 
 1. Open **http://&lt;vehicle&gt;:6020/** and create one **H.264** stream per camera (RTSP endpoint will appear in MCM’s stream list).
