@@ -148,7 +148,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -556,27 +556,62 @@ def _perform_delete_dates(dates: List[str]):
     if not isinstance(dates, list) or not dates:
         return jsonify({"success": False, "message": "dates[] required"}), 400
     active_d = _active_session_date()
-    deleted = []
-    skipped = []
+    active_session_name = os.path.basename(session_root) if session_root else None
+    active_session_abspath = os.path.abspath(session_root) if session_root else None
+    deleted: List[str] = []
+    partial: List[Dict[str, str]] = []
+    skipped: List[Dict[str, str]] = []
     for d in dates:
         ds = str(d)
         if not re.match(r"^\d{8}$", ds):
             skipped.append({"date": ds, "reason": "invalid date"})
             continue
-        if active_d == ds and session_root and os.path.isdir(session_root):
-            skipped.append({"date": ds, "reason": "active session on this calendar day"})
-            continue
+        is_active_day = (active_d == ds and active_session_abspath and os.path.isdir(active_session_abspath))
         removed_any = False
+        kept_active = False
         for root in _storage_roots():
             day_path = os.path.join(root, ds)
-            if os.path.isdir(day_path):
-                shutil.rmtree(day_path)
-                removed_any = True
-        if removed_any:
+            if not os.path.isdir(day_path):
+                continue
+            # On the active session's calendar day, only preserve the one live session
+            # directory; delete every other session (ended zips, ended dirs, stale folders)
+            # on every storage root. Previously we skipped the whole day, which made the
+            # UI appear broken when users tried to prune today's old sessions.
+            if is_active_day and os.path.abspath(day_path) == os.path.dirname(active_session_abspath):
+                for entry in os.listdir(day_path):
+                    # Keep the live session directory itself. Its matching <id>.zip
+                    # shouldn't exist yet (zipping happens post-session), but guard anyway.
+                    if active_session_name and (
+                        entry == active_session_name
+                        or entry == f"{active_session_name}.zip"
+                    ):
+                        kept_active = True
+                        continue
+                    p = os.path.join(day_path, entry)
+                    try:
+                        if os.path.isdir(p):
+                            shutil.rmtree(p)
+                        else:
+                            os.remove(p)
+                        removed_any = True
+                    except OSError as e:
+                        logger.warning("delete: failed to remove %s: %s", p, e)
+            else:
+                try:
+                    shutil.rmtree(day_path)
+                    removed_any = True
+                except OSError as e:
+                    logger.warning("delete: failed to remove %s: %s", day_path, e)
+        if removed_any and kept_active:
+            partial.append({"date": ds, "reason": "kept active session; other recordings removed"})
+        elif removed_any:
             deleted.append(ds)
+        elif kept_active:
+            # Only the active session exists on this day and nothing else to remove.
+            skipped.append({"date": ds, "reason": "only active session present"})
         else:
             skipped.append({"date": ds, "reason": "not found"})
-    return jsonify({"success": True, "deleted": deleted, "skipped": skipped})
+    return jsonify({"success": True, "deleted": deleted, "partial": partial, "skipped": skipped})
 
 
 @app.route("/recordings/delete", methods=["POST"])

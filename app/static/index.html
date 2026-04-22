@@ -267,7 +267,7 @@
     <div v-if="deleteModal" class="modal-bg" @click.self="deleteModal=false">
       <div class="modal">
         <h3 style="margin-top:0">Delete {{ selectedDates.length }} day(s)?</h3>
-        <p class="muted">This removes all recordings under those calendar dates on SD and USB (except the active session day).</p>
+        <p class="muted">Removes recordings under those calendar dates on SD and USB. The active session, if any, is preserved.</p>
         <ul><li v-for="d in selectedDates" :key="d">{{ d }}</li></ul>
         <div class="row" style="margin-top:16px">
           <button class="btn danger" @click="confirmDelete">Delete</button>
@@ -679,7 +679,16 @@ createApp({
       this.deleteModal = false;
       this.clearDays();
       await this.loadRec();
-      if (j.skipped?.length) alert('Some days skipped: ' + JSON.stringify(j.skipped));
+      var msgs = [];
+      if (j.partial?.length) {
+        msgs.push('Kept the active session on: ' + j.partial.map(function (p) { return p.date; }).join(', '));
+      }
+      // "not found" and "only active session present" are not worth surfacing as errors.
+      var realSkips = (j.skipped || []).filter(function (s) {
+        return s.reason && s.reason !== 'not found' && s.reason !== 'only active session present';
+      });
+      if (realSkips.length) msgs.push('Some days skipped: ' + JSON.stringify(realSkips));
+      if (msgs.length) alert(msgs.join('\n'));
     },
     async toggleAutoRecordOnBoot() {
       var cur = this.status.auto_record_on_boot !== false;
