@@ -13,18 +13,67 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 ## BlueOS install
 
-1. Build or install the extension image (Docker).
-2. Bind host path: `/usr/blueos/extensions/br_explorehd_dvr` → `/app/recordings`.
-3. Use **host network** and **privileged** so MCM (`127.0.0.1:6020`) and RTSP (`127.0.0.1:8554`) are reachable and USB drives can be mounted.
+### Option A — Manual install via the BlueOS UI (recommended)
 
-### Manual image from `.tar` (on the Pi or another Linux host)
+In BlueOS, open **Extensions → Installed → +** (the plus icon, bottom right) to open the **Create Extension** dialog, then fill it in exactly as below:
+
+| Field | Value |
+|-------|-------|
+| Extension Identifier | `br.dvr` |
+| Extension Name | `BR_exploreHD_DVR` |
+| Docker image | `vshie/blueos-br_explorehd_dvr` |
+| Docker tag | `main` |
+
+Paste this into the **Custom settings / Permissions** JSON editor:
+
+```json
+{
+  "ExposedPorts": {
+    "6010/tcp": {}
+  },
+  "HostConfig": {
+    "Binds": [
+      "/usr/blueos/extensions/br_explorehd_dvr:/app/recordings",
+      "/dev:/dev"
+    ],
+    "ExtraHosts": [
+      "host.docker.internal:host-gateway"
+    ],
+    "PortBindings": {
+      "6010/tcp": [
+        {
+          "HostPort": ""
+        }
+      ]
+    },
+    "NetworkMode": "host",
+    "Privileged": true
+  }
+}
+```
+
+Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:6010/**.
+
+What each piece does:
+- `Binds` — persists recordings to `/usr/blueos/extensions/br_explorehd_dvr` on the host (so they survive extension reinstalls) and exposes `/dev` so USB storage can be mounted from inside the container.
+- `NetworkMode: host` — required so the extension can reach MCM at `127.0.0.1:6020` and RTSP at `127.0.0.1:8554`.
+- `Privileged: true` — required for mounting removable storage (`exfat-fuse`, `mount`, `util-linux`).
+- `ExtraHosts: host.docker.internal:host-gateway` — lets the frontend iframe MCM's WebRTC UI via a stable hostname.
+
+### Option B — Manual install from a `.tar` (air-gapped / offline)
+
+Use this when the vehicle has no internet connection to pull from Docker Hub. Copy the tar built by this repo to the Pi, then:
 
 ```bash
 docker load -i br_explorehd_dvr_linux_arm64_v1.0.22.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.22 (or your build tag)
+# Image tag: vshie/br_explorehd_dvr:1.0.22
 ```
 
-Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.
+Then register the extension in BlueOS using the same fields as Option A, but change:
+- **Docker image**: `vshie/br_explorehd_dvr`
+- **Docker tag**: `1.0.22`
+
+(These match the image tag produced by `docker load`; Option A's `vshie/blueos-br_explorehd_dvr:main` is the Docker Hub published image and differs by name.)
 
 ## MCM prerequisites
 
