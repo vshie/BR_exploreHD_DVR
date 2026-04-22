@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
+VERSION = "1.0.19"
+
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
 # Goal: keep enough headroom for a full 4-cam session and avoid filling
@@ -181,7 +183,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.18",
+            "version": VERSION,
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -214,6 +216,7 @@ def route_status():
         auto_boot = True
     resp = jsonify(
         {
+            "version": VERSION,
             "boot_stage": stage,
             "boot_error": err,
             "recording": recording,

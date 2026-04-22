@@ -12,6 +12,7 @@
     body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
     header { padding: 12px 16px; border-bottom: 1px solid var(--bd); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
     h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+    h1 .ver { margin-left: 6px; font-size: 0.75rem; font-weight: 400; color: var(--muted); }
     nav button { margin-right: 6px; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--bd); background: var(--card); color: var(--tx); cursor: pointer; }
     nav button.active { border-color: var(--acc); color: var(--acc); }
     main { padding: 16px; max-width: 1200px; margin: 0 auto; }
@@ -132,7 +133,7 @@
 <body>
 <div id="app">
   <header>
-    <h1>BR_exploreHD_DVR</h1>
+    <h1>BR_exploreHD_DVR<span v-if="status.version" class="ver">v{{ status.version }}</span></h1>
     <nav>
       <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
       <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
@@ -182,7 +183,8 @@
           <span class="pill" :class="{run: cam.state==='running', bad: cam.state==='failed' || cam.state==='disk_stopped'}">{{ cam.state }}</span>
           <div class="muted" style="margin-top:8px">{{ cam.rtsp_url }}</div>
           <div class="muted">Segment: {{ cam.current_segment || '—' }} ({{ cam.current_segment_mb }} MB)</div>
-          <div class="muted">Session total: {{ cam.session_total_mb }} MB · restarts: {{ cam.restart_count }} · gst errors: {{ cam.gst_errors }}</div>
+          <div class="muted">Session total: {{ cam.session_total_mb }} MB · restarts: {{ cam.restart_count }}</div>
+          <div class="muted">gst errors: {{ cam.gst_errors }}</div>
           <div v-if="cam.last_error" class="muted" style="color:var(--err)">{{ cam.last_error }}</div>
           <div class="row">
             <button class="btn" @click="restartCam(cam.index)">Restart this cam</button>
@@ -194,6 +196,9 @@
         <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · SD free {{ status.telemetry?.disk_free_mb }} MB</div>
         <div class="muted">USB {{ status.storage?.usb?.mounted ? (status.storage.usb.free_mb + ' MB on ' + status.storage.usb.device) : 'not mounted' }} (usable if ≥ {{ status.storage?.usb?.min_free_gb || 5 }} GB free)</div>
         <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
+      </div>
+      <div class="card" style="margin-top:12px; padding:0; overflow:hidden">
+        <img src="/static/brdvr-banner.png" alt="BR_exploreHD_DVR" style="display:block; width:100%; height:auto" />
       </div>
     </section>
 
