@@ -4,14 +4,11 @@ Per-stream GStreamer RTSP -> MPEG-TS segment recorder with watchdog and restart.
 Stall isolation (v1.0.15 baseline, refined in v1.0.17):
   - A 60s RAM-backed queue sits between rtspsrc and splitmuxsink so SD fsync
     pauses up to ~60s are absorbed without backpressuring rtspsrc.
-  - The watchdog tracks RTSP ingest (/proc/<pid>/io rchar) rather than file
-    growth, so an SD-side pause (file not growing, but queue still draining
-    into RAM) no longer looks like a pipeline stall.
   - Segment rotations request a keyframe at roll time so the new file opens
     at a clean I-frame boundary without waiting for the next natural GOP.
 
 v1.0.17 MCM-friendliness changes:
-  - rchar stall threshold raised to 90s AND required to be observed across two
+  - Stall threshold raised to 90s AND required to be observed across two
     consecutive watchdog windows before restarting. MCM 0.2.4's RTSP fanout
     gets wedged by rapid SETUP/TEARDOWN cycles, so we churn pipelines as
     rarely as possible and only when a stall is clearly persistent.
@@ -25,6 +22,19 @@ v1.0.20 transport change:
     MCM-side producer glitches that manifest as multi-second flat-line stalls
     on TCP; UDP drops the affected packets and recovers instead of blocking.
     Overridable per-install via the DVR_RTSP_PROTOCOLS env var.
+
+v1.0.22 stall-signal fix (the big one):
+  - Prior versions used /proc/<pid>/io rchar as the stall signal. That worked
+    for TCP RTSP (where rtspsrc's main task does the recv()) but SILENTLY does
+    not count bytes for UDP RTSP: GStreamer's udpsrc element handles recvmsg()
+    in a way Linux does not attribute to the task's rchar counter, so rchar
+    stays flat at ~97 KB forever while video streams at 10 Mbps and the output
+    file grows normally. Once we switched to udp+tcp in 1.0.20 this produced
+    constant false-positive "rtsp stalled" watchdog restarts every 90s even
+    though recording was healthy. The fix: watch the actual bytes written to
+    disk across all segments in the session (monotonic, rollover-safe) instead.
+    Proven with an isolated test where rchar=97 KB over 60s while the output
+    file grew from 10 MB to 82 MB.
 """
 
 import logging
@@ -41,12 +51,15 @@ logger = logging.getLogger(__name__)
 MIN_FREE_DISK_MB = 1024
 WATCHDOG_INTERVAL_S = 5.0
 
-# Stall detection is now against RTSP ingest (rchar), not file growth. This is
-# decoupled from SD write latency so even a 30-45s SD GC pause does not trip
-# the watchdog as long as the camera is still sending RTP. The threshold is
-# intentionally generous because MCM 0.2.4 sometimes pauses briefly on cross-
-# consumer negotiation (e.g. when Cockpit opens WebRTC) and we don't want to
-# tear down our RTSP session and amplify the churn on MCM's state.
+# Stall detection tracks the total bytes written across all segments in the
+# current session (not /proc rchar — see the v1.0.22 note above for why rchar
+# is unreliable with UDP rtspsrc). The 60s RAM queue ahead of splitmuxsink
+# means a brief SD fsync pause does not reach the muxer's write() immediately,
+# but the queue empties quickly once the SD bus recovers, so the aggregate
+# file growth is still the right signal for "is data actually flowing through
+# the pipeline". The threshold is generous because MCM 0.2.4 sometimes pauses
+# briefly on cross-consumer negotiation (e.g. when Cockpit opens WebRTC) and
+# we don't want to tear down our RTSP session and amplify the churn on MCM.
 STALL_THRESHOLD_S = 90.0
 # Require the stalled condition to persist across this many consecutive
 # watchdog polls before we restart. With a 5s poll interval and a 90s
@@ -89,20 +102,27 @@ def _sanitize_dir_name(name: str) -> str:
     return s[:80]
 
 
-def _read_rchar(pid: int) -> Optional[int]:
-    """Bytes pulled via read()-family syscalls by the process (includes TCP reads).
+def _read_session_bytes(cam_dir: str) -> Optional[int]:
+    """Total bytes across all .ts segments in a cam's session directory.
 
-    Used as a cheap liveness probe for the RTSP ingest side of the pipeline,
-    independent of any downstream file-write activity.
+    This is the authoritative "is the pipeline producing output" signal:
+    it's independent of which specific segment file is currently being
+    written (so a rollover doesn't look like a regression), it's unaffected
+    by the /proc rchar udpsrc accounting quirk that broke v1.0.17..v1.0.21,
+    and it directly observes what ends up on disk.
     """
+    total = 0
     try:
-        with open(f"/proc/{pid}/io", "r") as f:
-            for line in f:
-                if line.startswith("rchar:"):
-                    return int(line.split()[1])
-    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        with os.scandir(cam_dir) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".ts"):
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
+    except (FileNotFoundError, PermissionError):
         return None
-    return None
+    return total
 
 
 class Recorder:
@@ -138,9 +158,11 @@ class Recorder:
         self.current_segment: Optional[str] = None
         self._pipeline_start_mono: float = 0.0
 
-        # RTSP ingest tracking for stall detection (decoupled from disk I/O).
-        self._last_rchar: Optional[int] = None
-        self._last_rchar_growth_mono: float = 0.0
+        # Session-bytes tracking for stall detection. This is the monotonic
+        # sum of all .ts file sizes in cam_dir; it advances every time
+        # splitmuxsink writes data, regardless of which segment is active.
+        self._last_session_bytes: Optional[int] = None
+        self._last_bytes_growth_mono: float = 0.0
         # Number of consecutive watchdog polls that have seen the stall condition.
         # We only restart when this reaches STALL_CONFIRM_POLLS.
         self._stall_streak: int = 0
@@ -228,8 +250,8 @@ class Recorder:
             except OSError:
                 pass
 
-    def _rtsp_stalled(self) -> bool:
-        """True if RTSP ingest has not advanced past STALL_THRESHOLD_S (and grace passed)."""
+    def _pipeline_stalled(self) -> bool:
+        """True if total session bytes on disk have not grown past STALL_THRESHOLD_S (and grace passed)."""
         with self._lock:
             proc = self._proc
         if proc is None or proc.poll() is not None:
@@ -237,14 +259,14 @@ class Recorder:
         now = time.monotonic()
         if now - self._pipeline_start_mono < STALL_GRACE_AFTER_START_S:
             return False
-        rchar = _read_rchar(proc.pid)
-        if rchar is None:
-            return False  # can't read /proc -> don't false-trigger
-        if self._last_rchar is None or rchar > self._last_rchar:
-            self._last_rchar = rchar
-            self._last_rchar_growth_mono = now
+        total = _read_session_bytes(self.cam_dir)
+        if total is None:
+            return False  # cam_dir missing -> don't false-trigger
+        if self._last_session_bytes is None or total > self._last_session_bytes:
+            self._last_session_bytes = total
+            self._last_bytes_growth_mono = now
             return False
-        return (now - self._last_rchar_growth_mono) > STALL_THRESHOLD_S
+        return (now - self._last_bytes_growth_mono) > STALL_THRESHOLD_S
 
     def _watch_loop(self):
         backoff = BACKOFF_START
@@ -283,23 +305,23 @@ class Recorder:
 
             self._update_file_status()
 
-            if self._rtsp_stalled():
+            if self._pipeline_stalled():
                 self._stall_streak += 1
                 if self._stall_streak >= STALL_CONFIRM_POLLS:
                     logger.warning(
-                        f"[cam{self.index}] rtsp ingest stalled (no rchar growth for "
+                        f"[cam{self.index}] pipeline stalled (no segment-bytes growth for "
                         f"~{STALL_THRESHOLD_S:.0f}s, confirmed across "
                         f"{self._stall_streak} polls), restarting pipeline"
                     )
                     self._stop_pipeline()
                     self.last_size = 0
                     self.last_grow_time = None
-                    self._last_rchar = None
+                    self._last_session_bytes = None
                     self._stall_streak = 0
-                    self.last_error = "rtsp stalled"
+                    self.last_error = "pipeline stalled"
                 else:
                     logger.info(
-                        f"[cam{self.index}] rtsp ingest looks stalled "
+                        f"[cam{self.index}] pipeline looks stalled "
                         f"(streak={self._stall_streak}/{STALL_CONFIRM_POLLS}); "
                         f"waiting for confirmation before restart"
                     )
@@ -338,8 +360,11 @@ class Recorder:
         self._pipeline_start_mono = time.monotonic()
         self.last_grow_time = self._pipeline_start_mono
         self.last_size = 0
-        self._last_rchar = None
-        self._last_rchar_growth_mono = self._pipeline_start_mono
+        # Seed the session-bytes baseline at pipeline start so "growth" is measured
+        # against whatever is already in the cam_dir (e.g. earlier segments from a
+        # prior attempt in the same session), not against zero.
+        self._last_session_bytes = _read_session_bytes(self.cam_dir)
+        self._last_bytes_growth_mono = self._pipeline_start_mono
         self._stall_streak = 0
         return True
 
@@ -374,7 +399,7 @@ class Recorder:
     def restart(self):
         self.last_size = 0
         self.last_grow_time = None
-        self._last_rchar = None
+        self._last_session_bytes = None
         self._stop_pipeline()
 
     def status_dict(self) -> Dict[str, Any]:
