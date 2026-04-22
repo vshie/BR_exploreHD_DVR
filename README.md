@@ -20,8 +20,8 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 ### Manual image from `.tar` (on the Pi or another Linux host)
 
 ```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.16.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.16 (or your build tag)
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.17.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.17 (or your build tag)
 ```
 
 Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.

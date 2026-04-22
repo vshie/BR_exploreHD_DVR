@@ -81,24 +81,24 @@ def list_h264_rtsp_streams(base: str = DEFAULT_MCM_BASE, timeout: float = 8.0) -
 
 
 def kick_streams(base: str = DEFAULT_MCM_BASE, timeout: float = 5.0) -> bool:
-    """POST /restart_streams?use_persistent=true to make MCM (re)start its configured pipelines.
+    """Compat shim: MCM 0.2.4 exposes `POST /restart_streams` but the endpoint
+    unconditionally returns `500 "Missing argument for restart_streams"` for
+    every request shape we tried (query param `?use_persistent=true`, form
+    body `use_persistent=true`, JSON body `{"use_persistent": true}`, empty
+    body, etc.). Worse, in the broken state we currently observe, cycling
+    pipelines is precisely what keeps MCM's RTSP fanout wedged. So this
+    function is intentionally a no-op on current MCM: it reports "we tried"
+    so callers continue, without actually poking MCM.
 
-    MCM frequently responds with HTTP 500 even when the restart succeeds and pipelines come up
-    shortly after, so we treat 500 as non-fatal and let callers poll /streams for `running: true`.
-
-    Returns True if the request reached MCM (even on 500); False if MCM was unreachable.
+    Kept as a named function so we can re-enable it if a future MCM release
+    ships a working `/restart_streams` endpoint and/or documents the argument.
+    Returns True so callers fall through to their normal poll-and-list path.
     """
-    url = f"{base.rstrip('/')}/restart_streams"
-    try:
-        r = requests.post(url, params={"use_persistent": "true"}, timeout=timeout)
-        if r.status_code >= 500:
-            logger.info("MCM %s returned HTTP %s (ignored; pipelines may still have restarted)", url, r.status_code)
-            return True
-        r.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        logger.warning("MCM kick_streams failed: %s", e)
-        return False
+    logger.info(
+        "MCM kick_streams: no-op (MCM 0.2.4 /restart_streams always 500s and "
+        "cycling pipelines destabilizes the RTSP fanout)"
+    )
+    return True
 
 
 def wait_for_streams(

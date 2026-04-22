@@ -1,7 +1,7 @@
 """
 Per-stream GStreamer RTSP -> MPEG-TS segment recorder with watchdog and restart.
 
-Stall isolation (v1.0.15):
+Stall isolation (v1.0.15 baseline, refined in v1.0.17):
   - A 60s RAM-backed queue sits between rtspsrc and splitmuxsink so SD fsync
     pauses up to ~60s are absorbed without backpressuring rtspsrc.
   - The watchdog tracks RTSP ingest (/proc/<pid>/io rchar) rather than file
@@ -9,9 +9,15 @@ Stall isolation (v1.0.15):
     into RAM) no longer looks like a pipeline stall.
   - Segment rotations request a keyframe at roll time so the new file opens
     at a clean I-frame boundary without waiting for the next natural GOP.
-  - When recording to internal SD the per-camera start is offset in larger
-    steps so the four splitmuxsink rotation fsyncs don't land in the same
-    wall-clock second. External media doesn't need that spread.
+
+v1.0.17 MCM-friendliness changes:
+  - rchar stall threshold raised to 90s AND required to be observed across two
+    consecutive watchdog windows before restarting. MCM 0.2.4's RTSP fanout
+    gets wedged by rapid SETUP/TEARDOWN cycles, so we churn pipelines as
+    rarely as possible and only when a stall is clearly persistent.
+  - Staggered starts dropped. MCM handles a single batched SETUP burst while
+    it is fresh more reliably than a trickled-in sequence (later clients were
+    observed to starve after the first was already streaming).
 """
 
 import logging
@@ -30,8 +36,16 @@ WATCHDOG_INTERVAL_S = 5.0
 
 # Stall detection is now against RTSP ingest (rchar), not file growth. This is
 # decoupled from SD write latency so even a 30-45s SD GC pause does not trip
-# the watchdog as long as the camera is still sending RTP.
-STALL_THRESHOLD_S = 30.0
+# the watchdog as long as the camera is still sending RTP. The threshold is
+# intentionally generous because MCM 0.2.4 sometimes pauses briefly on cross-
+# consumer negotiation (e.g. when Cockpit opens WebRTC) and we don't want to
+# tear down our RTSP session and amplify the churn on MCM's state.
+STALL_THRESHOLD_S = 90.0
+# Require the stalled condition to persist across this many consecutive
+# watchdog polls before we restart. With a 5s poll interval and a 90s
+# threshold this means ~90s + (N-1)*5s of confirmed inactivity before we
+# tear down and reconnect.
+STALL_CONFIRM_POLLS = 2
 # RTSP connect + first packet can take 10-20s on a cold start; avoid false restarts.
 STALL_GRACE_AFTER_START_S = 30.0
 BACKOFF_START = 1.0
@@ -44,12 +58,13 @@ BACKOFF_MAX = 10.0
 QUEUE_MAX_TIME_NS = 60 * 1_000_000_000  # 60 seconds of video in RAM
 QUEUE_MAX_BYTES = 100 * 1024 * 1024      # 100 MB hard cap per queue (4 cams -> ~400 MB worst case)
 
-# Per-cam start stagger. Desynchronising the segment rotation boundaries is the
-# only software knob we have to stop the four splitmuxsink fsyncs from landing
-# in the same wall-clock second on internal SD. External media (NVMe/SSD)
-# doesn't need the spread because its worst-case write latency is ~1ms.
-START_STAGGER_EXTERNAL_S = 0.5
-START_STAGGER_INTERNAL_SD_S = 15.0
+# Per-cam start stagger. We keep a very small (0.5s) jitter so that the four
+# splitmuxsink fsyncs don't land in exactly the same millisecond, but we no
+# longer spread starts across many seconds: MCM 0.2.4's RTSP fanout was
+# observed to serve the first client cleanly and starve subsequent clients
+# that connect while the first is already PLAYING. Issuing all four SETUPs
+# in a tight batch while MCM is fresh avoids that failure mode.
+START_STAGGER_S = 0.5
 
 
 def _sanitize_dir_name(name: str) -> str:
@@ -109,6 +124,9 @@ class Recorder:
         # RTSP ingest tracking for stall detection (decoupled from disk I/O).
         self._last_rchar: Optional[int] = None
         self._last_rchar_growth_mono: float = 0.0
+        # Number of consecutive watchdog polls that have seen the stall condition.
+        # We only restart when this reaches STALL_CONFIRM_POLLS.
+        self._stall_streak: int = 0
 
     def _segment_pattern(self) -> str:
         base = os.path.join(self.cam_dir, "seg_%05d.ts")
@@ -246,15 +264,27 @@ class Recorder:
             self._update_file_status()
 
             if self._rtsp_stalled():
-                logger.warning(
-                    f"[cam{self.index}] rtsp ingest stalled (no rchar growth for "
-                    f"{STALL_THRESHOLD_S:.0f}s), restarting pipeline"
-                )
-                self._stop_pipeline()
-                self.last_size = 0
-                self.last_grow_time = None
-                self._last_rchar = None
-                self.last_error = "rtsp stalled"
+                self._stall_streak += 1
+                if self._stall_streak >= STALL_CONFIRM_POLLS:
+                    logger.warning(
+                        f"[cam{self.index}] rtsp ingest stalled (no rchar growth for "
+                        f"~{STALL_THRESHOLD_S:.0f}s, confirmed across "
+                        f"{self._stall_streak} polls), restarting pipeline"
+                    )
+                    self._stop_pipeline()
+                    self.last_size = 0
+                    self.last_grow_time = None
+                    self._last_rchar = None
+                    self._stall_streak = 0
+                    self.last_error = "rtsp stalled"
+                else:
+                    logger.info(
+                        f"[cam{self.index}] rtsp ingest looks stalled "
+                        f"(streak={self._stall_streak}/{STALL_CONFIRM_POLLS}); "
+                        f"waiting for confirmation before restart"
+                    )
+            else:
+                self._stall_streak = 0
 
             time.sleep(WATCHDOG_INTERVAL_S)
 
@@ -290,6 +320,7 @@ class Recorder:
         self.last_size = 0
         self._last_rchar = None
         self._last_rchar_growth_mono = self._pipeline_start_mono
+        self._stall_streak = 0
         return True
 
     def _stop_pipeline(self):
@@ -378,20 +409,19 @@ class RecorderManager:
             )
 
     def start_all(self):
-        # Phase-offset the segment rotation boundaries. On internal SD we use a
-        # much larger per-cam stagger so the four splitmuxsink close-and-fsync
-        # bursts don't all land in the same wall-clock second. NVMe/SSD media
-        # doesn't benefit (microsecond-scale write latency), so we keep the
-        # minimal 0.5s stagger there.
-        stagger = START_STAGGER_INTERNAL_SD_S if self.is_internal_sd else START_STAGGER_EXTERNAL_S
+        # Use a tight 0.5s per-cam stagger on both internal SD and external
+        # media. Larger staggers were observed to interact badly with MCM
+        # 0.2.4's RTSP server: later SETUPs issued while earlier clients were
+        # already PLAYING starved of data. A near-batched start while MCM is
+        # fresh gives the most reliable multi-consumer fanout.
         if len(self.recorders) > 1:
             logger.info(
-                f"Starting {len(self.recorders)} recorders with {stagger:.1f}s per-cam stagger "
+                f"Starting {len(self.recorders)} recorders with {START_STAGGER_S:.1f}s per-cam stagger "
                 f"({'internal SD' if self.is_internal_sd else 'external media'})"
             )
         for i, r in enumerate(self.recorders):
             if i > 0:
-                time.sleep(stagger)
+                time.sleep(START_STAGGER_S)
             r.start()
 
     def stop_all(self):
