@@ -135,9 +135,9 @@
   <header>
     <h1>BR_exploreHD_DVR<span v-if="status.version" class="ver">v{{ status.version }}</span></h1>
     <nav>
-      <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
       <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
       <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
+      <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
     </nav>
   </header>
   <main :class="{ 'live-open': tab === 'live' }">
@@ -333,7 +333,7 @@ const { createApp } = Vue;
 createApp({
   data() {
     return {
-      tab: 'status',
+      tab: 'live',
       status: {},
       streams: [],
       poll: null,
@@ -430,6 +430,9 @@ createApp({
     this.tick();
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
+    // Default tab is 'live', so bring up the player right away. The tab watcher
+    // only fires on transitions, not on the initial value, so we kick it here.
+    this.scheduleLiveStart();
   },
   unmounted() {
     clearInterval(this.poll);
