@@ -367,7 +367,7 @@ createApp({
       var s = this.liveStreams[this.livePick] || this.liveStreams[0];
       this.liveErr = '';
       try {
-        await this._live.playStream(s.stream_id);
+        await this._live.playStream(s.stream_id, s.name);
       } catch (e) {
         this.liveErr = (e && e.message) ? e.message : String(e);
       }

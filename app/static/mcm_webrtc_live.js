@@ -143,13 +143,31 @@
     });
   };
 
-  McmWebRtcLive.prototype._findProducer = function (streams, streamUuid) {
-    var s = streams.find(function (x) {
-      return x && x.id === streamUuid;
-    });
-    if (!s) {
+  McmWebRtcLive.prototype._findProducer = function (streams, streamUuid, streamName) {
+    var uuid = streamUuid == null ? '' : String(streamUuid);
+    var name = streamName == null ? '' : String(streamName).trim();
+    var nameLo = name.toLowerCase();
+
+    // REST /streams "id" is often not the same as WebRTC producer "id"; match by name first.
+    var s = null;
+    if (name) {
       s = streams.find(function (x) {
-        return x && x.name && streamUuid && x.name.indexOf(streamUuid) !== -1;
+        return x && x.name && String(x.name).trim() === name;
+      });
+      if (!s && nameLo) {
+        s = streams.find(function (x) {
+          return x && x.name && String(x.name).trim().toLowerCase() === nameLo;
+        });
+      }
+    }
+    if (!s && uuid) {
+      s = streams.find(function (x) {
+        return x && x.id === uuid;
+      });
+    }
+    if (!s && uuid && name) {
+      s = streams.find(function (x) {
+        return x && x.name && String(x.name).indexOf(uuid) !== -1;
       });
     }
     return s || null;
@@ -182,7 +200,7 @@
     }
   };
 
-  McmWebRtcLive.prototype.playStream = function (streamUuid) {
+  McmWebRtcLive.prototype.playStream = function (streamUuid, streamName) {
     var self = this;
     if (!self._ws || self._ws.readyState !== WebSocket.OPEN || !self._consumerId) {
       return Promise.reject(new Error('Signalling not ready'));
@@ -192,9 +210,27 @@
     return self
       ._fetchAvailableStreams()
       .then(function (streams) {
-        var prod = self._findProducer(streams, streamUuid);
+        var prod = self._findProducer(streams, streamUuid, streamName);
         if (!prod) {
-          throw new Error('Stream not found in MCM WebRTC list (id: ' + streamUuid + ')');
+          var hint = '';
+          try {
+            hint =
+              ' Available: ' +
+              streams
+                .map(function (x) {
+                  return (x && x.name ? x.name : '?') + '(' + (x && x.id ? x.id : '?') + ')';
+                })
+                .join('; ');
+          } catch (e2) {
+            hint = '';
+          }
+          throw new Error(
+            'Stream not found in MCM WebRTC list (REST id ' +
+              streamUuid +
+              (streamName ? ', name "' + streamName + '"' : '') +
+              ').' +
+              hint
+          );
         }
         self._producerId = prod.id;
         self.onStatus('Starting WebRTC session for "' + prod.name + '"…');
