@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="DVR">
+  <defs>
+    <linearGradient id="chassis" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5c6b7e"/>
+      <stop offset="0.45" stop-color="#3d4d62"/>
+      <stop offset="1" stop-color="#1c2430"/>
+    </linearGradient>
+    <linearGradient id="lid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8b9cb0"/>
+      <stop offset="1" stop-color="#4f5f73"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#0d1117"/>
+  <!-- Depth wedge (right) -->
+  <path d="M22 8h7l0 18h-7l-2-2V10z" fill="#151b24"/>
+  <!-- Main front panel -->
+  <rect x="4" y="9" width="19" height="16" rx="2" fill="url(#chassis)" stroke="#30363d" stroke-width="0.75"/>
+  <!-- Top / 3D lid -->
+  <path d="M4 9 L22 6 L26 8 L8 11 Z" fill="url(#lid)" stroke="#30363d" stroke-width="0.5"/>
+  <!-- Tape slot -->
+  <rect x="7" y="17" width="13" height="3.5" rx="0.75" fill="#070b10" stroke="#21262d"/>
+  <!-- Segment display -->
+  <rect x="7" y="11.5" width="2.4" height="2" rx="0.4" fill="#238636"/>
+  <rect x="10.2" y="11.5" width="2.4" height="2" rx="0.4" fill="#238636"/>
+  <rect x="13.4" y="11.5" width="2.4" height="2" rx="0.4" fill="#238636"/>
+  <!-- REC -->
+  <circle cx="22.5" cy="12.5" r="1.6" fill="#da3633"/>
+</svg>
