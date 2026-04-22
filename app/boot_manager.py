@@ -7,7 +7,7 @@ import os
 import time
 import zipfile
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import usb_storage
 from mcm_client import wait_for_streams
