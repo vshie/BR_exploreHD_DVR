@@ -5,6 +5,7 @@ Boot: CPU calm wait, zip prior sessions, USB mount, discover MCM streams (read-o
 import logging
 import os
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
