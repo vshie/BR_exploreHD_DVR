@@ -132,7 +132,7 @@ def register_service():
             "description": "Multi-camera MPEG-TS recorder for exploreHD / MCM RTSP streams",
             "icon": "mdi-video-box-multiple",
             "company": "Blue Robotics",
-            "version": "1.0.3",
+            "version": "1.0.5",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }

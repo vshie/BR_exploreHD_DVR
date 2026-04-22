@@ -29,9 +29,10 @@ def _is_h264_stream(stream_info: Dict[str, Any]) -> bool:
     return False
 
 
-def parse_stream_status(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> Optional[Dict[str, Any]]:
     """Return normalized stream dict or None if unusable for H264 RTSP recording."""
     try:
+        base = (base or DEFAULT_MCM_BASE).rstrip("/")
         sid = item.get("id")
         vas = item.get("video_and_stream") or {}
         name = vas.get("name") or "stream"
@@ -47,8 +48,8 @@ def parse_stream_status(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "stream_id": str(sid),
             "name": name,
             "rtsp_url": rtsp,
-            "webrtc_page": f"{DEFAULT_MCM_BASE}/webrtc",
-            "mcm_root": DEFAULT_MCM_BASE,
+            "webrtc_page": f"{base}/webrtc",
+            "mcm_root": base,
             "running": bool(item.get("running")),
             "state": item.get("state"),
             "error": item.get("error"),
@@ -72,7 +73,7 @@ def list_h264_rtsp_streams(base: str = DEFAULT_MCM_BASE, timeout: float = 8.0) -
     raw = fetch_streams_raw(base=base, timeout=timeout)
     out: List[Dict[str, Any]] = []
     for item in raw:
-        parsed = parse_stream_status(item)
+        parsed = parse_stream_status(item, base=base)
         if parsed:
             out.append(parsed)
     out.sort(key=lambda s: s["name"].lower())

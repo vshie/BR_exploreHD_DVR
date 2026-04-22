@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 MIN_FREE_DISK_MB = 1024
 WATCHDOG_INTERVAL_S = 5.0
 STALL_THRESHOLD_S = 20.0
+# RTSP + first keyframe can take tens of seconds before the TS grows; avoid false stall restarts.
+STALL_GRACE_AFTER_START_S = 55.0
 BACKOFF_START = 1.0
 BACKOFF_MAX = 10.0
 
@@ -56,6 +58,7 @@ class Recorder:
         self.last_grow_time: Optional[float] = None
         self.last_size = 0
         self.current_segment: Optional[str] = None
+        self._pipeline_start_mono: float = 0.0
 
     def _segment_pattern(self) -> str:
         base = os.path.join(self.cam_dir, "seg_%05d.ts")
@@ -159,7 +162,9 @@ class Recorder:
                     self.last_grow_time = time.monotonic()
                     self.last_size = sz
                 elif self.last_grow_time is not None:
-                    if time.monotonic() - self.last_grow_time > STALL_THRESHOLD_S:
+                    now = time.monotonic()
+                    in_grace = (now - self._pipeline_start_mono) < STALL_GRACE_AFTER_START_S
+                    if not in_grace and now - self.last_grow_time > STALL_THRESHOLD_S:
                         logger.warning(f"[cam{self.index}] file stalled, restarting pipeline")
                         self._stop_pipeline()
                         self.last_size = 0
@@ -194,7 +199,8 @@ class Recorder:
             self._proc = None
             return False
         self.state = "running"
-        self.last_grow_time = time.monotonic()
+        self._pipeline_start_mono = time.monotonic()
+        self.last_grow_time = self._pipeline_start_mono
         self.last_size = 0
         return True
 

@@ -14,6 +14,7 @@
     nav button { margin-right: 6px; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--bd); background: var(--card); color: var(--tx); cursor: pointer; }
     nav button.active { border-color: var(--acc); color: var(--acc); }
     main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+    main.live-open { max-width: none; }
     .banner { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--bd); }
     .banner.err { border-color: var(--err); background: #3d1b1b; }
     .banner.warn { border-color: var(--warn); background: #2d2a1b; }
@@ -26,7 +27,26 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--bd); }
     .pill.run { border-color: var(--ok); color: var(--ok); }
     .pill.bad { border-color: var(--err); color: var(--err); }
-    iframe { width: 100%; height: 62vh; border: 1px solid var(--bd); border-radius: 8px; background: #000; }
+    .live-layout { display: flex; flex-direction: column; gap: 10px; }
+    .live-stage {
+      flex: 1 1 auto;
+      min-height: min(72vh, 800px);
+      background: #000;
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .live-stage video {
+      width: 100%;
+      height: 100%;
+      max-height: calc(100vh - 200px);
+      object-fit: contain;
+      vertical-align: middle;
+      background: #000;
+    }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
     th { color: var(--muted); font-weight: 500; }
@@ -45,11 +65,11 @@
     <h1>BR_exploreHD_DVR</h1>
     <nav>
       <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
-      <button :class="{active: tab==='live'}" @click="tab='live'">Live</button>
+      <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
       <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
     </nav>
   </header>
-  <main>
+  <main :class="{ 'live-open': tab === 'live' }">
     <div v-if="status.boot_error" class="banner err">
       <strong>Recording unavailable</strong> — {{ status.boot_error }}
       <div class="row">
@@ -94,15 +114,22 @@
       </div>
     </section>
 
-    <section v-show="tab==='live'">
-      <p class="muted">MAVLink Camera Manager WebRTC page (same host, port 6020). Select the stream inside MCM if needed.</p>
-      <div class="row" style="margin-bottom:10px">
-        <button class="btn" :class="{primary: livePick===i}" v-for="(s,i) in streams" :key="s.stream_id" @click="livePick=i; bumpIframe()">
+    <section v-show="tab==='live'" class="live-layout">
+      <p class="muted">
+        Low-latency preview uses the same WebRTC signalling as Cockpit (WebSocket on port <strong>6021</strong>, REST on 6020). Switch cameras with one click; use Fullscreen for a borderless view.
+      </p>
+      <div class="row live-toolbar" style="margin-bottom:4px">
+        <button class="btn" :class="{primary: livePick===i}" v-for="(s,i) in liveStreams" :key="s.stream_id" @click="onLivePick(i)">
           {{ s.name }}
         </button>
+        <button class="btn primary" type="button" :disabled="!liveStreams.length" @click="liveFullscreen">Fullscreen</button>
       </div>
-      <iframe v-if="iframeSrc" :key="iframeKey" :src="iframeSrc" title="MCM WebRTC"></iframe>
-      <div v-else class="banner err">No streams — configure MCM first.</div>
+      <div v-if="liveStreams.length" class="live-stage" ref="liveStage">
+        <video ref="liveVideo" playsinline autoplay muted></video>
+      </div>
+      <div v-else class="banner err">No streams yet — open Status until boot finishes, or configure MCM.</div>
+      <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
+      <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
     </section>
 
     <section v-show="tab==='rec'">
@@ -162,6 +189,7 @@
     </div>
   </main>
 </div>
+<script src="/static/mcm_webrtc_live.js"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -172,7 +200,10 @@ createApp({
       streams: [],
       poll: null,
       livePick: 0,
-      iframeKey: 0,
+      liveStatus: '',
+      liveErr: '',
+      _live: null,
+      _liveStarting: false,
       days: [],
       expanded: {},
       selectedDates: [],
@@ -182,15 +213,36 @@ createApp({
     };
   },
   computed: {
-    mcmRoot() {
-      const s = this.streams[0];
-      return (s && s.mcm_root) ? s.mcm_root : ('http://' + window.location.hostname + ':6020');
+    /**
+     * Prefer /streams from server; else status.cams if mount raced boot.
+     * Server uses MCM_BASE=http://127.0.0.1:6020 inside Docker — the browser must not load that host;
+     * rewrite loopback to the page hostname so the iframe hits the vehicle (same host as BlueOS).
+     */
+    liveStreams() {
+      const def = 'http://' + window.location.hostname + ':6020';
+      let raw = [];
+      if (this.streams.length) {
+        raw = this.streams;
+      } else {
+        const cams = this.status.cams || [];
+        if (!cams.length) return [];
+        raw = cams.map((c) => ({
+          stream_id: c.stream_id,
+          name: c.name,
+          rtsp_url: c.rtsp_url,
+          webrtc_page: def + '/webrtc',
+          mcm_root: def,
+        }));
+      }
+      return raw.map((s) => ({
+        ...s,
+        webrtc_page: this.mcmUrlForBrowser(s.webrtc_page || (def + '/webrtc')),
+        mcm_root: this.mcmUrlForBrowser(s.mcm_root || def, { stripTrailingSlash: true }),
+      }));
     },
-    iframeSrc() {
-      if (!this.streams.length) return '';
-      const s = this.streams[this.livePick] || this.streams[0];
-      const base = (s && s.webrtc_page) ? s.webrtc_page.replace(/\/$/, '') : (this.mcmRoot + '/webrtc');
-      return base + '?pick=' + encodeURIComponent(s.stream_id) + '&t=' + this.iframeKey;
+    mcmRoot() {
+      const s = this.liveStreams[0];
+      return (s && s.mcm_root) ? s.mcm_root : ('http://' + window.location.hostname + ':6020');
     },
     selectionSummary() {
       let bytes = 0, files = 0;
@@ -200,13 +252,43 @@ createApp({
       return this.selectedDates.length ? `${this.selectedDates.length} day(s) · ${this.fmtBytes(bytes)} · ${files} files` : 'No days selected';
     },
   },
+  watch: {
+    tab(n, o) {
+      if (o === 'live' && n !== 'live') this.teardownLive();
+      if (n === 'live') this.scheduleLiveStart();
+    },
+    livePick() {
+      if (this.tab === 'live') this.switchLiveStream();
+    },
+  },
   mounted() {
     this.tick();
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
   },
-  unmounted() { clearInterval(this.poll); },
+  unmounted() {
+    clearInterval(this.poll);
+    this.teardownLive();
+  },
   methods: {
+    /** Turn container-side MCM URLs into browser-reachable URLs (vehicle hostname). */
+    mcmUrlForBrowser(url, opts) {
+      const strip = opts && opts.stripTrailingSlash;
+      if (!url || typeof url !== 'string') {
+        return 'http://' + window.location.hostname + ':6020';
+      }
+      try {
+        const u = new URL(url, window.location.href);
+        if (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]') {
+          u.hostname = window.location.hostname;
+        }
+        let out = u.toString();
+        if (strip) out = out.replace(/\/+$/, '');
+        return out;
+      } catch {
+        return 'http://' + window.location.hostname + ':6020';
+      }
+    },
     fmtBytes(n) {
       if (!n) return '0 B';
       const u = ['B','KB','MB','GB','TB'];
@@ -218,6 +300,8 @@ createApp({
       try {
         const r = await fetch('/status');
         this.status = await r.json();
+        const n = this.status.streams_count || 0;
+        if (n > 0 && this.streams.length !== n) await this.loadStreams();
       } catch (e) { console.warn(e); }
     },
     async loadStreams() {
@@ -225,9 +309,69 @@ createApp({
         const r = await fetch('/streams');
         this.streams = await r.json();
         if (this.livePick >= this.streams.length) this.livePick = 0;
+        if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
       } catch (e) { this.streams = []; }
     },
-    bumpIframe() { this.iframeKey++; },
+    scheduleLiveStart() {
+      this.$nextTick(() => this.ensureLive());
+    },
+    async ensureLive() {
+      if (!this.liveStreams.length) return;
+      if (!window.McmWebRtcLive) {
+        this.liveErr = 'Live WebRTC helper failed to load (mcm_webrtc_live.js).';
+        return;
+      }
+      var v = this.$refs.liveVideo;
+      if (!v) return;
+      if (this._liveStarting) return;
+      this._liveStarting = true;
+      this.liveErr = '';
+      try {
+        if (!this._live) {
+          var self = this;
+          this._live = window.McmWebRtcLive.create(v, {
+            onStatus: function (s) { self.liveStatus = s; },
+            onError: function (e) { self.liveErr = String(e); },
+          });
+          await this._live.connect();
+        }
+        await this.switchLiveStream();
+      } catch (e) {
+        this.liveErr = (e && e.message) ? e.message : String(e);
+      } finally {
+        this._liveStarting = false;
+      }
+    },
+    async switchLiveStream() {
+      if (!this._live || !this.liveStreams.length) return;
+      var s = this.liveStreams[this.livePick] || this.liveStreams[0];
+      this.liveErr = '';
+      try {
+        await this._live.playStream(s.stream_id);
+      } catch (e) {
+        this.liveErr = (e && e.message) ? e.message : String(e);
+      }
+    },
+    teardownLive() {
+      if (this._live) {
+        try {
+          this._live.close();
+        } catch (e) {}
+        this._live = null;
+      }
+      this.liveStatus = '';
+      this.liveErr = '';
+    },
+    onLivePick(i) {
+      if (this.livePick === i) return;
+      this.livePick = i;
+    },
+    liveFullscreen() {
+      var el = this.$refs.liveStage;
+      if (!el) return;
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    },
     async loadRec() {
       try {
         const r = await fetch('/recordings');
