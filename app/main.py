@@ -487,4 +487,5 @@ def route_delete_day(date: str):
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5777")))
+    # Default 6010: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "6010")))

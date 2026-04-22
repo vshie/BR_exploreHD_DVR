@@ -29,7 +29,7 @@ COPY app/ .
 ENV PYTHONUNBUFFERED=1
 ENV FLASK_APP=main.py
 
-EXPOSE 5777
+EXPOSE 6010
 
 LABEL version="1.0.0"
 
@@ -37,7 +37,7 @@ ARG IMAGE_NAME
 LABEL permissions='\
 {\
   "ExposedPorts": {\
-    "5777/tcp": {}\
+    "6010/tcp": {}\
   },\
   "HostConfig": {\
     "Binds": [\
@@ -46,7 +46,7 @@ LABEL permissions='\
     ],\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "PortBindings": {\
-      "5777/tcp": [\
+      "6010/tcp": [\
         {\
           "HostPort": ""\
         }\

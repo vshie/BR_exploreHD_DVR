@@ -6,7 +6,7 @@ services:
     container_name: blueos-br-explorehd-dvr
     network_mode: host
     ports:
-      - "5777:5777"
+      - "6010:6010"
     volumes:
       - /usr/blueos/extensions/br_explorehd_dvr:/app/recordings
       - /dev:/dev

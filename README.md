@@ -8,7 +8,7 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 - **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
 - **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Web UI** (port **5777**): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete).
+- **Web UI** (default port **6010**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
 
 ## BlueOS install
@@ -20,8 +20,8 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 ### Manual image from `.tar` (on the Pi or another Linux host)
 
 ```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.0.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.0
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.1.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.1 (or your build tag)
 ```
 
 Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.
@@ -37,7 +37,7 @@ Then register the extension in BlueOS pointing at that image, or run with the sa
 |----------|---------|-------------|
 | `MCM_BASE` | `http://127.0.0.1:6020` | MCM REST base URL |
 | `SEGMENT_SECONDS` | `300` | TS segment duration |
-| `PORT` | `5777` | Flask listen port |
+| `PORT` | `6010` | Flask listen port (override if needed) |
 | `BOOT_MIN_SLEEP_S` | `20` | Minimum sleep before loadavg gate |
 | `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
