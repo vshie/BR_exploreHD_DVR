@@ -1,0 +1,18 @@
+version: "3.7"
+
+services:
+  br_explorehd_dvr:
+    build: .
+    container_name: blueos-br-explorehd-dvr
+    network_mode: host
+    ports:
+      - "5777:5777"
+    volumes:
+      - /usr/blueos/extensions/br_explorehd_dvr:/app/recordings
+      - /dev:/dev
+    privileged: true
+    restart: unless-stopped
+    environment:
+      - BLUEOS=true
+      - MCM_BASE=http://127.0.0.1:6020
+      - SEGMENT_SECONDS=300

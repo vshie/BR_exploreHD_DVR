@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BR_exploreHD_DVR</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    :root { --bg: #0d1117; --card: #161b22; --bd: #30363d; --tx: #e6edf3; --muted: #8b949e; --acc: #58a6ff; --err: #f85149; --ok: #3fb950; --warn: #d29922; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
+    header { padding: 12px 16px; border-bottom: 1px solid var(--bd); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+    nav button { margin-right: 6px; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--bd); background: var(--card); color: var(--tx); cursor: pointer; }
+    nav button.active { border-color: var(--acc); color: var(--acc); }
+    main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+    .banner { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--bd); }
+    .banner.err { border-color: var(--err); background: #3d1b1b; }
+    .banner.warn { border-color: var(--warn); background: #2d2a1b; }
+    .banner.ok { border-color: var(--ok); background: #11271a; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+    .card { background: var(--card); border: 1px solid var(--bd); border-radius: 10px; padding: 12px; }
+    .card h3 { margin: 0 0 8px; font-size: 0.95rem; }
+    .muted { color: var(--muted); font-size: 0.85rem; word-break: break-all; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--bd); }
+    .pill.run { border-color: var(--ok); color: var(--ok); }
+    .pill.bad { border-color: var(--err); color: var(--err); }
+    iframe { width: 100%; height: 62vh; border: 1px solid var(--bd); border-radius: 8px; background: #000; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
+    th { color: var(--muted); font-weight: 500; }
+    .btn { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--bd); background: var(--card); color: var(--tx); cursor: pointer; font-size: 0.85rem; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn.primary { border-color: var(--acc); color: var(--acc); }
+    .btn.danger { border-color: var(--err); color: var(--err); }
+    .expand { cursor: pointer; user-select: none; color: var(--acc); }
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
+    .modal { background: var(--card); border: 1px solid var(--bd); border-radius: 12px; padding: 20px; max-width: 480px; width: 92%; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>BR_exploreHD_DVR</h1>
+    <nav>
+      <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
+      <button :class="{active: tab==='live'}" @click="tab='live'">Live</button>
+      <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
+    </nav>
+  </header>
+  <main>
+    <div v-if="status.boot_error" class="banner err">
+      <strong>Recording unavailable</strong> — {{ status.boot_error }}
+      <div class="row">
+        <button class="btn primary" @click="retryBoot">Retry boot</button>
+        <a class="btn" :href="mcmRoot" target="_blank" rel="noopener">Open MCM (6020)</a>
+      </div>
+    </div>
+    <div v-else-if="status.streams_warning" class="banner warn">
+      Only {{ status.streams_count }} H264 RTSP stream(s) from MCM (you may expect up to four). Recording all available streams.
+    </div>
+    <div v-else-if="status.recording" class="banner ok">
+      Recording active ({{ status.streams_count }} stream<span v-if="status.streams_count!==1">s</span>).
+    </div>
+    <div v-else-if="status.boot_stage && status.boot_stage !== 'recording'" class="banner">
+      Boot: {{ status.boot_stage }}…
+    </div>
+
+    <section v-show="tab==='status'">
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn" @click="stopRec" :disabled="!status.cams?.length">Stop all</button>
+        <button class="btn primary" @click="startRec" :disabled="!status.cams?.length && status.boot_error">Start / resume</button>
+        <span class="muted">Session: {{ status.session_id || '—' }}</span>
+      </div>
+      <div class="grid">
+        <div class="card" v-for="cam in (status.cams||[])" :key="cam.index">
+          <h3>{{ cam.name }}</h3>
+          <span class="pill" :class="{run: cam.state==='running', bad: cam.state==='failed' || cam.state==='disk_stopped'}">{{ cam.state }}</span>
+          <div class="muted" style="margin-top:8px">{{ cam.rtsp_url }}</div>
+          <div class="muted">Segment: {{ cam.current_segment || '—' }} ({{ cam.current_segment_mb }} MB)</div>
+          <div class="muted">Session total: {{ cam.session_total_mb }} MB · restarts: {{ cam.restart_count }} · gst errors: {{ cam.gst_errors }}</div>
+          <div v-if="cam.last_error" class="muted" style="color:var(--err)">{{ cam.last_error }}</div>
+          <div class="row">
+            <button class="btn" @click="restartCam(cam.index)">Restart this cam</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h3>System</h3>
+        <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · SD free {{ status.telemetry?.disk_free_mb }} MB</div>
+        <div class="muted">USB {{ status.storage?.usb?.mounted ? (status.storage.usb.free_mb + ' MB on ' + status.storage.usb.device) : 'not mounted' }} (usable if ≥ {{ status.storage?.usb?.min_free_gb || 5 }} GB free)</div>
+        <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
+      </div>
+    </section>
+
+    <section v-show="tab==='live'">
+      <p class="muted">MAVLink Camera Manager WebRTC page (same host, port 6020). Select the stream inside MCM if needed.</p>
+      <div class="row" style="margin-bottom:10px">
+        <button class="btn" :class="{primary: livePick===i}" v-for="(s,i) in streams" :key="s.stream_id" @click="livePick=i; bumpIframe()">
+          {{ s.name }}
+        </button>
+      </div>
+      <iframe v-if="iframeSrc" :key="iframeKey" :src="iframeSrc" title="MCM WebRTC"></iframe>
+      <div v-else class="banner err">No streams — configure MCM first.</div>
+    </section>
+
+    <section v-show="tab==='rec'">
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn" @click="selectAllDays">Select all</button>
+        <button class="btn" @click="clearDays">Clear</button>
+        <button class="btn primary" :disabled="!selectedDates.length" @click="downloadSelected">Download selected (.zip)</button>
+        <button class="btn danger" :disabled="!selectedDates.length" @click="openDeleteModal">Delete selected…</button>
+        <span class="muted">{{ selectionSummary }}</span>
+      </div>
+      <table>
+        <thead><tr><th style="width:36px"></th><th>Date</th><th>Size</th><th>Files</th><th>Storages</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="(d, idx) in days" :key="d.date">
+            <td>
+              <input type="checkbox" :checked="selectedSet.has(d.date)"
+                @click.prevent="onDayCheck($event, d.date, idx)" />
+            </td>
+            <td><strong>{{ d.date }}</strong> <span v-if="d.active_session_here" class="pill">active day</span></td>
+            <td>{{ fmtBytes(d.total_bytes) }}</td>
+            <td>{{ d.file_count }}</td>
+            <td class="muted">{{ (d.storages||[]).join(', ') }}</td>
+            <td>
+              <span class="expand" @click="toggleExpand(d.date)">{{ expanded[d.date] ? '▼' : '▶' }}</span>
+              <button class="btn" style="margin-left:8px" @click="downloadOneDay(d.date)">Day zip</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-for="d in days" :key="'x'+d.date">
+        <div v-if="expanded[d.date]" style="margin:8px 0 16px 24px" class="card">
+          <div v-for="s in d.sessions" :key="s.id" style="margin-bottom:10px">
+            <div class="muted">Session {{ s.id }} ({{ s.storage }}) — {{ fmtBytes(s.bytes) }}</div>
+            <div v-for="c in s.cams" :key="c.name" style="margin-left:8px">
+              <div>{{ c.name }}</div>
+              <ul style="margin:4px 0; padding-left:18px">
+                <li v-for="seg in c.segments" :key="seg.name">
+                  <a :href="seg.download_url">{{ seg.name }}</a> ({{ fmtBytes(seg.size_bytes) }})
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div v-if="deleteModal" class="modal-bg" @click.self="deleteModal=false">
+      <div class="modal">
+        <h3 style="margin-top:0">Delete {{ selectedDates.length }} day(s)?</h3>
+        <p class="muted">This removes all recordings under those calendar dates on SD and USB (except the active session day).</p>
+        <ul><li v-for="d in selectedDates" :key="d">{{ d }}</li></ul>
+        <div class="row" style="margin-top:16px">
+          <button class="btn danger" @click="confirmDelete">Delete</button>
+          <button class="btn" @click="deleteModal=false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const { createApp } = Vue;
+createApp({
+  data() {
+    return {
+      tab: 'status',
+      status: {},
+      streams: [],
+      poll: null,
+      livePick: 0,
+      iframeKey: 0,
+      days: [],
+      expanded: {},
+      selectedDates: [],
+      selectedSet: new Set(),
+      lastDayIdx: null,
+      deleteModal: false,
+    };
+  },
+  computed: {
+    mcmRoot() {
+      const s = this.streams[0];
+      return (s && s.mcm_root) ? s.mcm_root : ('http://' + window.location.hostname + ':6020');
+    },
+    iframeSrc() {
+      if (!this.streams.length) return '';
+      const s = this.streams[this.livePick] || this.streams[0];
+      const base = (s && s.webrtc_page) ? s.webrtc_page.replace(/\/$/, '') : (this.mcmRoot + '/webrtc');
+      return base + '?pick=' + encodeURIComponent(s.stream_id) + '&t=' + this.iframeKey;
+    },
+    selectionSummary() {
+      let bytes = 0, files = 0;
+      for (const d of this.days) {
+        if (this.selectedSet.has(d.date)) { bytes += d.total_bytes; files += d.file_count; }
+      }
+      return this.selectedDates.length ? `${this.selectedDates.length} day(s) · ${this.fmtBytes(bytes)} · ${files} files` : 'No days selected';
+    },
+  },
+  mounted() {
+    this.tick();
+    this.poll = setInterval(this.tick, 2000);
+    this.loadStreams();
+  },
+  unmounted() { clearInterval(this.poll); },
+  methods: {
+    fmtBytes(n) {
+      if (!n) return '0 B';
+      const u = ['B','KB','MB','GB','TB'];
+      let i = 0; let v = n;
+      while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+      return (v<10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+    },
+    async tick() {
+      try {
+        const r = await fetch('/status');
+        this.status = await r.json();
+      } catch (e) { console.warn(e); }
+    },
+    async loadStreams() {
+      try {
+        const r = await fetch('/streams');
+        this.streams = await r.json();
+        if (this.livePick >= this.streams.length) this.livePick = 0;
+      } catch (e) { this.streams = []; }
+    },
+    bumpIframe() { this.iframeKey++; },
+    async loadRec() {
+      try {
+        const r = await fetch('/recordings');
+        const j = await r.json();
+        this.days = j.days || [];
+      } catch (e) { this.days = []; }
+    },
+    toggleExpand(date) { this.expanded[date] = !this.expanded[date]; },
+    onDayCheck(ev, date, idx) {
+      const checked = !this.selectedSet.has(date);
+      if (ev.shiftKey && this.lastDayIdx !== null) {
+        const [a,b] = [this.lastDayIdx, idx].sort((x,y)=>x-y);
+        for (let i = a; i <= b; i++) {
+          const dd = this.days[i].date;
+          if (checked) this.selectedSet.add(dd); else this.selectedSet.delete(dd);
+        }
+      } else {
+        if (checked) this.selectedSet.add(date); else this.selectedSet.delete(date);
+      }
+      this.lastDayIdx = idx;
+      this.selectedDates = this.days.filter(d => this.selectedSet.has(d.date)).map(d => d.date);
+    },
+    selectAllDays() {
+      this.selectedSet = new Set(this.days.map(d => d.date));
+      this.selectedDates = [...this.selectedSet];
+    },
+    clearDays() {
+      this.selectedSet.clear();
+      this.selectedDates = [];
+      this.lastDayIdx = null;
+    },
+    downloadOneDay(date) { window.location = '/download_day/' + date; },
+    async downloadSelected() {
+      const r = await fetch('/download_days', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ dates: this.selectedDates }),
+      });
+      if (!r.ok) { alert('Download failed'); return; }
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'BR_exploreHD_DVR_multi.zip';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    },
+    openDeleteModal() { this.deleteModal = true; },
+    async confirmDelete() {
+      const r = await fetch('/recordings/delete', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ dates: this.selectedDates }),
+      });
+      const j = await r.json();
+      this.deleteModal = false;
+      this.clearDays();
+      await this.loadRec();
+      if (j.skipped?.length) alert('Some days skipped: ' + JSON.stringify(j.skipped));
+    },
+    async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
+    async startRec() { await fetch('/start', { method: 'POST' }); this.tick(); this.loadStreams(); },
+    async restartCam(i) { await fetch('/cam/' + i + '/restart', { method: 'POST' }); },
+    async retryBoot() {
+      await fetch('/boot/retry', { method: 'POST' });
+      this.tab = 'status';
+    },
+  },
+}).mount('#app');
+</script>
+</body>
+</html>

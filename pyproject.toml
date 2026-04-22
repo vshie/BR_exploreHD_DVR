@@ -1,0 +1,13 @@
+[project]
+name = "br-explorehd-dvr"
+version = "1.0.0"
+description = "BlueOS extension: BR_exploreHD_DVR"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "flask>=3.0",
+  "requests>=2.28",
+]
+
+[tool.setuptools]
+packages = []
