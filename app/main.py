@@ -181,7 +181,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }

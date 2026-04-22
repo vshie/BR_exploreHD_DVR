@@ -98,13 +98,6 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .live-quad-chrome .btn {
-      pointer-events: auto;
-      padding: 4px 10px;
-      font-size: 0.8rem;
-      background: rgba(0,0,0,0.55);
-      border-color: rgba(255,255,255,0.15);
-    }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
     th { color: var(--muted); font-weight: 500; }
@@ -219,11 +212,10 @@
         <video ref="liveVideo" playsinline autoplay muted></video>
       </div>
       <div v-else-if="liveStreams.length && liveViewMode==='quad'" class="live-quad-grid" ref="liveQuadStage">
-        <div class="live-quad-cell" v-for="i in 4" :key="'q'+i" :ref="el => setQuadCellRef(i-1, el)">
+        <div class="live-quad-cell" v-for="i in 4" :key="'q'+i">
           <template v-if="liveStreams[i-1]">
             <div class="live-quad-chrome">
               <div class="live-quad-title">{{ liveStreams[i-1].name }}</div>
-              <button class="btn" type="button" @click="quadFullscreen(i-1)">Fullscreen</button>
             </div>
             <video :ref="el => setQuadVideoRef(i-1, el)" playsinline autoplay muted></video>
           </template>
@@ -349,7 +341,6 @@ createApp({
       _liveQuadStatus: ['', '', '', ''],
       _liveQuadErr: ['', '', '', ''],
       _quadVideos: [null, null, null, null],
-      _quadCells: [null, null, null, null],
       _liveStarting: false,
       _liveSwitchGen: 0,
       _liveSwitchPromise: null,
@@ -497,9 +488,6 @@ createApp({
     },
     setQuadVideoRef(i, el) {
       this._quadVideos[i] = el || null;
-    },
-    setQuadCellRef(i, el) {
-      this._quadCells[i] = el || null;
     },
     setLiveQuad() {
       if (!this.liveStreams.length) return;
@@ -712,9 +700,6 @@ createApp({
       } else {
         this.requestFullscreenOn(this.$refs.liveStage);
       }
-    },
-    quadFullscreen(i) {
-      this.requestFullscreenOn(this._quadCells[i]);
     },
     async loadRec() {
       try {
