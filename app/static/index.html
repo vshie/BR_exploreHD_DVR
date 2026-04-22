@@ -275,6 +275,45 @@
         </div>
       </div>
     </div>
+
+    <div v-if="downloadModal.open" class="modal-bg" @click.self="closeDownloadModalIfIdle">
+      <div class="modal">
+        <h3 style="margin-top:0">
+          <span v-if="downloadModal.phase==='scanning'">Preparing download…</span>
+          <span v-else-if="downloadModal.phase==='starting'">Starting download…</span>
+          <span v-else-if="downloadModal.phase==='streaming'">Your download is in progress</span>
+          <span v-else-if="downloadModal.phase==='error'">Download failed</span>
+          <span v-else>Download</span>
+        </h3>
+        <p v-if="downloadModal.dates?.length" class="muted" style="margin-top:4px">
+          {{ downloadModal.dates.length }} day(s): {{ downloadModal.dates.join(', ') }}
+        </p>
+        <div v-if="downloadModal.phase==='scanning'" class="muted" style="margin:12px 0">
+          Scanning recordings on SD and USB…
+        </div>
+        <div v-else-if="downloadModal.phase==='error'" class="banner err" style="margin:12px 0">
+          {{ downloadModal.error || 'Unknown error' }}
+        </div>
+        <div v-else style="margin:12px 0">
+          <div><strong>{{ downloadModal.file_count }}</strong> files · <strong>{{ fmtBytes(downloadModal.total_bytes) }}</strong> raw</div>
+          <div class="muted" style="margin-top:4px">
+            Archive size ≈ {{ fmtBytes(downloadModal.estimated_zip_bytes || downloadModal.total_bytes) }}
+            <span v-if="downloadModal.file_count > 1">(no compression — ZIP_STORED, CPU-free)</span>
+          </div>
+          <div class="muted" style="margin-top:10px">
+            Elapsed: {{ downloadModal.elapsedLabel }}
+          </div>
+          <div v-if="downloadModal.phase==='streaming'" class="muted" style="margin-top:8px">
+            Your browser's download tray should show bytes arriving now. You can close this window; the download will continue.
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button v-if="downloadModal.phase==='streaming'" class="btn" @click="closeDownloadModal">Close</button>
+          <button v-else-if="downloadModal.phase==='error'" class="btn" @click="closeDownloadModal">Dismiss</button>
+          <button v-else class="btn" disabled>Preparing…</button>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 <script src="/static/mcm_webrtc_live.js"></script>
@@ -307,6 +346,22 @@ createApp({
       selectedSet: new Set(),
       lastDayIdx: null,
       deleteModal: false,
+      // Download modal: 'scanning' while preflight runs, 'starting' while we
+      // poke the browser to begin the download, 'streaming' once it's underway,
+      // 'error' if preflight fails. An elapsed timer keeps the UI honest for
+      // multi-GB selections where even the scan takes a few hundred ms.
+      downloadModal: {
+        open: false,
+        phase: 'scanning',
+        dates: [],
+        file_count: 0,
+        total_bytes: 0,
+        estimated_zip_bytes: 0,
+        startedAt: 0,
+        elapsedLabel: '0s',
+        error: '',
+      },
+      _downloadTimer: null,
     };
   },
   computed: {
@@ -653,20 +708,101 @@ createApp({
       this.selectedDates = [];
       this.lastDayIdx = null;
     },
-    downloadOneDay(date) { window.location = '/download_day/' + date; },
-    async downloadSelected() {
-      const r = await fetch('/download_days', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ dates: this.selectedDates }),
+    _fmtElapsed(ms) {
+      var s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      var m = Math.floor(s / 60);
+      var rem = s % 60;
+      return m + 'm ' + String(rem).padStart(2, '0') + 's';
+    },
+    _startDownloadTimer() {
+      var self = this;
+      if (self._downloadTimer) clearInterval(self._downloadTimer);
+      self.downloadModal.startedAt = performance.now();
+      self.downloadModal.elapsedLabel = '0s';
+      self._downloadTimer = setInterval(function () {
+        self.downloadModal.elapsedLabel = self._fmtElapsed(performance.now() - self.downloadModal.startedAt);
+      }, 500);
+    },
+    _stopDownloadTimer() {
+      if (this._downloadTimer) {
+        clearInterval(this._downloadTimer);
+        this._downloadTimer = null;
+      }
+    },
+    closeDownloadModal() {
+      this._stopDownloadTimer();
+      this.downloadModal.open = false;
+    },
+    closeDownloadModalIfIdle() {
+      // Don't allow backdrop-click to dismiss while we're still preparing — it
+      // looks like nothing happened if the modal vanishes before the browser
+      // download tray shows up.
+      if (this.downloadModal.phase === 'streaming' || this.downloadModal.phase === 'error') {
+        this.closeDownloadModal();
+      }
+    },
+    async _beginDownload(dates, zipUrl) {
+      this.downloadModal = Object.assign({}, this.downloadModal, {
+        open: true,
+        phase: 'scanning',
+        dates: dates.slice(),
+        file_count: 0,
+        total_bytes: 0,
+        estimated_zip_bytes: 0,
+        error: '',
       });
-      if (!r.ok) { alert('Download failed'); return; }
-      const blob = await r.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'BR_exploreHD_DVR_multi.zip';
-      a.click();
-      URL.revokeObjectURL(a.href);
+      this._startDownloadTimer();
+      try {
+        const r = await fetch('/recordings/download_info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dates: dates }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.success) {
+          this.downloadModal.phase = 'error';
+          this.downloadModal.error = (j && j.message) || ('HTTP ' + r.status);
+          return;
+        }
+        this.downloadModal.file_count = j.file_count;
+        this.downloadModal.total_bytes = j.total_bytes;
+        this.downloadModal.estimated_zip_bytes = j.estimated_zip_bytes;
+        if (!j.file_count) {
+          this.downloadModal.phase = 'error';
+          this.downloadModal.error = 'No recordings found for those dates.';
+          return;
+        }
+        this.downloadModal.phase = 'starting';
+        // Let Vue flush the "starting" state, then navigate via a hidden <a>.
+        // The browser takes over: streaming download, progress in the tray,
+        // resumable if the server supports it. We don't buffer anything in JS.
+        await this.$nextTick();
+        const a = document.createElement('a');
+        a.href = zipUrl;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // Give the browser a moment to actually kick off the request before we
+        // flip to 'streaming'. This is cosmetic; the request is already in flight.
+        setTimeout(() => {
+          if (this.downloadModal.open && this.downloadModal.phase === 'starting') {
+            this.downloadModal.phase = 'streaming';
+          }
+        }, 600);
+      } catch (e) {
+        this.downloadModal.phase = 'error';
+        this.downloadModal.error = (e && e.message) ? e.message : String(e);
+      }
+    },
+    downloadOneDay(date) {
+      this._beginDownload([date], '/download_day/' + encodeURIComponent(date));
+    },
+    downloadSelected() {
+      if (!this.selectedDates.length) return;
+      const qs = this.selectedDates.map(function (d) { return 'd=' + encodeURIComponent(d); }).join('&');
+      this._beginDownload(this.selectedDates.slice(), '/download_days?' + qs);
     },
     openDeleteModal() { this.deleteModal = true; },
     async confirmDelete() {

@@ -4,17 +4,17 @@ BR_exploreHD_DVR — BlueOS extension: record MCM H264 RTSP streams to segmented
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
 import shutil
-import tempfile
 import threading
 import time
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, after_this_request, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 
 import usb_storage
 from boot_manager import SEGMENT_SECONDS_DEFAULT, run_boot_sequence
@@ -148,7 +148,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.12",
+            "version": "1.0.13",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -471,6 +471,163 @@ def route_download_file(date: str, session: str, cam: str, filename: str):
     return jsonify({"success": False, "message": "Not found"}), 404
 
 
+class _ZipDrainBuffer(io.RawIOBase):
+    """Write-only in-memory buffer used as zipfile.ZipFile's output stream.
+
+    ZipFile detects this is non-seekable (tell() raises UnsupportedOperation)
+    and switches to streaming mode: local headers use zip64 size placeholders
+    and each entry is followed by a data descriptor with the real sizes/CRC.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:
+        self._buf.extend(data)
+        return len(data)
+
+    def drain(self) -> bytes:
+        if not self._buf:
+            return b""
+        out = bytes(self._buf)
+        self._buf.clear()
+        return out
+
+
+def _estimated_zip_size(items: List[Tuple[str, str]]) -> int:
+    # Upper-bound estimate for ZIP_STORED streaming with force_zip64. Real size is
+    # within a few hundred bytes of this per entry and is only used for UI display.
+    per_entry = 30 + 20 + 24 + 46 + 28  # local + zip64 extra + data descr + central + zip64 extra
+    end = 22 + 20 + 56  # EOCD + zip64 EOCD locator + zip64 EOCD
+    total = end
+    for p, arc in items:
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            sz = 0
+        arc_len = len(arc.encode("utf-8"))
+        total += per_entry + 2 * arc_len + sz
+    return total
+
+
+def _stream_zip(items: List[Tuple[str, str]], read_chunk: int = 1 << 20):
+    """Yield a ZIP_STORED archive of the given (fullpath, arcname) items.
+
+    - No compression: recordings are H264/MPEG-TS, which is already packed;
+      ZIP_STORED is CPU-free and keeps I/O the only bottleneck.
+    - Streams directly to the HTTP response — never writes a staging copy to
+      /tmp. This halves disk I/O and makes the browser's download tray start
+      showing bytes almost immediately instead of after multi-minute prep.
+    - force_zip64=True so a single >4 GiB segment (or a total archive >4 GiB)
+      is handled correctly without pre-computing sizes.
+    """
+    buf = _ZipDrainBuffer()
+    zf = zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True)
+    try:
+        for full, arc in items:
+            try:
+                zi = zipfile.ZipInfo.from_file(full, arcname=arc)
+            except FileNotFoundError:
+                # A segment can finalize-and-rename between /recordings listing and
+                # the actual stream; skip gracefully so the archive remains usable.
+                logger.warning("download: skipping missing %s", full)
+                continue
+            zi.compress_type = zipfile.ZIP_STORED
+            try:
+                with open(full, "rb") as src, zf.open(zi, mode="w", force_zip64=True) as dest:
+                    while True:
+                        chunk = src.read(read_chunk)
+                        if not chunk:
+                            break
+                        dest.write(chunk)
+                        data = buf.drain()
+                        if data:
+                            yield data
+            except FileNotFoundError:
+                logger.warning("download: segment vanished mid-stream: %s", full)
+                continue
+            except OSError as e:
+                logger.warning("download: read error for %s: %s", full, e)
+                continue
+            # Data descriptor / bookkeeping bytes emitted by ZipFile on close.
+            data = buf.drain()
+            if data:
+                yield data
+    finally:
+        zf.close()
+    tail = buf.drain()
+    if tail:
+        yield tail
+
+
+def _collect_items_for_dates(dates: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
+    bad: List[str] = []
+    items: List[Tuple[str, str]] = []
+    for d in dates:
+        ds = str(d)
+        if not re.match(r"^\d{8}$", ds):
+            bad.append(ds)
+            continue
+        items.extend(_walk_day(ds))
+    return items, bad
+
+
+def _download_response(items: List[Tuple[str, str]], filename: str) -> Response:
+    total_bytes = 0
+    for p, _ in items:
+        try:
+            total_bytes += os.path.getsize(p)
+        except OSError:
+            pass
+    resp = Response(_stream_zip(items), mimetype="application/zip")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    # Custom headers so the UI can show an accurate preparation summary even when
+    # clients use a direct navigation (browser download manager) and don't see
+    # a JSON body.
+    resp.headers["X-Filename"] = filename
+    resp.headers["X-File-Count"] = str(len(items))
+    resp.headers["X-Raw-Bytes"] = str(total_bytes)
+    resp.headers["X-Estimated-Bytes"] = str(_estimated_zip_size(items))
+    # Chunked transfer: no Content-Length. Browsers render bytes-downloaded and
+    # throughput in the native download tray, which is enough feedback here.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/recordings/download_info", methods=["POST"])
+def route_download_info():
+    """Preflight for the UI: how many files and bytes will a given selection zip up?
+
+    Kept cheap (os.path.getsize only, no reads) so the modal shows info within a
+    few hundred ms even for large selections.
+    """
+    data = request.get_json(silent=True) or {}
+    dates = data.get("dates") or []
+    if not isinstance(dates, list) or not dates:
+        return jsonify({"success": False, "message": "dates[] required"}), 400
+    items, bad = _collect_items_for_dates(dates)
+    if bad:
+        return jsonify({"success": False, "message": f"Bad date(s): {','.join(bad)}"}), 400
+    total_bytes = 0
+    for p, _ in items:
+        try:
+            total_bytes += os.path.getsize(p)
+        except OSError:
+            pass
+    return jsonify(
+        {
+            "success": True,
+            "dates": [str(d) for d in dates],
+            "file_count": len(items),
+            "total_bytes": total_bytes,
+            "estimated_zip_bytes": _estimated_zip_size(items),
+        }
+    )
+
+
 @app.route("/download_day/<date>", methods=["GET"])
 def route_download_day(date: str):
     if not re.match(r"^\d{8}$", date):
@@ -478,78 +635,38 @@ def route_download_day(date: str):
     items = _walk_day(date)
     if not items:
         return jsonify({"success": False, "message": "No files"}), 404
-    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, dir="/tmp")
-    tmp.close()
-    try:
-        with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_STORED) as zf:
-            for full, arc in items:
-                zf.write(full, arcname=arc, compress_type=zipfile.ZIP_STORED)
-
-        def _cleanup_day(resp):
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            return resp
-
-        after_this_request(_cleanup_day)
-        return send_file(
-            tmp.name,
-            as_attachment=True,
-            download_name=f"BR_exploreHD_DVR_{date}.zip",
-            mimetype="application/zip",
-        )
-    except Exception as e:
-        logger.exception("download_day zip failed")
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        return jsonify({"success": False, "message": str(e)}), 500
+    return _download_response(items, f"BR_exploreHD_DVR_{date}.zip")
 
 
-@app.route("/download_days", methods=["POST"])
+def _dates_from_query() -> List[str]:
+    """Accept either ?d=YYYYMMDD&d=... or ?dates=YYYYMMDD,YYYYMMDD."""
+    dates: List[str] = list(request.args.getlist("d"))
+    if not dates:
+        raw = request.args.get("dates", "")
+        if raw:
+            dates = [x for x in raw.split(",") if x]
+    return dates
+
+
+@app.route("/download_days", methods=["GET", "POST"])
 def route_download_days():
-    data = request.get_json(silent=True) or {}
-    dates = data.get("dates") or []
+    # GET with query params lets the UI use a plain <a> navigation so the
+    # browser's native download manager handles progress/pause/resume and we
+    # never have to buffer the archive in JS memory.
+    if request.method == "GET":
+        dates = _dates_from_query()
+    else:
+        data = request.get_json(silent=True) or {}
+        dates = data.get("dates") or []
     if not isinstance(dates, list) or not dates:
         return jsonify({"success": False, "message": "dates[] required"}), 400
-    for d in dates:
-        if not re.match(r"^\d{8}$", str(d)):
-            return jsonify({"success": False, "message": f"Bad date: {d}"}), 400
-    all_items: List[Tuple[str, str]] = []
-    for d in dates:
-        all_items.extend(_walk_day(str(d)))
-    if not all_items:
+    items, bad = _collect_items_for_dates(dates)
+    if bad:
+        return jsonify({"success": False, "message": f"Bad date(s): {','.join(bad)}"}), 400
+    if not items:
         return jsonify({"success": False, "message": "No files for selection"}), 404
-    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, dir="/tmp")
-    tmp.close()
-    try:
-        with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_STORED) as zf:
-            for full, arc in all_items:
-                zf.write(full, arcname=arc, compress_type=zipfile.ZIP_STORED)
-
-        def _cleanup_days(resp):
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            return resp
-
-        after_this_request(_cleanup_days)
-        return send_file(
-            tmp.name,
-            as_attachment=True,
-            download_name=f"BR_exploreHD_DVR_multi_{int(time.time())}.zip",
-            mimetype="application/zip",
-        )
-    except Exception as e:
-        logger.exception("download_days zip failed")
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        return jsonify({"success": False, "message": str(e)}), 500
+    filename = f"BR_exploreHD_DVR_multi_{int(time.time())}.zip"
+    return _download_response(items, filename)
 
 
 def _perform_delete_dates(dates: List[str]):
