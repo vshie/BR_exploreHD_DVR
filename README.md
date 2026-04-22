@@ -20,8 +20,8 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 ### Manual image from `.tar` (on the Pi or another Linux host)
 
 ```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.19.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.19 (or your build tag)
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.10.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.10 (or your build tag)
 ```
 
 Then register the extension in BlueOS pointing at that image, or run with the same `docker-compose` / labels as in this repo’s `Dockerfile`.
@@ -42,6 +42,7 @@ Then register the extension in BlueOS pointing at that image, or run with the sa
 | `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
 | `EXTERNAL_STORAGE_DEVICE` | _(unset)_ | Optional explicit partition to mount at `/mnt/usb` (e.g. `/dev/nvme0n1p1`) if auto-detection does not pick your drive |
+| `DVR_RTSP_PROTOCOLS` | `udp+tcp` | rtspsrc transport preference: `udp+tcp` (UDP with TCP fallback; default since 1.0.20), `tcp` (RTSP-over-TCP only — useful on lossy links), or `udp` (UDP only, no fallback). UDP avoids TCP head-of-line blocking when the MCM producer briefly glitches. |
 
 ## Recording layout
 

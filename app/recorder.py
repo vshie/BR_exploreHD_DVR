@@ -18,6 +18,13 @@ v1.0.17 MCM-friendliness changes:
   - Staggered starts dropped. MCM handles a single batched SETUP burst while
     it is fresh more reliably than a trickled-in sequence (later clients were
     observed to starve after the first was already streaming).
+
+v1.0.20 transport change:
+  - Default rtspsrc transport is now UDP with TCP fallback (`udp+tcp`) instead
+    of TCP-only. Even with WiFi fully disabled we continued to see periodic
+    MCM-side producer glitches that manifest as multi-second flat-line stalls
+    on TCP; UDP drops the affected packets and recovers instead of blocking.
+    Overridable per-install via the DVR_RTSP_PROTOCOLS env var.
 """
 
 import logging
@@ -65,6 +72,16 @@ QUEUE_MAX_BYTES = 100 * 1024 * 1024      # 100 MB hard cap per queue (4 cams -> 
 # that connect while the first is already PLAYING. Issuing all four SETUPs
 # in a tight batch while MCM is fresh avoids that failure mode.
 START_STAGGER_S = 0.5
+
+# RTSP transport preference for rtspsrc. Accepts any value rtspsrc understands:
+#   "tcp"         - interleave RTP over the RTSP TCP control connection (TCP HOL blocking applies)
+#   "udp+tcp"     - negotiate UDP for RTP, fall back to TCP if UDP SETUP fails
+#   "udp"         - UDP only (no fallback; fails cleanly if the server rejects UDP)
+# UDP avoids TCP head-of-line blocking: a brief MCM-side producer glitch drops
+# a few RTP packets and recovers instead of flat-lining the whole socket for
+# tens of seconds like TCP does. Overridable without a rebuild via the extension
+# env var DVR_RTSP_PROTOCOLS (BlueOS extension config).
+RTSP_PROTOCOLS = os.environ.get("DVR_RTSP_PROTOCOLS", "udp+tcp").strip() or "udp+tcp"
 
 
 def _sanitize_dir_name(name: str) -> str:
@@ -145,7 +162,7 @@ class Recorder:
             "-e",
             "rtspsrc",
             f"location={url}",
-            "protocols=tcp",
+            f"protocols={RTSP_PROTOCOLS}",
             "latency=200",
             "!",
             "rtph264depay",
@@ -252,7 +269,10 @@ class Recorder:
                     break
                 self.state = "restarting"
                 self.restart_count += 1
-                logger.info(f"[cam{self.index}] starting pipeline (attempt {self.restart_count})")
+                logger.info(
+                    f"[cam{self.index}] starting pipeline "
+                    f"(attempt {self.restart_count}, rtsp_protocols={RTSP_PROTOCOLS})"
+                )
                 ok = self._start_pipeline()
                 if not ok:
                     self.last_error = "gst-launch failed to start"
