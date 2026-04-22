@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BR_exploreHD_DVR</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="/static/vue.global.prod.js"></script>
   <style>
     :root { --bg: #0d1117; --card: #161b22; --bd: #30363d; --tx: #e6edf3; --muted: #8b949e; --acc: #58a6ff; --err: #f85149; --ok: #3fb950; --warn: #d29922; }
     * { box-sizing: border-box; }
@@ -66,6 +66,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      aspect-ratio: 16 / 9;
     }
     .live-quad-cell video {
       width: 100%;
@@ -120,6 +121,19 @@
     .expand { cursor: pointer; user-select: none; color: var(--acc); }
     .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
     .modal { background: var(--card); border: 1px solid var(--bd); border-radius: 12px; padding: 20px; max-width: 480px; width: 92%; }
+
+    @media (max-width: 900px) {
+      main { padding: 10px; }
+      .live-toolbar .btn { flex: 1 1 auto; }
+      .live-quad-grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: none;
+        grid-auto-rows: auto;
+        min-height: 0;
+      }
+      .live-stage { min-height: 0; }
+      .live-stage video { max-height: 70vh; }
+    }
   </style>
 </head>
 <body>
@@ -195,10 +209,10 @@
         Low-latency preview uses the same WebRTC signalling as Cockpit (WebSocket on port <strong>6021</strong>, REST on 6020). Camera buttons show a full-frame view; Quad opens up to four WebRTC sessions at once. Empty Quad slots stay blank.
       </p>
       <div class="row live-toolbar" style="margin-bottom:4px">
+        <button class="btn" type="button" :class="{ primary: liveViewMode==='quad' }" :disabled="!liveStreams.length" @click="setLiveQuad">Quad</button>
         <button class="btn" :class="{primary: (liveViewMode==='single' && livePick===i)}" v-for="(s,i) in liveStreams" :key="s.stream_id" @click="onLivePick(i)">
           {{ s.name }}
         </button>
-        <button class="btn" type="button" :class="{ primary: liveViewMode==='quad' }" :disabled="!liveStreams.length" @click="setLiveQuad">Quad</button>
         <button class="btn primary" type="button" :disabled="!liveStreams.length" @click="liveFullscreen">Fullscreen</button>
       </div>
       <div v-if="liveStreams.length && liveViewMode==='single'" class="live-stage" ref="liveStage">
@@ -327,7 +341,7 @@ createApp({
       streams: [],
       poll: null,
       livePick: 0,
-      liveViewMode: 'single', // 'single' | 'quad'
+      liveViewMode: 'quad', // 'single' | 'quad'
       liveStatus: '',
       liveErr: '',
       _live: null,
