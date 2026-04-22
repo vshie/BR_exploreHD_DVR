@@ -129,13 +129,24 @@ def index():
     return app.send_static_file("index.html")
 
 
+@app.route("/favicon.ico")
+def favicon_ico():
+    """Some browsers / shells request /favicon.ico; serve the same SVG asset."""
+    return send_file(
+        os.path.join(app.root_path, "static", "favicon.svg"),
+        mimetype="image/svg+xml",
+        max_age=86400,
+    )
+
+
 @app.route("/register_service")
 def register_service():
     return jsonify(
         {
             "name": "BR_exploreHD_DVR",
             "description": "Multi-camera MPEG-TS recorder for exploreHD / MCM RTSP streams",
-            "icon": "mdi-video-box-multiple",
+            # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
+            "icon": "mdi-vhs",
             "company": "Blue Robotics",
             "version": "1.0.7",
             "webpage": "https://github.com/bluerobotics",
@@ -194,10 +205,17 @@ def route_status():
 
 @app.route("/streams", methods=["GET"])
 def route_streams():
-    with _state_lock:
-        snap = list(streams_snapshot)
+    """Live MCM list for the Live tab (matches WebRTC); fallback to boot snapshot if MCM is down."""
+    streams: List[Dict[str, Any]] = []
+    try:
+        streams = list_h264_rtsp_streams(base=MCM_BASE)
+    except Exception as e:
+        logger.warning("/streams: live MCM fetch failed: %s", e)
+    if not streams:
+        with _state_lock:
+            streams = list(streams_snapshot)
     out = []
-    for i, s in enumerate(snap):
+    for i, s in enumerate(streams):
         out.append(
             {
                 "index": i,

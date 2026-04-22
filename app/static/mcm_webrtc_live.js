@@ -14,6 +14,26 @@
     return scheme + '://' + host + ':6021/';
   }
 
+  function _normMatchUrl(u) {
+    if (u == null) return '';
+    var s = String(u).trim();
+    if (!s) return '';
+    try {
+      var x = new URL(s);
+      x.hash = '';
+      return x.toString().toLowerCase();
+    } catch (e) {
+      return s.toLowerCase();
+    }
+  }
+
+  function _normName(n) {
+    return String(n == null ? '' : n)
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+  }
+
   function parseMessage(data) {
     try {
       return JSON.parse(data);
@@ -143,10 +163,12 @@
     });
   };
 
-  McmWebRtcLive.prototype._findProducer = function (streams, streamUuid, streamName) {
+  McmWebRtcLive.prototype._findProducer = function (streams, streamUuid, streamName, rtspUrl) {
     var uuid = streamUuid == null ? '' : String(streamUuid);
     var name = streamName == null ? '' : String(streamName).trim();
     var nameLo = name.toLowerCase();
+    var nameNorm = _normName(name);
+    var urlNorm = _normMatchUrl(rtspUrl);
 
     // REST /streams "id" is often not the same as WebRTC producer "id"; match by name first.
     var s = null;
@@ -159,15 +181,25 @@
           return x && x.name && String(x.name).trim().toLowerCase() === nameLo;
         });
       }
+      if (!s && nameNorm) {
+        s = streams.find(function (x) {
+          return x && x.name && _normName(x.name) === nameNorm;
+        });
+      }
     }
     if (!s && uuid) {
       s = streams.find(function (x) {
-        return x && x.id === uuid;
+        return x && String(x.id) === uuid;
       });
     }
     if (!s && uuid && name) {
       s = streams.find(function (x) {
         return x && x.name && String(x.name).indexOf(uuid) !== -1;
+      });
+    }
+    if (!s && urlNorm) {
+      s = streams.find(function (x) {
+        return x && x.source && _normMatchUrl(x.source) === urlNorm;
       });
     }
     return s || null;
@@ -200,7 +232,7 @@
     }
   };
 
-  McmWebRtcLive.prototype.playStream = function (streamUuid, streamName) {
+  McmWebRtcLive.prototype.playStream = function (streamUuid, streamName, rtspUrl) {
     var self = this;
     if (!self._ws || self._ws.readyState !== WebSocket.OPEN || !self._consumerId) {
       return Promise.reject(new Error('Signalling not ready'));
@@ -210,7 +242,7 @@
     return self
       ._fetchAvailableStreams()
       .then(function (streams) {
-        var prod = self._findProducer(streams, streamUuid, streamName);
+        var prod = self._findProducer(streams, streamUuid, streamName, rtspUrl);
         if (!prod) {
           var hint = '';
           try {

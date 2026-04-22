@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BR_exploreHD_DVR</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <style>
     :root { --bg: #0d1117; --card: #161b22; --bd: #30363d; --tx: #e6edf3; --muted: #8b949e; --acc: #58a6ff; --err: #f85149; --ok: #3fb950; --warn: #d29922; }
@@ -367,7 +368,7 @@ createApp({
       var s = this.liveStreams[this.livePick] || this.liveStreams[0];
       this.liveErr = '';
       try {
-        await this._live.playStream(s.stream_id, s.name);
+        await this._live.playStream(s.stream_id, s.name, s.rtsp_url);
       } catch (e) {
         this.liveErr = (e && e.message) ? e.message : String(e);
       }

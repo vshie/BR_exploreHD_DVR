@@ -24,7 +24,7 @@ def _first_rtsp_url(endpoints: List[Any]) -> Optional[str]:
 def _is_h264_stream(stream_info: Dict[str, Any]) -> bool:
     cfg = stream_info.get("configuration") or {}
     if cfg.get("type") == "video":
-        enc = (cfg.get("encode") or "").upper()
+        enc = (cfg.get("encode") or "").strip().upper()
         return enc == "H264"
     return False
 
@@ -43,6 +43,11 @@ def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> O
             return None
         if not _is_h264_stream(si):
             logger.debug(f"Skipping non-H264 stream {name!r}")
+            return None
+        # MCM WebRTC availableStreams omits stopped pipelines; listing them breaks Live matching.
+        state = (item.get("state") or "")
+        if isinstance(state, str) and state.lower() == "stopped":
+            logger.debug(f"Skipping stopped stream {name!r} (not in WebRTC list)")
             return None
         return {
             "stream_id": str(sid),
