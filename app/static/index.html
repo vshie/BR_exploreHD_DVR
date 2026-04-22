@@ -48,6 +48,62 @@
       vertical-align: middle;
       background: #000;
     }
+    .live-quad-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 10px;
+      min-height: min(72vh, 800px);
+      background: transparent;
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .live-quad-cell {
+      background: #000;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .live-quad-cell video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    .live-quad-chrome {
+      position: absolute;
+      left: 8px;
+      right: 8px;
+      top: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .live-quad-title {
+      pointer-events: none;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      color: var(--tx);
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(0,0,0,0.55);
+      max-width: 70%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .live-quad-chrome .btn {
+      pointer-events: auto;
+      padding: 4px 10px;
+      font-size: 0.8rem;
+      background: rgba(0,0,0,0.55);
+      border-color: rgba(255,255,255,0.15);
+    }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
     th { color: var(--muted); font-weight: 500; }
@@ -136,16 +192,28 @@
 
     <section v-show="tab==='live'" class="live-layout">
       <p class="muted">
-        Low-latency preview uses the same WebRTC signalling as Cockpit (WebSocket on port <strong>6021</strong>, REST on 6020). Switch cameras with one click; use Fullscreen for a borderless view.
+        Low-latency preview uses the same WebRTC signalling as Cockpit (WebSocket on port <strong>6021</strong>, REST on 6020). Camera buttons show a full-frame view; Quad opens up to four WebRTC sessions at once. Empty Quad slots stay blank.
       </p>
       <div class="row live-toolbar" style="margin-bottom:4px">
-        <button class="btn" :class="{primary: livePick===i}" v-for="(s,i) in liveStreams" :key="s.stream_id" @click="onLivePick(i)">
+        <button class="btn" :class="{primary: (liveViewMode==='single' && livePick===i)}" v-for="(s,i) in liveStreams" :key="s.stream_id" @click="onLivePick(i)">
           {{ s.name }}
         </button>
+        <button class="btn" type="button" :class="{ primary: liveViewMode==='quad' }" :disabled="!liveStreams.length" @click="setLiveQuad">Quad</button>
         <button class="btn primary" type="button" :disabled="!liveStreams.length" @click="liveFullscreen">Fullscreen</button>
       </div>
-      <div v-if="liveStreams.length" class="live-stage" ref="liveStage">
+      <div v-if="liveStreams.length && liveViewMode==='single'" class="live-stage" ref="liveStage">
         <video ref="liveVideo" playsinline autoplay muted></video>
+      </div>
+      <div v-else-if="liveStreams.length && liveViewMode==='quad'" class="live-quad-grid" ref="liveQuadStage">
+        <div class="live-quad-cell" v-for="i in 4" :key="'q'+i" :ref="el => setQuadCellRef(i-1, el)">
+          <template v-if="liveStreams[i-1]">
+            <div class="live-quad-chrome">
+              <div class="live-quad-title">{{ liveStreams[i-1].name }}</div>
+              <button class="btn" type="button" @click="quadFullscreen(i-1)">Fullscreen</button>
+            </div>
+            <video :ref="el => setQuadVideoRef(i-1, el)" playsinline autoplay muted></video>
+          </template>
+        </div>
       </div>
       <div v-else class="banner err">No streams yet — open Status until boot finishes, or configure MCM.</div>
       <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
@@ -220,9 +288,15 @@ createApp({
       streams: [],
       poll: null,
       livePick: 0,
+      liveViewMode: 'single', // 'single' | 'quad'
       liveStatus: '',
       liveErr: '',
       _live: null,
+      _liveQuad: [null, null, null, null],
+      _liveQuadStatus: ['', '', '', ''],
+      _liveQuadErr: ['', '', '', ''],
+      _quadVideos: [null, null, null, null],
+      _quadCells: [null, null, null, null],
       _liveStarting: false,
       settingsSaving: false,
       days: [],
@@ -278,8 +352,11 @@ createApp({
       if (o === 'live' && n !== 'live') this.teardownLive();
       if (n === 'live') this.scheduleLiveStart();
     },
+    liveViewMode() {
+      if (this.tab === 'live') this.scheduleLiveStart();
+    },
     livePick() {
-      if (this.tab === 'live') this.switchLiveStream();
+      if (this.tab === 'live' && this.liveViewMode === 'single') this.switchLiveStream();
     },
   },
   mounted() {
@@ -292,6 +369,11 @@ createApp({
     this.teardownLive();
   },
   methods: {
+    requestFullscreenOn(el) {
+      if (!el) return;
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    },
     /** Turn container-side MCM URLs into browser-reachable URLs (vehicle hostname). */
     mcmUrlForBrowser(url, opts) {
       const strip = opts && opts.stripTrailingSlash;
@@ -336,27 +418,47 @@ createApp({
     scheduleLiveStart() {
       this.$nextTick(() => this.ensureLive());
     },
+    setQuadVideoRef(i, el) {
+      this._quadVideos[i] = el || null;
+    },
+    setQuadCellRef(i, el) {
+      this._quadCells[i] = el || null;
+    },
+    setLiveQuad() {
+      if (!this.liveStreams.length) return;
+      this.liveViewMode = 'quad';
+    },
     async ensureLive() {
       if (!this.liveStreams.length) return;
       if (!window.McmWebRtcLive) {
         this.liveErr = 'Live WebRTC helper failed to load (mcm_webrtc_live.js).';
         return;
       }
-      var v = this.$refs.liveVideo;
-      if (!v) return;
       if (this._liveStarting) return;
       this._liveStarting = true;
       this.liveErr = '';
       try {
-        if (!this._live) {
-          var self = this;
-          this._live = window.McmWebRtcLive.create(v, {
-            onStatus: function (s) { self.liveStatus = s; },
-            onError: function (e) { self.liveErr = String(e); },
-          });
-          await this._live.connect();
+        if (this.liveViewMode === 'single') {
+          // Tear down any quad sessions first.
+          this._teardownQuad();
+
+          var v = this.$refs.liveVideo;
+          if (!v) return;
+
+          if (!this._live) {
+            var self = this;
+            this._live = window.McmWebRtcLive.create(v, {
+              onStatus: function (s) { self.liveStatus = s; },
+              onError: function (e) { self.liveErr = String(e); },
+            });
+            await this._live.connect();
+          }
+          await this.switchLiveStream();
+        } else {
+          // Quad: tear down single session and create up to four independent sessions.
+          this._teardownSingle();
+          await this._ensureQuad();
         }
-        await this.switchLiveStream();
       } catch (e) {
         this.liveErr = (e && e.message) ? e.message : String(e);
       } finally {
@@ -373,25 +475,80 @@ createApp({
         this.liveErr = (e && e.message) ? e.message : String(e);
       }
     },
-    teardownLive() {
+    async _ensureQuad() {
+      var self = this;
+      // Reset per-slot status/error so old failures don't linger.
+      this._liveQuadStatus = ['', '', '', ''];
+      this._liveQuadErr = ['', '', '', ''];
+
+      var tasks = [];
+      for (let i = 0; i < 4; i++) {
+        const s = this.liveStreams[i];
+        const videoEl = this._quadVideos[i];
+        if (!s || !videoEl) {
+          // Ensure we don't keep a stale session alive for an empty/missing slot.
+          if (this._liveQuad[i]) {
+            try { this._liveQuad[i].close(); } catch (e) {}
+          }
+          this._liveQuad[i] = null;
+          continue;
+        }
+        if (!this._liveQuad[i]) {
+          this._liveQuad[i] = window.McmWebRtcLive.create(videoEl, {
+            onStatus: function (msg) { self._liveQuadStatus[i] = String(msg); },
+            onError: function (err) { self._liveQuadErr[i] = String(err); },
+          });
+        }
+        tasks.push(
+          (async () => {
+            try {
+              await self._liveQuad[i].connect();
+              await self._liveQuad[i].playStream(s.stream_id, s.name, s.rtsp_url);
+            } catch (e) {
+              self._liveQuadErr[i] = (e && e.message) ? e.message : String(e);
+            }
+          })()
+        );
+      }
+      await Promise.all(tasks);
+    },
+    _teardownSingle() {
       if (this._live) {
-        try {
-          this._live.close();
-        } catch (e) {}
+        try { this._live.close(); } catch (e) {}
         this._live = null;
       }
+      this.liveStatus = '';
+    },
+    _teardownQuad() {
+      for (let i = 0; i < 4; i++) {
+        if (this._liveQuad[i]) {
+          try { this._liveQuad[i].close(); } catch (e) {}
+          this._liveQuad[i] = null;
+        }
+        this._liveQuadStatus[i] = '';
+        this._liveQuadErr[i] = '';
+      }
+    },
+    teardownLive() {
+      this._teardownSingle();
+      this._teardownQuad();
       this.liveStatus = '';
       this.liveErr = '';
     },
     onLivePick(i) {
-      if (this.livePick === i) return;
-      this.livePick = i;
+      if (this.liveViewMode !== 'single') this.liveViewMode = 'single';
+      if (this.livePick !== i) this.livePick = i;
+      if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
     },
     liveFullscreen() {
-      var el = this.$refs.liveStage;
-      if (!el) return;
-      if (el.requestFullscreen) el.requestFullscreen();
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      if (this.liveViewMode === 'quad') {
+        this.requestFullscreenOn(this.$refs.liveQuadStage);
+      } else {
+        this.requestFullscreenOn(this.$refs.liveStage);
+      }
+    },
+    quadFullscreen(i) {
+      this.requestFullscreenOn(this._quadCells[i]);
     },
     async loadRec() {
       try {
