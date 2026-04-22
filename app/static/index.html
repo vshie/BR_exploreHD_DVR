@@ -298,6 +298,8 @@ createApp({
       _quadVideos: [null, null, null, null],
       _quadCells: [null, null, null, null],
       _liveStarting: false,
+      _liveSwitchGen: 0,
+      _liveSwitchPromise: null,
       settingsSaving: false,
       days: [],
       expanded: {},
@@ -465,15 +467,31 @@ createApp({
         this._liveStarting = false;
       }
     },
-    async switchLiveStream() {
-      if (!this._live || !this.liveStreams.length) return;
-      var s = this.liveStreams[this.livePick] || this.liveStreams[0];
-      this.liveErr = '';
-      try {
-        await this._live.playStream(s.stream_id, s.name, s.rtsp_url);
-      } catch (e) {
-        this.liveErr = (e && e.message) ? e.message : String(e);
-      }
+    switchLiveStream() {
+      // MCM's WebRTC signaller and our single-manager model don't tolerate two concurrent
+      // playStream() calls on the same WebSocket: they race on availableStreams / startSession
+      // answers and cross-wire producer IDs. Serialize with a latest-wins token so rapid
+      // clicks (and duplicate triggers from the livePick watcher + ensureLive) collapse into
+      // one actual switch, with only the most recent selection ultimately played.
+      if (!this._live || !this.liveStreams.length) return Promise.resolve();
+      var self = this;
+      var token = ++self._liveSwitchGen;
+      var target = self.liveStreams[self.livePick] || self.liveStreams[0];
+      self.liveErr = '';
+      var prev = self._liveSwitchPromise;
+      var p = (async () => {
+        try { if (prev) await prev; } catch (_) {}
+        if (token !== self._liveSwitchGen) return; // superseded by a newer click
+        try {
+          await self._live.playStream(target.stream_id, target.name, target.rtsp_url);
+        } catch (e) {
+          if (token === self._liveSwitchGen) {
+            self.liveErr = (e && e.message) ? e.message : String(e);
+          }
+        }
+      })();
+      self._liveSwitchPromise = p;
+      return p;
     },
     async _ensureQuad() {
       var self = this;
@@ -536,9 +554,18 @@ createApp({
       this.liveErr = '';
     },
     onLivePick(i) {
-      if (this.liveViewMode !== 'single') this.liveViewMode = 'single';
-      if (this.livePick !== i) this.livePick = i;
-      if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
+      var modeChanged = this.liveViewMode !== 'single';
+      var pickChanged = this.livePick !== i;
+      if (modeChanged) this.liveViewMode = 'single';
+      if (pickChanged) this.livePick = i;
+      // If the single manager is already set up and only the pick changed, the livePick
+      // watcher already triggered switchLiveStream(). Avoid a duplicate call via ensureLive,
+      // which would race against the watcher on the same WebSocket. Otherwise we do need
+      // ensureLive to create/connect the manager (first click, or returning from quad).
+      if (this.tab !== 'live') return;
+      if (!this._live || modeChanged || !pickChanged) {
+        this.$nextTick(() => this.ensureLive());
+      }
     },
     liveFullscreen() {
       if (this.liveViewMode === 'quad') {
