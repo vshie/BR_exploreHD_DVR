@@ -65,13 +65,13 @@ What each piece does:
 Use this when the vehicle has no internet connection to pull from Docker Hub. Copy the tar built by this repo to the Pi, then:
 
 ```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.22.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.22
+docker load -i br_explorehd_dvr_linux_arm64_v1.0.23.tar
+# Image tag: vshie/br_explorehd_dvr:1.0.23
 ```
 
 Then register the extension in BlueOS using the same fields as Option A, but change:
 - **Docker image**: `vshie/br_explorehd_dvr`
-- **Docker tag**: `1.0.22`
+- **Docker tag**: `1.0.23`
 
 (These match the image tag produced by `docker load`; Option A's `vshie/blueos-br_explorehd_dvr:main` is the Docker Hub published image and differs by name.)
 
