@@ -1,6 +1,6 @@
 [project]
 name = "br-explorehd-dvr"
-version = "1.0.14"
+version = "1.0.15"
 description = "BlueOS extension: BR_exploreHD_DVR"
 readme = "README.md"
 requires-python = ">=3.10"

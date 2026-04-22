@@ -30,6 +30,10 @@ app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 RECORDINGS_LOCAL = "/app/recordings"
+# Minimum free space required to start a recording session on internal SD.
+# Goal: keep enough headroom for a full 4-cam session and avoid filling
+# rootfs. External media does NOT need this gate (it's dedicated storage).
+INTERNAL_SD_MIN_FREE_MB = 5 * 1024
 MCM_BASE = os.environ.get("MCM_BASE", DEFAULT_MCM_BASE).rstrip("/")
 
 _boot_lock = threading.Lock()
@@ -97,13 +101,42 @@ def _boot_worker():
                     manager = None
                 return
             segment_ns = int(os.environ.get("SEGMENT_SECONDS", str(SEGMENT_SECONDS_DEFAULT))) * 1_000_000_000
-            mgr = RecorderManager(sr, streams, segment_ns, _disk_free_for_session, on_disk_critical=_on_disk_critical)
+            internal_sd = (rb == RECORDINGS_LOCAL)
+            mgr = RecorderManager(
+                sr,
+                streams,
+                segment_ns,
+                _disk_free_for_session,
+                on_disk_critical=_on_disk_critical,
+                is_internal_sd=internal_sd,
+            )
             auto_rec = bool(load_settings().get("auto_record_on_boot", True))
+            # 5 GB free precondition for recording to internal SD. External media is
+            # assumed dedicated and is gated only by the general disk-critical watchdog.
+            sd_blocked = False
+            if auto_rec and internal_sd:
+                free_mb = _disk_free_for_session()
+                if free_mb is not None and free_mb < INTERNAL_SD_MIN_FREE_MB:
+                    sd_blocked = True
+                    logger.error(
+                        f"Internal SD has only {free_mb:.0f} MB free; need "
+                        f"{INTERNAL_SD_MIN_FREE_MB} MB to auto-start. Staying in standby. "
+                        f"Free space, switch to external media, or press Start to override."
+                    )
             with _state_lock:
                 manager = mgr
-                boot_stage = "recording" if auto_rec else "standby"
-            if auto_rec:
+                if sd_blocked:
+                    boot_stage = "sd_low"
+                    boot_error = (
+                        f"Internal SD has < {INTERNAL_SD_MIN_FREE_MB // 1024} GB free. "
+                        f"Attach external media or free space, then press Start."
+                    )
+                else:
+                    boot_stage = "recording" if auto_rec else "standby"
+            if auto_rec and not sd_blocked:
                 mgr.start_all()
+            elif sd_blocked:
+                logger.info("SD gate blocked auto-record; recorders created but not started")
             else:
                 logger.info("auto_record_on_boot is false; recorders created but not started (standby)")
         except Exception as e:
@@ -148,7 +181,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.14",
+            "version": "1.0.15",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -318,6 +351,19 @@ def route_start():
     with _state_lock:
         sr = session_root
         mgr = manager
+        rb = recording_base
+    # 5 GB free gate for internal SD only. External media bypasses this check.
+    if rb == RECORDINGS_LOCAL:
+        free_mb = _disk_free_for_session()
+        if free_mb is not None and free_mb < INTERNAL_SD_MIN_FREE_MB:
+            return jsonify({
+                "success": False,
+                "message": (
+                    f"Internal SD has only {free_mb:.0f} MB free; "
+                    f"{INTERNAL_SD_MIN_FREE_MB // 1024} GB required to start recording. "
+                    f"Free space or attach external media."
+                ),
+            }), 507  # Insufficient Storage
     if not sr:
         threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
         return jsonify({"success": True, "message": "Boot sequence started"})

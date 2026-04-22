@@ -1,5 +1,17 @@
 """
 Per-stream GStreamer RTSP -> MPEG-TS segment recorder with watchdog and restart.
+
+Stall isolation (v1.0.15):
+  - A 60s RAM-backed queue sits between rtspsrc and splitmuxsink so SD fsync
+    pauses up to ~60s are absorbed without backpressuring rtspsrc.
+  - The watchdog tracks RTSP ingest (/proc/<pid>/io rchar) rather than file
+    growth, so an SD-side pause (file not growing, but queue still draining
+    into RAM) no longer looks like a pipeline stall.
+  - Segment rotations request a keyframe at roll time so the new file opens
+    at a clean I-frame boundary without waiting for the next natural GOP.
+  - When recording to internal SD the per-camera start is offset in larger
+    steps so the four splitmuxsink rotation fsyncs don't land in the same
+    wall-clock second. External media doesn't need that spread.
 """
 
 import logging
@@ -15,25 +27,50 @@ logger = logging.getLogger(__name__)
 
 MIN_FREE_DISK_MB = 1024
 WATCHDOG_INTERVAL_S = 5.0
-# Per-camera stall detection. SD cards can pause all writes for several seconds during
-# internal GC / wear-leveling, and when all four cameras roll segments at the same time
-# the fsync bursts can stack. 45s gives comfortable headroom without letting a truly dead
-# pipeline sit for too long.
-STALL_THRESHOLD_S = 45.0
-# RTSP + first keyframe can take tens of seconds before the TS grows; avoid false stall restarts.
-STALL_GRACE_AFTER_START_S = 55.0
+
+# Stall detection is now against RTSP ingest (rchar), not file growth. This is
+# decoupled from SD write latency so even a 30-45s SD GC pause does not trip
+# the watchdog as long as the camera is still sending RTP.
+STALL_THRESHOLD_S = 30.0
+# RTSP connect + first packet can take 10-20s on a cold start; avoid false restarts.
+STALL_GRACE_AFTER_START_S = 30.0
 BACKOFF_START = 1.0
 BACKOFF_MAX = 10.0
-# Per-cam start stagger. When 4 pipelines start within the same second their segment
-# rotation boundaries align, so every 300s all four splitmuxsinks fsync at once — which
-# on SD can produce a multi-second write pause and a correlated stall cascade. Offsetting
-# starts by ~0.5s per cam permanently desyncs the rotation bursts.
-START_STAGGER_S = 0.5
+
+# RAM queue between rtspsrc and splitmuxsink. At ~10 Mbps per camera this
+# holds up to ~75 MB per camera worth of buffered video (bounded by the hard
+# byte cap below), which is enough to ride through multi-second SD GC pauses
+# without stalling the recording pipeline.
+QUEUE_MAX_TIME_NS = 60 * 1_000_000_000  # 60 seconds of video in RAM
+QUEUE_MAX_BYTES = 100 * 1024 * 1024      # 100 MB hard cap per queue (4 cams -> ~400 MB worst case)
+
+# Per-cam start stagger. Desynchronising the segment rotation boundaries is the
+# only software knob we have to stop the four splitmuxsink fsyncs from landing
+# in the same wall-clock second on internal SD. External media (NVMe/SSD)
+# doesn't need the spread because its worst-case write latency is ~1ms.
+START_STAGGER_EXTERNAL_S = 0.5
+START_STAGGER_INTERNAL_SD_S = 15.0
 
 
 def _sanitize_dir_name(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name.strip()) or "cam"
     return s[:80]
+
+
+def _read_rchar(pid: int) -> Optional[int]:
+    """Bytes pulled via read()-family syscalls by the process (includes TCP reads).
+
+    Used as a cheap liveness probe for the RTSP ingest side of the pipeline,
+    independent of any downstream file-write activity.
+    """
+    try:
+        with open(f"/proc/{pid}/io", "r") as f:
+            for line in f:
+                if line.startswith("rchar:"):
+                    return int(line.split()[1])
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        return None
+    return None
 
 
 class Recorder:
@@ -69,6 +106,10 @@ class Recorder:
         self.current_segment: Optional[str] = None
         self._pipeline_start_mono: float = 0.0
 
+        # RTSP ingest tracking for stall detection (decoupled from disk I/O).
+        self._last_rchar: Optional[int] = None
+        self._last_rchar_growth_mono: float = 0.0
+
     def _segment_pattern(self) -> str:
         base = os.path.join(self.cam_dir, "seg_%05d.ts")
         return base
@@ -76,12 +117,11 @@ class Recorder:
     def _build_cmd(self) -> List[str]:
         url = self.stream["rtsp_url"]
         loc = self._segment_pattern()
-        # Pipeline tuning notes:
-        #  - queue max-size-time=5s absorbs SD write-latency spikes (GC, fsync) so rtspsrc
-        #    doesn't backpressure and drop packets during brief storage pauses.
-        #  - splitmuxsink async-finalize=true runs the old-segment close/fsync on a
-        #    dedicated thread instead of blocking the muxer/queue path, which is what
-        #    turned simultaneous 4-camera rotations into a correlated stall cascade on SD.
+        # Pipeline:
+        #   rtspsrc -> rtph264depay -> h264parse -> queue(60s/100MB RAM) -> splitmuxsink
+        # The large RAM queue absorbs SD write-latency bursts; async-finalize
+        # moves old-segment close/fsync off the muxer thread; send-keyframe-requests
+        # asks the upstream for a keyframe at roll time so new segments open cleanly.
         return [
             "gst-launch-1.0",
             "-e",
@@ -97,12 +137,14 @@ class Recorder:
             "!",
             "queue",
             "max-size-buffers=0",
-            "max-size-bytes=0",
-            "max-size-time=5000000000",
+            f"max-size-bytes={QUEUE_MAX_BYTES}",
+            f"max-size-time={QUEUE_MAX_TIME_NS}",
+            "leaky=no",
             "!",
             "splitmuxsink",
             "muxer-factory=mpegtsmux",
             "async-finalize=true",
+            "send-keyframe-requests=true",
             f"max-size-time={self.segment_ns}",
             f"location={loc}",
         ]
@@ -138,6 +180,37 @@ class Recorder:
         except OSError:
             return None
 
+    def _update_file_status(self):
+        """Refresh current_segment / last_size for the status UI. Informational only."""
+        path = self._latest_ts()
+        self.current_segment = os.path.basename(path) if path else None
+        if path and os.path.exists(path):
+            try:
+                sz = os.path.getsize(path)
+                if sz > self.last_size:
+                    self.last_grow_time = time.monotonic()
+                    self.last_size = sz
+            except OSError:
+                pass
+
+    def _rtsp_stalled(self) -> bool:
+        """True if RTSP ingest has not advanced past STALL_THRESHOLD_S (and grace passed)."""
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False  # caller handles dead-process case separately
+        now = time.monotonic()
+        if now - self._pipeline_start_mono < STALL_GRACE_AFTER_START_S:
+            return False
+        rchar = _read_rchar(proc.pid)
+        if rchar is None:
+            return False  # can't read /proc -> don't false-trigger
+        if self._last_rchar is None or rchar > self._last_rchar:
+            self._last_rchar = rchar
+            self._last_rchar_growth_mono = now
+            return False
+        return (now - self._last_rchar_growth_mono) > STALL_THRESHOLD_S
+
     def _watch_loop(self):
         backoff = BACKOFF_START
         while not self._stop.is_set():
@@ -170,22 +243,19 @@ class Recorder:
                     continue
                 backoff = BACKOFF_START
 
-            path = self._latest_ts()
-            self.current_segment = os.path.basename(path) if path else None
-            if path and os.path.exists(path):
-                sz = os.path.getsize(path)
-                if sz > self.last_size:
-                    self.last_grow_time = time.monotonic()
-                    self.last_size = sz
-                elif self.last_grow_time is not None:
-                    now = time.monotonic()
-                    in_grace = (now - self._pipeline_start_mono) < STALL_GRACE_AFTER_START_S
-                    if not in_grace and now - self.last_grow_time > STALL_THRESHOLD_S:
-                        logger.warning(f"[cam{self.index}] file stalled, restarting pipeline")
-                        self._stop_pipeline()
-                        self.last_size = 0
-                        self.last_grow_time = None
-                        self.last_error = "segment stalled"
+            self._update_file_status()
+
+            if self._rtsp_stalled():
+                logger.warning(
+                    f"[cam{self.index}] rtsp ingest stalled (no rchar growth for "
+                    f"{STALL_THRESHOLD_S:.0f}s), restarting pipeline"
+                )
+                self._stop_pipeline()
+                self.last_size = 0
+                self.last_grow_time = None
+                self._last_rchar = None
+                self.last_error = "rtsp stalled"
+
             time.sleep(WATCHDOG_INTERVAL_S)
 
         self._stop_pipeline()
@@ -218,6 +288,8 @@ class Recorder:
         self._pipeline_start_mono = time.monotonic()
         self.last_grow_time = self._pipeline_start_mono
         self.last_size = 0
+        self._last_rchar = None
+        self._last_rchar_growth_mono = self._pipeline_start_mono
         return True
 
     def _stop_pipeline(self):
@@ -251,6 +323,7 @@ class Recorder:
     def restart(self):
         self.last_size = 0
         self.last_grow_time = None
+        self._last_rchar = None
         self._stop_pipeline()
 
     def status_dict(self) -> Dict[str, Any]:
@@ -289,11 +362,13 @@ class RecorderManager:
         segment_ns: int,
         disk_free_fn: Callable[[], Optional[float]],
         on_disk_critical: Optional[Callable[[], None]] = None,
+        is_internal_sd: bool = True,
     ):
         self.session_root = session_root
         self.segment_ns = segment_ns
         self.disk_free_fn = disk_free_fn
         self.on_disk_critical = on_disk_critical
+        self.is_internal_sd = is_internal_sd
         self.recorders: List[Recorder] = []
         for i, s in enumerate(streams):
             sub = _sanitize_dir_name(s["name"])
@@ -303,13 +378,20 @@ class RecorderManager:
             )
 
     def start_all(self):
-        # Stagger pipeline starts so the 4 recorders' segment rotation boundaries don't
-        # coincide. Each Recorder.start() is cheap (spawns a watchdog thread that opens
-        # the gst-launch subprocess), so a small sleep between starts is enough to
-        # permanently offset their rotation fsync bursts on disk.
+        # Phase-offset the segment rotation boundaries. On internal SD we use a
+        # much larger per-cam stagger so the four splitmuxsink close-and-fsync
+        # bursts don't all land in the same wall-clock second. NVMe/SSD media
+        # doesn't benefit (microsecond-scale write latency), so we keep the
+        # minimal 0.5s stagger there.
+        stagger = START_STAGGER_INTERNAL_SD_S if self.is_internal_sd else START_STAGGER_EXTERNAL_S
+        if len(self.recorders) > 1:
+            logger.info(
+                f"Starting {len(self.recorders)} recorders with {stagger:.1f}s per-cam stagger "
+                f"({'internal SD' if self.is_internal_sd else 'external media'})"
+            )
         for i, r in enumerate(self.recorders):
             if i > 0:
-                time.sleep(START_STAGGER_S)
+                time.sleep(stagger)
             r.start()
 
     def stop_all(self):
