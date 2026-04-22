@@ -562,30 +562,44 @@ createApp({
       }
     },
     async switchLiveStream() {
+      // Latest-wins + serialized. Multiple rapid calls are chained so only one
+      // playStream() is ever in flight on the shared RTCPeerConnection, and
+      // any switch whose gen has been superseded becomes a no-op.
       if (!this._live || !this.liveStreams.length) return;
-      var s = this.liveStreams[this.livePick] || this.liveStreams[0];
-      this.liveErr = '';
-      try {
-        await this._live.playStream(s.stream_id, s.name, s.rtsp_url);
-      } catch (e) {
-        if (this._isStreamNotFoundErr(e)) {
-          // MCM's WebRTC producer list was empty — its pipelines are not running yet.
-          // Kick them via the backend and retry once.
-          this.liveStatus = 'Starting camera pipelines on MCM…';
-          var kicked = await this._ensureMcmStreamsRunning();
-          if (kicked) {
-            var s2 = this.liveStreams[this.livePick] || this.liveStreams[0];
-            try {
-              await this._live.playStream(s2.stream_id, s2.name, s2.rtsp_url);
-              return;
-            } catch (e2) {
-              this.liveErr = (e2 && e2.message) ? e2.message : String(e2);
-              return;
+      var self = this;
+      var myGen = ++self._liveSwitchGen;
+      var prev = self._liveSwitchPromise || Promise.resolve();
+      var next = prev.then(async function () {
+        if (myGen !== self._liveSwitchGen) return;   // superseded -> skip
+        if (!self._live || !self.liveStreams.length) return;
+        var s = self.liveStreams[self.livePick] || self.liveStreams[0];
+        self.liveErr = '';
+        try {
+          await self._live.playStream(s.stream_id, s.name, s.rtsp_url);
+        } catch (e) {
+          if (myGen !== self._liveSwitchGen) return; // superseded during await -> suppress
+          if (self._isStreamNotFoundErr(e)) {
+            // MCM's WebRTC producer list was empty — pipelines not running yet.
+            self.liveStatus = 'Starting camera pipelines on MCM…';
+            var kicked = await self._ensureMcmStreamsRunning();
+            if (myGen !== self._liveSwitchGen) return;
+            if (kicked) {
+              var s2 = self.liveStreams[self.livePick] || self.liveStreams[0];
+              try {
+                await self._live.playStream(s2.stream_id, s2.name, s2.rtsp_url);
+                return;
+              } catch (e2) {
+                if (myGen !== self._liveSwitchGen) return;
+                self.liveErr = (e2 && e2.message) ? e2.message : String(e2);
+                return;
+              }
             }
           }
+          self.liveErr = (e && e.message) ? e.message : String(e);
         }
-        this.liveErr = (e && e.message) ? e.message : String(e);
-      }
+      });
+      self._liveSwitchPromise = next.catch(function () { /* swallow; next caller re-tries */ });
+      return next;
     },
     async _ensureQuad() {
       var self = this;
@@ -677,9 +691,20 @@ createApp({
       this.liveErr = '';
     },
     onLivePick(i) {
-      if (this.liveViewMode !== 'single') this.liveViewMode = 'single';
+      // Single source of truth: set state, let the reactive watchers drive the work.
+      //   - In quad mode: set livePick FIRST, then liveViewMode='single'. The
+      //     liveViewMode watcher calls ensureLive, which teardownQuad + create
+      //     _live + connect + switchLiveStream(). The livePick watcher's
+      //     switchLiveStream fires too but early-returns (no _live yet).
+      //   - In single mode: only livePick changes; its watcher calls the
+      //     serialized switchLiveStream. We do NOT also call ensureLive here,
+      //     because that would race a second playStream() on the same peer.
+      if (this.liveViewMode !== 'single') {
+        if (this.livePick !== i) this.livePick = i;
+        this.liveViewMode = 'single';
+        return;
+      }
       if (this.livePick !== i) this.livePick = i;
-      if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
     },
     liveFullscreen() {
       if (this.liveViewMode === 'quad') {
