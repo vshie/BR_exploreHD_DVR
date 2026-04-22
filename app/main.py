@@ -18,7 +18,7 @@ from flask import Flask, after_this_request, jsonify, request, send_file
 
 import usb_storage
 from boot_manager import SEGMENT_SECONDS_DEFAULT, run_boot_sequence
-from mcm_client import DEFAULT_MCM_BASE, list_h264_rtsp_streams
+from mcm_client import DEFAULT_MCM_BASE, fetch_streams_raw, kick_streams, list_h264_rtsp_streams
 from recorder import RecorderManager
 from settings_store import load_settings, save_settings
 from system_telemetry import get_all_telemetry, get_disk_free_mb
@@ -148,7 +148,7 @@ def register_service():
             # BlueOS sidebar: MDI icon name only (see https://blueos.cloud/docs/latest/development/extensions/ ).
             "icon": "mdi-vhs",
             "company": "Blue Robotics",
-            "version": "1.0.10",
+            "version": "1.0.11",
             "webpage": "https://github.com/bluerobotics",
             "api": "",
         }
@@ -227,6 +227,59 @@ def route_streams():
             }
         )
     return jsonify(out)
+
+
+def _mcm_all_running() -> Tuple[Optional[bool], List[Dict[str, Any]]]:
+    """Return (all_running, raw_streams). all_running=None if MCM unreachable."""
+    try:
+        raw = fetch_streams_raw(base=MCM_BASE, timeout=2.5)
+    except Exception as e:
+        logger.info("/live/ensure_streams: MCM /streams fetch failed: %s", e)
+        return None, []
+    if not raw:
+        return False, []
+    return all(bool(s.get("running")) for s in raw), raw
+
+
+@app.route("/live/ensure_streams", methods=["POST"])
+def route_live_ensure_streams():
+    """Ensure MCM has running pipelines so WebRTC `availableStreams` is non-empty.
+
+    Idempotent and recording-safe: if every MCM stream already reports `running: true`, this is
+    a no-op and will NOT restart pipelines (which would briefly disrupt active RTSP readers).
+    Otherwise it calls MCM `POST /restart_streams?use_persistent=true` and polls briefly.
+    """
+    all_running, _raw = _mcm_all_running()
+    if all_running is None:
+        return jsonify({"success": False, "kicked": False, "message": "MCM unreachable"}), 503
+    kicked = False
+    if not all_running:
+        kicked = kick_streams(base=MCM_BASE)
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            latest_all, _latest_raw = _mcm_all_running()
+            if latest_all:
+                all_running = True
+                break
+    try:
+        streams = list_h264_rtsp_streams(base=MCM_BASE)
+    except Exception as e:
+        logger.warning("/live/ensure_streams: list failed after kick: %s", e)
+        streams = []
+    out = [
+        {
+            "index": i,
+            "name": s["name"],
+            "stream_id": s["stream_id"],
+            "rtsp_url": s["rtsp_url"],
+            "webrtc_page": s.get("webrtc_page"),
+            "mcm_root": s.get("mcm_root"),
+            "running": s.get("running", False),
+        }
+        for i, s in enumerate(streams)
+    ]
+    return jsonify({"success": bool(all_running), "kicked": kicked, "streams": out})
 
 
 @app.route("/settings", methods=["GET"])

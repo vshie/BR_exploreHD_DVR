@@ -15,11 +15,20 @@ logger = logging.getLogger(__name__)
 
 MIN_FREE_DISK_MB = 1024
 WATCHDOG_INTERVAL_S = 5.0
-STALL_THRESHOLD_S = 20.0
+# Per-camera stall detection. SD cards can pause all writes for several seconds during
+# internal GC / wear-leveling, and when all four cameras roll segments at the same time
+# the fsync bursts can stack. 45s gives comfortable headroom without letting a truly dead
+# pipeline sit for too long.
+STALL_THRESHOLD_S = 45.0
 # RTSP + first keyframe can take tens of seconds before the TS grows; avoid false stall restarts.
 STALL_GRACE_AFTER_START_S = 55.0
 BACKOFF_START = 1.0
 BACKOFF_MAX = 10.0
+# Per-cam start stagger. When 4 pipelines start within the same second their segment
+# rotation boundaries align, so every 300s all four splitmuxsinks fsync at once — which
+# on SD can produce a multi-second write pause and a correlated stall cascade. Offsetting
+# starts by ~0.5s per cam permanently desyncs the rotation bursts.
+START_STAGGER_S = 0.5
 
 
 def _sanitize_dir_name(name: str) -> str:
@@ -67,6 +76,12 @@ class Recorder:
     def _build_cmd(self) -> List[str]:
         url = self.stream["rtsp_url"]
         loc = self._segment_pattern()
+        # Pipeline tuning notes:
+        #  - queue max-size-time=5s absorbs SD write-latency spikes (GC, fsync) so rtspsrc
+        #    doesn't backpressure and drop packets during brief storage pauses.
+        #  - splitmuxsink async-finalize=true runs the old-segment close/fsync on a
+        #    dedicated thread instead of blocking the muxer/queue path, which is what
+        #    turned simultaneous 4-camera rotations into a correlated stall cascade on SD.
         return [
             "gst-launch-1.0",
             "-e",
@@ -83,10 +98,11 @@ class Recorder:
             "queue",
             "max-size-buffers=0",
             "max-size-bytes=0",
-            "max-size-time=1000000000",
+            "max-size-time=5000000000",
             "!",
             "splitmuxsink",
             "muxer-factory=mpegtsmux",
+            "async-finalize=true",
             f"max-size-time={self.segment_ns}",
             f"location={loc}",
         ]
@@ -287,7 +303,13 @@ class RecorderManager:
             )
 
     def start_all(self):
-        for r in self.recorders:
+        # Stagger pipeline starts so the 4 recorders' segment rotation boundaries don't
+        # coincide. Each Recorder.start() is cheap (spawns a watchdog thread that opens
+        # the gst-launch subprocess), so a small sleep between starts is enough to
+        # permanently offset their rotation fsync bursts on disk.
+        for i, r in enumerate(self.recorders):
+            if i > 0:
+                time.sleep(START_STAGGER_S)
             r.start()
 
     def stop_all(self):

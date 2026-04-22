@@ -24,7 +24,7 @@ def _first_rtsp_url(endpoints: List[Any]) -> Optional[str]:
 def _is_h264_stream(stream_info: Dict[str, Any]) -> bool:
     cfg = stream_info.get("configuration") or {}
     if cfg.get("type") == "video":
-        enc = (cfg.get("encode") or "").strip().upper()
+        enc = (cfg.get("encode") or "").upper()
         return enc == "H264"
     return False
 
@@ -43,11 +43,6 @@ def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> O
             return None
         if not _is_h264_stream(si):
             logger.debug(f"Skipping non-H264 stream {name!r}")
-            return None
-        # MCM WebRTC availableStreams omits stopped pipelines; listing them breaks Live matching.
-        state = (item.get("state") or "")
-        if isinstance(state, str) and state.lower() == "stopped":
-            logger.debug(f"Skipping stopped stream {name!r} (not in WebRTC list)")
             return None
         return {
             "stream_id": str(sid),
@@ -83,6 +78,27 @@ def list_h264_rtsp_streams(base: str = DEFAULT_MCM_BASE, timeout: float = 8.0) -
             out.append(parsed)
     out.sort(key=lambda s: s["name"].lower())
     return out
+
+
+def kick_streams(base: str = DEFAULT_MCM_BASE, timeout: float = 5.0) -> bool:
+    """POST /restart_streams?use_persistent=true to make MCM (re)start its configured pipelines.
+
+    MCM frequently responds with HTTP 500 even when the restart succeeds and pipelines come up
+    shortly after, so we treat 500 as non-fatal and let callers poll /streams for `running: true`.
+
+    Returns True if the request reached MCM (even on 500); False if MCM was unreachable.
+    """
+    url = f"{base.rstrip('/')}/restart_streams"
+    try:
+        r = requests.post(url, params={"use_persistent": "true"}, timeout=timeout)
+        if r.status_code >= 500:
+            logger.info("MCM %s returned HTTP %s (ignored; pipelines may still have restarted)", url, r.status_code)
+            return True
+        r.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.warning("MCM kick_streams failed: %s", e)
+        return False
 
 
 def wait_for_streams(

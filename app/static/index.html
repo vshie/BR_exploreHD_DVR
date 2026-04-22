@@ -414,7 +414,13 @@ createApp({
         const r = await fetch('/streams');
         this.streams = await r.json();
         if (this.livePick >= this.streams.length) this.livePick = 0;
-        if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
+        if (this.tab === 'live') {
+          // Proactively ensure MCM has live producers so the first play doesn't hit
+          // the "Stream not found in MCM WebRTC list" race after a fresh boot.
+          this._ensureMcmStreamsRunning().finally(() => {
+            this.$nextTick(() => this.ensureLive());
+          });
+        }
       } catch (e) { this.streams = []; }
     },
     scheduleLiveStart() {
@@ -429,6 +435,25 @@ createApp({
     setLiveQuad() {
       if (!this.liveStreams.length) return;
       this.liveViewMode = 'quad';
+    },
+    _isStreamNotFoundErr(e) {
+      var msg = (e && e.message) ? e.message : String(e || '');
+      return /Stream not found in MCM WebRTC list/i.test(msg);
+    },
+    async _ensureMcmStreamsRunning() {
+      // Ask the backend to kick MCM pipelines if they are idle. No-op when all are already running.
+      try {
+        var r = await fetch('/live/ensure_streams', { method: 'POST' });
+        if (!r.ok) return false;
+        var data = await r.json();
+        if (data && Array.isArray(data.streams) && data.streams.length) {
+          // Refresh our button list from the (now-live) MCM snapshot so names/IDs match producers.
+          this.streams = data.streams;
+        }
+        return !!(data && data.success);
+      } catch (e) {
+        return false;
+      }
     },
     async ensureLive() {
       if (!this.liveStreams.length) return;
@@ -467,31 +492,31 @@ createApp({
         this._liveStarting = false;
       }
     },
-    switchLiveStream() {
-      // MCM's WebRTC signaller and our single-manager model don't tolerate two concurrent
-      // playStream() calls on the same WebSocket: they race on availableStreams / startSession
-      // answers and cross-wire producer IDs. Serialize with a latest-wins token so rapid
-      // clicks (and duplicate triggers from the livePick watcher + ensureLive) collapse into
-      // one actual switch, with only the most recent selection ultimately played.
-      if (!this._live || !this.liveStreams.length) return Promise.resolve();
-      var self = this;
-      var token = ++self._liveSwitchGen;
-      var target = self.liveStreams[self.livePick] || self.liveStreams[0];
-      self.liveErr = '';
-      var prev = self._liveSwitchPromise;
-      var p = (async () => {
-        try { if (prev) await prev; } catch (_) {}
-        if (token !== self._liveSwitchGen) return; // superseded by a newer click
-        try {
-          await self._live.playStream(target.stream_id, target.name, target.rtsp_url);
-        } catch (e) {
-          if (token === self._liveSwitchGen) {
-            self.liveErr = (e && e.message) ? e.message : String(e);
+    async switchLiveStream() {
+      if (!this._live || !this.liveStreams.length) return;
+      var s = this.liveStreams[this.livePick] || this.liveStreams[0];
+      this.liveErr = '';
+      try {
+        await this._live.playStream(s.stream_id, s.name, s.rtsp_url);
+      } catch (e) {
+        if (this._isStreamNotFoundErr(e)) {
+          // MCM's WebRTC producer list was empty — its pipelines are not running yet.
+          // Kick them via the backend and retry once.
+          this.liveStatus = 'Starting camera pipelines on MCM…';
+          var kicked = await this._ensureMcmStreamsRunning();
+          if (kicked) {
+            var s2 = this.liveStreams[this.livePick] || this.liveStreams[0];
+            try {
+              await this._live.playStream(s2.stream_id, s2.name, s2.rtsp_url);
+              return;
+            } catch (e2) {
+              this.liveErr = (e2 && e2.message) ? e2.message : String(e2);
+              return;
+            }
           }
         }
-      })();
-      self._liveSwitchPromise = p;
-      return p;
+        this.liveErr = (e && e.message) ? e.message : String(e);
+      }
     },
     async _ensureQuad() {
       var self = this;
@@ -529,6 +554,35 @@ createApp({
         );
       }
       await Promise.all(tasks);
+      // If any slot reported a missing producer, kick MCM once and retry those slots.
+      var missing = [];
+      for (var mi = 0; mi < 4; mi++) {
+        if (self._liveQuadErr[mi] && self._isStreamNotFoundErr({ message: self._liveQuadErr[mi] })) {
+          missing.push(mi);
+        }
+      }
+      if (missing.length) {
+        self.liveStatus = 'Starting camera pipelines on MCM…';
+        var kicked = await self._ensureMcmStreamsRunning();
+        if (kicked) {
+          var retries = [];
+          missing.forEach(function (i) {
+            var s2 = self.liveStreams[i];
+            if (!s2 || !self._liveQuad[i]) return;
+            self._liveQuadErr[i] = '';
+            retries.push(
+              (async () => {
+                try {
+                  await self._liveQuad[i].playStream(s2.stream_id, s2.name, s2.rtsp_url);
+                } catch (e) {
+                  self._liveQuadErr[i] = (e && e.message) ? e.message : String(e);
+                }
+              })()
+            );
+          });
+          await Promise.all(retries);
+        }
+      }
     },
     _teardownSingle() {
       if (this._live) {
@@ -554,18 +608,9 @@ createApp({
       this.liveErr = '';
     },
     onLivePick(i) {
-      var modeChanged = this.liveViewMode !== 'single';
-      var pickChanged = this.livePick !== i;
-      if (modeChanged) this.liveViewMode = 'single';
-      if (pickChanged) this.livePick = i;
-      // If the single manager is already set up and only the pick changed, the livePick
-      // watcher already triggered switchLiveStream(). Avoid a duplicate call via ensureLive,
-      // which would race against the watcher on the same WebSocket. Otherwise we do need
-      // ensureLive to create/connect the manager (first click, or returning from quad).
-      if (this.tab !== 'live') return;
-      if (!this._live || modeChanged || !pickChanged) {
-        this.$nextTick(() => this.ensureLive());
-      }
+      if (this.liveViewMode !== 'single') this.liveViewMode = 'single';
+      if (this.livePick !== i) this.livePick = i;
+      if (this.tab === 'live') this.$nextTick(() => this.ensureLive());
     },
     liveFullscreen() {
       if (this.liveViewMode === 'quad') {
