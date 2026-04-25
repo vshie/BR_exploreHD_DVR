@@ -39,6 +39,33 @@ curl -s http://127.0.0.1:6010/status | python3 -m json.tool | grep -A6 '"usb"'
 
 You should see `"mounted": true` and the device path. If auto-detection misses an unusual enclosure, set `EXTERNAL_STORAGE_DEVICE=/dev/nvme0n1p1` (or the matching `sdX1`) on the extension to force it.
 
+#### Reference: NVMe vs SD card throughput on a Pi 5
+
+Numbers from a Pi 5 with a Patriot M.2 P300 256 GB NVMe (PCIe link `Speed 5GT/s, Width x1` — the Pi 5's default Gen2 x1) compared to its boot SD card, both `dd`'d through ext4 from inside the extension container:
+
+| Test | SD card (`/dev/mmcblk0p2`) | NVMe (`/dev/nvme0n1p1`) | NVMe / SD |
+|------|----------------------------|--------------------------|-----------|
+| Sequential write, 4 GiB, 1 MiB blocks, `fdatasync` | 73.5 MB/s | 396 MB/s | 5.4× |
+| Sequential read, 4 GiB, 1 MiB blocks (cache-primed) | 180 MB/s | 800 MB/s | 4.4× |
+| 64 KiB blocks, 1 GiB, `oflag=dsync` (fsync each block) | **8.5 MB/s** | **108 MB/s** | **12.7×** |
+| Sequential write, 4 GiB, 4 MiB blocks, no sync | 97.9 MB/s | 504 MB/s | 5.1× |
+
+The row that actually matters for this workload is the `oflag=dsync` one — that's the closest analogue to what `splitmuxsink` does on segment boundaries (write some payload, sync, finalize). Four exploreHD cameras at ~24 Mbps aggregate (~3 MB/s on disk) gives:
+
+- **SD card**: ~24× headroom on bulk writes but only ~2.8× on the worst-case sync-bound path. Any competing latency source (WiFi, container churn, segment finalize on a sibling cam) erodes that and starts tripping the recorder's stall watchdog.
+- **NVMe**: ~130× headroom on bulk, ~36× on the sync-bound path. Effectively unlimited margin.
+
+If you observe segment stalls on SD-only systems, this gap is the underlying reason; moving recording to the NVMe is the durable fix. If you want even more NVMe headroom, adding `dtparam=pciex1_gen=3` to `/boot/firmware/config.txt` lifts the link from Gen2 x1 (~500 MB/s ceiling) to Gen3 x1 (~1000 MB/s); not necessary for four 1080p30 H.264 cameras.
+
+`dd` invocation used (run inside the container at the target mount):
+
+```bash
+dd if=/dev/zero of=stest.bin bs=1M  count=4096 conv=fdatasync          # bulk write
+dd if=stest.bin of=/dev/null bs=1M                                      # read back
+dd if=/dev/zero of=stest.bin bs=64K count=16K conv=fdatasync oflag=dsync # sync-per-block
+dd if=/dev/zero of=stest.bin bs=4M  count=1024                          # bulk no-sync
+```
+
 ### 2. Camera power (4× exploreHD)
 
 Each exploreHD draws roughly 1.5 A at peak. The Pi 5's combined USB rail cannot run four of them on bus power — symptoms are random USB resets, MCM streams dropping in/out, and `dmesg` `xhci`/`port reset` errors. With **four** exploreHD cameras connected:
