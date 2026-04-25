@@ -11,6 +11,45 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 - **Web UI** (default port **6010**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
 
+## Hardware setup (Raspberry Pi 5)
+
+Do this once, before installing the extension.
+
+### 1. Prepare the NVMe drive (recommended recording target)
+
+The extension auto-detects an attached NVMe (or USB SSD) and prefers it over the SD card whenever it has ≥ 5 GB free. The drive must have a partition table and a filesystem; a brand-new disk ships raw and will not mount until you initialize it.
+
+> **WARNING**: these commands erase the target disk. Verify the device path with `lsblk` first — `/dev/nvme0n1` is the M.2 slot on the Pi 5; do **not** run them against `/dev/mmcblk0` (your boot SD) or any drive that holds data you want to keep.
+
+From a Pi shell (BlueOS host, **not** inside the container):
+
+```bash
+sudo wipefs -a /dev/nvme0n1
+sudo parted -s /dev/nvme0n1 mklabel gpt mkpart primary ext4 0% 100%
+sudo mkfs.ext4 -L BR_DVR /dev/nvme0n1p1
+```
+
+ext4 is preferred over exFAT/vfat for this workload: many small `.ts` segments with periodic `fsync`/finalize. exFAT and vfat are also supported (the image includes `exfat-fuse`), but vfat caps individual files at 4 GB.
+
+The 30 s storage probe will mount the new partition at `/mnt/usb` automatically; no extension restart required. Verify with:
+
+```bash
+curl -s http://127.0.0.1:6010/status | python3 -m json.tool | grep -A6 '"usb"'
+```
+
+You should see `"mounted": true` and the device path. If auto-detection misses an unusual enclosure, set `EXTERNAL_STORAGE_DEVICE=/dev/nvme0n1p1` (or the matching `sdX1`) on the extension to force it.
+
+### 2. Camera power (4× exploreHD)
+
+Each exploreHD draws roughly 1.5 A at peak. The Pi 5's combined USB rail cannot run four of them on bus power — symptoms are random USB resets, MCM streams dropping in/out, and `dmesg` `xhci`/`port reset` errors. With **four** exploreHD cameras connected:
+
+- Pick **two** of the four cameras and **disconnect the 5 V (red) wire** from their USB‑A connectors so they are no longer powered from the Pi's USB bus.
+- Splice those two 5 V leads to a separate, regulated **5 V supply** sized for ≥ 4 A combined (the cameras' grounds remain on the USB connector to share reference with the Pi). A common low-voltage drop is enough to cause intermittent stalls, so size the supply and wiring conservatively.
+- Leave the data lines (D+/D−) and ground on the USB‑A connector untouched.
+- The remaining two cameras stay fully USB-powered from the Pi.
+
+This split keeps the Pi's USB controller within its current budget while preserving USB enumeration and per-camera v4l2 paths through MCM. Three or fewer cameras can run entirely on Pi USB power without modification.
+
 ## BlueOS install
 
 ### Option A — Manual install via the BlueOS UI (recommended)
