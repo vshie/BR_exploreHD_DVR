@@ -35,6 +35,18 @@ v1.0.22 stall-signal fix (the big one):
     disk across all segments in the session (monotonic, rollover-safe) instead.
     Proven with an isolated test where rchar=97 KB over 60s while the output
     file grew from 10 MB to 82 MB.
+
+v1.0.24 segment naming:
+  - splitmuxsink writes segments under a fixed printf template (`seg_%05d.ts`)
+    because gst-launch can't handle the `format-location-full` signal that
+    would let us name files at creation. Instead, the watchdog promotes each
+    closed segment to `YYYYMMDD_HHMMSS.ts` in the operator's *browser-local*
+    time so file names match what the user reads on their wall clock when
+    they sift through recordings on USB or SD after a dive. The active
+    segment keeps its temp name until splitmuxsink rolls (or the recorder
+    stops); only then do we rename. The browser TZ is reported via POST /tz
+    and persisted in settings_store, so auto-record-on-boot still produces
+    correctly-named files after a reboot, before any browser has connected.
 """
 
 import logging
@@ -45,6 +57,8 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+
+from settings_store import browser_local_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +114,25 @@ RTSP_PROTOCOLS = os.environ.get("DVR_RTSP_PROTOCOLS", "udp+tcp").strip() or "udp
 def _sanitize_dir_name(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name.strip()) or "cam"
     return s[:80]
+
+
+# Active segments use the splitmuxsink template `seg_NNNNN.ts`. Once a segment
+# rolls over and is closed by splitmuxsink, the watchdog renames it to a
+# wall-clock timestamp in the operator's browser-local time (see
+# Recorder._finalize_completed_segments). The temp pattern is a regex so we
+# only ever rename our own files and never touch a renamed `YYYYMMDD_*.ts`.
+_TEMP_SEG_RE = re.compile(r"^seg_(\d+)\.ts$")
+
+
+def _format_segment_filename(epoch_seconds: float) -> str:
+    """Build a `YYYYMMDD_HHMMSS.ts` filename in the operator's browser-local time.
+
+    Sortable in shells/file browsers, contains no separators that would need
+    escaping, and matches what the user reads off their wall clock when they
+    are looking at the recordings on USB or SD after a dive.
+    """
+    local = browser_local_datetime(epoch_seconds)
+    return local.strftime("%Y%m%d_%H%M%S") + ".ts"
 
 
 def _read_session_bytes(cam_dir: str) -> Optional[int]:
@@ -166,6 +199,14 @@ class Recorder:
         # Number of consecutive watchdog polls that have seen the stall condition.
         # We only restart when this reaches STALL_CONFIRM_POLLS.
         self._stall_streak: int = 0
+
+        # First-observation wall clock for each `seg_NNNNN.ts` we see in this
+        # cam_dir. The watchdog runs every WATCHDOG_INTERVAL_S, so this is the
+        # actual segment start time to within ~5s. When the segment rolls and
+        # we promote the closed file to its `YYYYMMDD_HHMMSS.ts` filename, we
+        # use the value stashed here instead of mtime (which on a closed
+        # segment reflects the END of the segment, not the start).
+        self._segment_first_observed: Dict[str, float] = {}
 
     def _segment_pattern(self) -> str:
         base = os.path.join(self.cam_dir, "seg_%05d.ts")
@@ -237,6 +278,101 @@ class Recorder:
         except OSError:
             return None
 
+    def _finalize_completed_segments(self, include_active: bool = False):
+        """Rename closed `seg_NNNNN.ts` files to `YYYYMMDD_HHMMSS.ts`.
+
+        splitmuxsink writes one segment at a time using the printf template
+        `seg_%05d.ts`; rolling to a new index implies the previous file is
+        closed and safe to rename. This pass runs every watchdog tick.
+
+        Strategy:
+          - Scan the cam_dir for files matching `seg_NNNNN.ts`.
+          - First-observation wall clock for each one is recorded into
+            `_segment_first_observed`. For files that were already on disk
+            before this Recorder instance saw them (e.g. from a pipeline
+            restart in the same session), fall back to `mtime - segment_secs`
+            since splitmuxsink's mtime on a closed file is the segment END,
+            and segments are nominally `segment_ns` long.
+          - Identify the active segment (largest mtime; on ties, largest index)
+            and skip it — its filename is still bound to the running pipeline.
+            Pass `include_active=True` when the pipeline has been torn down
+            (stop or crash) so the trailing segment also gets renamed.
+          - Rename every other `seg_*.ts` to its first-observed timestamp.
+
+        On a fresh pipeline restart, splitmuxsink resets to seg_00000 by
+        default. With this rename in place there's no conflict: prior closed
+        segments have been promoted to timestamp filenames already, so the
+        seg_00000 namespace is always free.
+        """
+        try:
+            candidates: List[Any] = []
+            with os.scandir(self.cam_dir) as it:
+                for entry in it:
+                    m = _TEMP_SEG_RE.match(entry.name)
+                    if not m:
+                        continue
+                    if not entry.is_file():
+                        continue
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    candidates.append((entry.name, int(m.group(1)), st.st_mtime))
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.debug(f"[cam{self.index}] scandir failed: {e}")
+            return
+        if not candidates:
+            return
+
+        now_wall = time.time()
+        seg_secs = max(1.0, self.segment_ns / 1_000_000_000.0)
+        for name, _, mtime in candidates:
+            if name in self._segment_first_observed:
+                continue
+            # New file appearing within roughly one segment-duration of now is
+            # almost certainly a brand-new segment we just saw being created;
+            # treat now() as its start. Anything older predates us — best-effort
+            # back-date to mtime - segment_secs.
+            if (now_wall - mtime) < seg_secs:
+                self._segment_first_observed[name] = now_wall
+            else:
+                self._segment_first_observed[name] = max(0.0, mtime - seg_secs)
+
+        # Active segment = largest (mtime, index). The pipeline is still
+        # writing it so its filename must stay seg_NNNNN.ts. When the caller
+        # signals the pipeline is gone (`include_active=True`), there is no
+        # active segment and every leftover seg_*.ts is fair game.
+        candidates.sort(key=lambda t: (t[2], t[1]))
+        active_name = None if include_active else candidates[-1][0]
+
+        for name, _idx, _mtime in candidates:
+            if active_name is not None and name == active_name:
+                continue
+            start_epoch = self._segment_first_observed.get(name, now_wall)
+            new_name = _format_segment_filename(start_epoch)
+            src = os.path.join(self.cam_dir, name)
+            dst = os.path.join(self.cam_dir, new_name)
+            # Two segments could in theory finalize within the same wall-clock
+            # second (rare; segment_secs >> 1s). Append `_N` to disambiguate.
+            n = 1
+            while os.path.exists(dst):
+                base = new_name[: -len(".ts")]
+                dst = os.path.join(self.cam_dir, f"{base}_{n}.ts")
+                n += 1
+            try:
+                os.rename(src, dst)
+                self._segment_first_observed.pop(name, None)
+                logger.info(
+                    f"[cam{self.index}] segment {name} -> {os.path.basename(dst)}"
+                )
+            except OSError as e:
+                logger.warning(
+                    f"[cam{self.index}] failed to rename {name} -> "
+                    f"{os.path.basename(dst)}: {e}"
+                )
+
     def _update_file_status(self):
         """Refresh current_segment / last_size for the status UI. Informational only."""
         path = self._latest_ts()
@@ -276,6 +412,7 @@ class Recorder:
                 logger.error(f"[cam{self.index}] disk critically low ({free} MB), stopping recorder")
                 self.last_error = f"Disk full (<{MIN_FREE_DISK_MB} MB free)"
                 self._stop_pipeline()
+                self._finalize_completed_segments(include_active=True)
                 self.state = "disk_stopped"
                 if self.on_disk_critical:
                     try:
@@ -304,6 +441,7 @@ class Recorder:
                 backoff = BACKOFF_START
 
             self._update_file_status()
+            self._finalize_completed_segments()
 
             if self._pipeline_stalled():
                 self._stall_streak += 1
@@ -314,6 +452,10 @@ class Recorder:
                         f"{self._stall_streak} polls), restarting pipeline"
                     )
                     self._stop_pipeline()
+                    # Pipeline is gone; promote the trailing seg_NNNNN.ts so
+                    # the next run starts with a fresh seg_00000 namespace and
+                    # the stalled segment shows up under its real start time.
+                    self._finalize_completed_segments(include_active=True)
                     self.last_size = 0
                     self.last_grow_time = None
                     self._last_session_bytes = None
@@ -331,6 +473,9 @@ class Recorder:
             time.sleep(WATCHDOG_INTERVAL_S)
 
         self._stop_pipeline()
+        # Final pass: rename the trailing seg_NNNNN.ts now that nothing is
+        # writing to it anymore. This is the segment the user just stopped on.
+        self._finalize_completed_segments(include_active=True)
         self.state = "stopped"
 
     def _start_pipeline(self) -> bool:
@@ -366,6 +511,11 @@ class Recorder:
         self._last_session_bytes = _read_session_bytes(self.cam_dir)
         self._last_bytes_growth_mono = self._pipeline_start_mono
         self._stall_streak = 0
+        # A new pipeline run resets splitmuxsink's segment numbering to
+        # seg_00000; clear our first-observation map so we don't reuse a stale
+        # start time if any seg_NNNNN.ts left over from a prior run is now
+        # being written to (rather than renamed first).
+        self._segment_first_observed.clear()
         return True
 
     def _stop_pipeline(self):

@@ -10,11 +10,38 @@
     :root { --bg: #0d1117; --card: #161b22; --bd: #30363d; --tx: #e6edf3; --muted: #8b949e; --acc: #58a6ff; --err: #f85149; --ok: #3fb950; --warn: #d29922; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
-    header { padding: 12px 16px; border-bottom: 1px solid var(--bd); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-    h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
-    h1 .ver { margin-left: 6px; font-size: 0.75rem; font-weight: 400; color: var(--muted); }
-    nav button { margin-right: 6px; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--bd); background: var(--card); color: var(--tx); cursor: pointer; }
-    nav button.active { border-color: var(--acc); color: var(--acc); }
+    /* The page is dark, but the header is white so the brand logos read
+       cleanly. Scope all the light-on-dark overrides under `header` so the
+       rest of the UI keeps its dark palette. */
+    header {
+      padding: 12px 16px;
+      background: #ffffff;
+      color: #0d1117;
+      border-bottom: 1px solid #d0d7de;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: #0d1117; justify-self: start; }
+    header h1 .ver { margin-left: 6px; font-size: 0.75rem; font-weight: 400; color: #57606a; }
+    .header-logos { display: flex; align-items: center; gap: 14px; justify-self: center; }
+    .header-logos img { display: block; height: 28px; width: auto; }
+    header nav { justify-self: end; }
+    header nav button {
+      margin-right: 6px;
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: 1px solid #d0d7de;
+      background: #ffffff;
+      color: #0d1117;
+      cursor: pointer;
+    }
+    header nav button.active { border-color: var(--acc); color: var(--acc); }
+    @media (max-width: 900px) {
+      header { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+      header h1, header nav, .header-logos { justify-self: center; }
+    }
     main { padding: 16px; max-width: 1200px; margin: 0 auto; }
     main.live-open { max-width: none; padding: 8px 12px; }
     .banner { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--bd); }
@@ -143,6 +170,10 @@
 <div id="app">
   <header>
     <h1>BR_exploreHD_DVR<span v-if="status.version" class="ver">v{{ status.version }}</span></h1>
+    <div class="header-logos">
+      <img src="/static/logo-bluerobotics.jpg" alt="Blue Robotics" />
+      <img src="/static/logo-bom.png" alt="Blue Ocean Mapping" />
+    </div>
     <nav>
       <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
       <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
@@ -267,7 +298,10 @@
       <div v-for="d in days" :key="'x'+d.date">
         <div v-if="expanded[d.date]" style="margin:8px 0 16px 24px" class="card">
           <div v-for="s in d.sessions" :key="s.id" style="margin-bottom:10px">
-            <div class="muted">Session {{ s.id }} ({{ s.storage }}) — {{ fmtBytes(s.bytes) }}</div>
+            <div class="row" style="align-items:center; gap:8px">
+              <div class="muted" style="flex:1">Session {{ s.id }} ({{ s.storage }}) — {{ fmtBytes(s.bytes) }}</div>
+              <button class="btn" @click="downloadOneSession(d.date, s)">Session zip</button>
+            </div>
             <div v-for="c in s.cams" :key="c.name" style="margin-left:8px">
               <div>{{ c.name }}</div>
               <ul style="margin:4px 0; padding-left:18px">
@@ -302,7 +336,10 @@
           <span v-else-if="downloadModal.phase==='error'">Download failed</span>
           <span v-else>Download</span>
         </h3>
-        <p v-if="downloadModal.dates?.length" class="muted" style="margin-top:4px">
+        <p v-if="downloadModal.session" class="muted" style="margin-top:4px">
+          Session {{ downloadModal.session }} ({{ downloadModal.dates[0] }})
+        </p>
+        <p v-else-if="downloadModal.dates?.length" class="muted" style="margin-top:4px">
           {{ downloadModal.dates.length }} day(s): {{ downloadModal.dates.join(', ') }}
         </p>
         <div v-if="downloadModal.phase==='scanning'" class="muted" style="margin:12px 0">
@@ -370,6 +407,7 @@ createApp({
         open: false,
         phase: 'scanning',
         dates: [],
+        session: '',
         file_count: 0,
         total_bytes: 0,
         estimated_zip_bytes: 0,
@@ -433,6 +471,12 @@ createApp({
     },
   },
   mounted() {
+    // Tell the backend our local TZ so segment timestamps and the calendar-day
+    // session directory match what the operator sees on this clock. We send on
+    // mount, on visibility change (laptop sleep can cross a TZ boundary), and
+    // when the user clicks Start/resume.
+    this.reportBrowserTz();
+    document.addEventListener('visibilitychange', this._onVisibility);
     this.tick();
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
@@ -442,9 +486,36 @@ createApp({
   },
   unmounted() {
     clearInterval(this.poll);
+    document.removeEventListener('visibilitychange', this._onVisibility);
     this.teardownLive();
   },
   methods: {
+    // JS getTimezoneOffset returns minutes WEST of UTC (UTC-10 -> +600); we
+    // store EAST of UTC on the server (UTC-10 -> -600) so the sign matches
+    // what people read on `UTC±N` labels. Try to also pass the IANA name when
+    // available — purely informational, the offset is what drives naming.
+    async reportBrowserTz() {
+      try {
+        const offset = -new Date().getTimezoneOffset();
+        let name = null;
+        try {
+          if (Intl && Intl.DateTimeFormat) {
+            name = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+          }
+        } catch (_) { /* not all engines expose it; offset is enough */ }
+        await fetch('/tz', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tz_offset_minutes: offset, tz_name: name }),
+        });
+      } catch (e) {
+        // Non-fatal: backend will just keep using its previous TZ guess (or
+        // device local time on a fresh install).
+      }
+    },
+    _onVisibility() {
+      if (!document.hidden) this.reportBrowserTz();
+    },
     requestFullscreenOn(el) {
       if (!el) return;
       if (el.requestFullscreen) el.requestFullscreen();
@@ -785,6 +856,7 @@ createApp({
         open: true,
         phase: 'scanning',
         dates: dates.slice(),
+        session: '',
         file_count: 0,
         total_bytes: 0,
         estimated_zip_bytes: 0,
@@ -837,6 +909,39 @@ createApp({
     downloadOneDay(date) {
       this._beginDownload([date], '/download_day/' + encodeURIComponent(date));
     },
+    /**
+     * Per-session download. We already know the session's file_count/bytes
+     * from /recordings, so we skip the preflight POST and go straight to
+     * 'starting' — the user gets visible feedback immediately. The backend
+     * short-circuits to the pre-built <sessionId>.zip when one exists, so
+     * for completed sessions this is essentially a direct file send.
+     */
+    async downloadOneSession(date, sess) {
+      this.downloadModal = Object.assign({}, this.downloadModal, {
+        open: true,
+        phase: 'starting',
+        dates: [date],
+        session: sess.id,
+        file_count: sess.file_count || 0,
+        total_bytes: sess.bytes || 0,
+        estimated_zip_bytes: sess.bytes || 0,
+        error: '',
+      });
+      this._startDownloadTimer();
+      const zipUrl = '/download_session/' + encodeURIComponent(date) + '/' + encodeURIComponent(sess.id);
+      await this.$nextTick();
+      const a = document.createElement('a');
+      a.href = zipUrl;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => {
+        if (this.downloadModal.open && this.downloadModal.phase === 'starting') {
+          this.downloadModal.phase = 'streaming';
+        }
+      }, 600);
+    },
     downloadSelected() {
       if (!this.selectedDates.length) return;
       const qs = this.selectedDates.map(function (d) { return 'd=' + encodeURIComponent(d); }).join('&');
@@ -883,7 +988,14 @@ createApp({
       }
     },
     async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
-    async startRec() { await fetch('/start', { method: 'POST' }); this.tick(); this.loadStreams(); },
+    async startRec() {
+      // Send our TZ first so the new session directory and any segment
+      // rolls happen in the operator's local time on the very first tick.
+      await this.reportBrowserTz();
+      await fetch('/start', { method: 'POST' });
+      this.tick();
+      this.loadStreams();
+    },
     async restartCam(i) { await fetch('/cam/' + i + '/restart', { method: 'POST' }); },
     async retryBoot() {
       await fetch('/boot/retry', { method: 'POST' });

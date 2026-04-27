@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.23"
+VERSION = "1.0.25"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -343,6 +343,37 @@ def route_settings_post():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+@app.route("/tz", methods=["POST"])
+def route_tz_post():
+    """Persist the operator's browser TZ so segment timestamps and the calendar-day
+    session directory match what they see in the UI.
+
+    Body: {"tz_offset_minutes": <signed int, minutes east of UTC>, "tz_name": "<IANA>"}.
+    The browser computes this as `-(new Date()).getTimezoneOffset()` (JS reports
+    minutes WEST of UTC; we store EAST so the sign matches conventional usage).
+    """
+    data = request.get_json(silent=True) or {}
+    if "tz_offset_minutes" not in data:
+        return jsonify({"success": False, "message": "tz_offset_minutes required"}), 400
+    try:
+        merged = save_settings(
+            {
+                "browser_tz_offset_minutes": data.get("tz_offset_minutes"),
+                "browser_tz_name": data.get("tz_name"),
+            }
+        )
+        return jsonify(
+            {
+                "success": True,
+                "tz_offset_minutes": merged.get("browser_tz_offset_minutes"),
+                "tz_name": merged.get("browser_tz_name"),
+            }
+        )
+    except Exception as e:
+        logger.exception("tz post failed")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
 @app.route("/start", methods=["POST"])
 def route_start():
     global stopped_by_user, streams_snapshot, _disk_stopped
@@ -413,6 +444,30 @@ def _walk_day(date_str: str) -> List[Tuple[str, str]]:
         if not os.path.isdir(day):
             continue
         for dirpath, _, files in os.walk(day):
+            for fn in files:
+                if fn.endswith(".ts") or fn.endswith(".zip"):
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, root)
+                    arc = f"{label}/{rel}".replace("\\", "/")
+                    items.append((full, arc))
+    return items
+
+
+def _walk_session(date_str: str, session_id: str) -> List[Tuple[str, str]]:
+    """Return (full_path, archive_relative_path) tuples for one session across SD+USB.
+
+    Used by the per-session download route. A session_id is a UUID-like name with
+    no separators, so we reject anything that could traverse out of the date dir.
+    """
+    items: List[Tuple[str, str]] = []
+    if "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+        return items
+    for root in _storage_roots():
+        label = "sd" if root == RECORDINGS_LOCAL else "usb"
+        sp = os.path.join(root, date_str, session_id)
+        if not os.path.isdir(sp):
+            continue
+        for dirpath, _, files in os.walk(sp):
             for fn in files:
                 if fn.endswith(".ts") or fn.endswith(".zip"):
                     full = os.path.join(dirpath, fn)
@@ -685,6 +740,32 @@ def route_download_day(date: str):
     if not items:
         return jsonify({"success": False, "message": "No files"}), 404
     return _download_response(items, f"BR_exploreHD_DVR_{date}.zip")
+
+
+@app.route("/download_session/<date>/<session>", methods=["GET"])
+def route_download_session(date: str, session: str):
+    """Download a single session as one .zip.
+
+    Completed sessions already have a pre-built `<sessionId>.zip` written by
+    boot_manager; serving that file directly avoids re-zipping multi-GB
+    archives just to deliver bytes the OS already has on disk. For sessions
+    that don't have a prebuilt zip yet (the active one, or a session whose
+    boot-zip hasn't run on this storage), we fall back to streaming a
+    ZIP_STORED archive of the .ts segments — same path the day-zip uses.
+    """
+    if not re.match(r"^\d{8}$", date):
+        return jsonify({"success": False, "message": "Bad date"}), 400
+    if "/" in session or "\\" in session or session in (".", ".."):
+        return jsonify({"success": False, "message": "Bad session"}), 400
+    download_name = f"BR_exploreHD_DVR_{date}_{session}.zip"
+    for root in _storage_roots():
+        zp = os.path.join(root, date, session, f"{session}.zip")
+        if os.path.isfile(zp):
+            return send_file(zp, as_attachment=True, download_name=download_name)
+    items = _walk_session(date, session)
+    if not items:
+        return jsonify({"success": False, "message": "No files"}), 404
+    return _download_response(items, download_name)
 
 
 def _dates_from_query() -> List[str]:

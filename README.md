@@ -162,8 +162,10 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 ## Recording layout
 
 ```
-/app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/seg_00001.ts
+/app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/YYYYMMDD_HHMMSS.ts
 ```
+
+The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to its actual start time within ~5 s. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop).
 
 When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
 
@@ -176,8 +178,10 @@ When external storage is mounted at `/mnt/usb` with enough free space, recording
 - `POST /boot/retry` — re-run boot (e.g. after fixing MCM).
 - `GET /recordings` — days + sessions + segment download URLs.
 - `GET /download_day/<YYYYMMDD>` — zip one calendar day (`sd/` and `usb/` prefixes inside zip if both exist).
+- `GET /download_session/<YYYYMMDD>/<sessionId>` — zip one session. Serves the pre-built `<sessionId>.zip` directly when present; otherwise stream-zips the session's `.ts` segments.
 - `POST /download_days` — JSON `{"dates":["YYYYMMDD",...]}` → zip.
 - `POST /recordings/delete` — JSON `{"dates":[...]}` (skips the calendar day of the active session).
+- `POST /tz` — JSON `{"tz_offset_minutes": <signed int east of UTC>, "tz_name": "<IANA tz>"}` to inform the extension of the operator's browser-local timezone. The Web UI sends this on load and on visibility changes; only needed externally if you drive the API without the bundled UI.
 
 ## Live view
 

@@ -7,11 +7,11 @@ import os
 import time
 import uuid
 import zipfile
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import usb_storage
 from mcm_client import wait_for_streams
+from settings_store import browser_local_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +161,10 @@ def run_boot_sequence(
     boot_stage = "ready"
     recording_base = choose_recording_base()
     session_id = str(uuid.uuid4())
-    today = datetime.now().strftime("%Y%m%d")
+    # Use the operator's last-known browser TZ for the calendar-day directory
+    # so it matches the segment timestamps written under it. Falls back to the
+    # container's local time (UTC) if no browser has reported a TZ yet.
+    today = browser_local_datetime().strftime("%Y%m%d")
     session_path = os.path.join(recording_base, today, session_id)
     os.makedirs(session_path, exist_ok=True)
     logger.info(f"New session directory: {session_path}")
