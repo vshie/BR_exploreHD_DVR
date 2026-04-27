@@ -12,9 +12,11 @@
     body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
     /* The page is dark, but the header is white so the brand logos read
        cleanly. Scope all the light-on-dark overrides under `header` so the
-       rest of the UI keeps its dark palette. */
+       rest of the UI keeps its dark palette. The header has a fixed height
+       so the logo elements can stretch to 100% of it; vertical padding lives
+       on the logos via box-sizing: border-box, not on the header. */
     header {
-      padding: 12px 16px;
+      padding: 0 16px;
       background: #ffffff;
       color: #0d1117;
       border-bottom: 1px solid #d0d7de;
@@ -22,11 +24,29 @@
       grid-template-columns: 1fr auto 1fr;
       align-items: center;
       gap: 12px;
+      height: 56px;
     }
     header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: #0d1117; justify-self: start; }
     header h1 .ver { margin-left: 6px; font-size: 0.75rem; font-weight: 400; color: #57606a; }
-    .header-logos { display: flex; align-items: center; gap: 14px; justify-self: center; }
-    .header-logos img { display: block; height: 28px; width: auto; }
+    .header-logos {
+      display: flex;
+      align-items: stretch;
+      gap: 14px;
+      justify-self: center;
+      align-self: stretch;
+      height: 100%;
+    }
+    .header-logos img { display: block; height: 100%; width: auto; }
+    /* The Blue Robotics wordmark uses white text for "Robotics", which would
+       disappear on the white header. Frame just that logo in a small black
+       pill so it reads correctly. The BOM mark is dark-navy on white and
+       needs no backing. */
+    .header-logos img.br-logo {
+      padding: 4px 10px;
+      background: #000;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
     header nav { justify-self: end; }
     header nav button {
       margin-right: 6px;
@@ -39,8 +59,15 @@
     }
     header nav button.active { border-color: var(--acc); color: var(--acc); }
     @media (max-width: 900px) {
-      header { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+      header {
+        height: auto;
+        padding: 8px 16px;
+        grid-template-columns: 1fr;
+        justify-items: center;
+        text-align: center;
+      }
       header h1, header nav, .header-logos { justify-self: center; }
+      .header-logos { height: 48px; align-self: auto; }
     }
     main { padding: 16px; max-width: 1200px; margin: 0 auto; }
     main.live-open { max-width: none; padding: 8px 12px; }
@@ -171,7 +198,7 @@
   <header>
     <h1>BR_exploreHD_DVR<span v-if="status.version" class="ver">v{{ status.version }}</span></h1>
     <div class="header-logos">
-      <img src="/static/logo-bluerobotics.jpg" alt="Blue Robotics" />
+      <img class="br-logo" src="/static/logo-bluerobotics.png" alt="Blue Robotics" />
       <img src="/static/logo-bom.png" alt="Blue Ocean Mapping" />
     </div>
     <nav>
