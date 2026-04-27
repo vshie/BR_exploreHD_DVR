@@ -12,9 +12,14 @@
     body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
     /* The page is dark, but the header is white so the brand logos read
        cleanly. Scope all the light-on-dark overrides under `header` so the
-       rest of the UI keeps its dark palette. The header has a fixed height
-       so the logo elements can stretch to 100% of it; vertical padding lives
-       on the logos via box-sizing: border-box, not on the header. */
+       rest of the UI keeps its dark palette.
+
+       Logo sizing uses fixed pixel heights instead of height:100%. Reason:
+       img height:100% inside a flex/grid container creates a circular
+       intrinsic-size loop with the img's natural 1024x155 dimensions, and
+       at wider viewports browsers resolve that loop by using the natural
+       size — which blows the header out to ~155px tall. Pixel heights are
+       deterministic and let the header be driven naturally by content. */
     header {
       padding: 0 16px;
       background: #ffffff;
@@ -24,24 +29,22 @@
       grid-template-columns: 1fr auto 1fr;
       align-items: center;
       gap: 12px;
-      height: 56px;
     }
     header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: #0d1117; justify-self: start; }
     header h1 .ver { margin-left: 6px; font-size: 0.75rem; font-weight: 400; color: #57606a; }
     .header-logos {
       display: flex;
-      align-items: stretch;
+      align-items: center;
       gap: 14px;
       justify-self: center;
-      align-self: stretch;
-      height: 100%;
     }
-    .header-logos img { display: block; height: 100%; width: auto; }
+    .header-logos img { display: block; height: 48px; width: auto; }
     /* The Blue Robotics wordmark uses white text for "Robotics", which would
        disappear on the white header. Frame just that logo in a small black
        pill so it reads correctly. The BOM mark is dark-navy on white and
        needs no backing. */
     .header-logos img.br-logo {
+      height: 48px;
       padding: 4px 10px;
       background: #000;
       border-radius: 6px;
@@ -58,16 +61,48 @@
       cursor: pointer;
     }
     header nav button.active { border-color: var(--acc); color: var(--acc); }
-    @media (max-width: 900px) {
+    /* The BlueOS extension panel iframes us at ~720-780px wide, which is too
+       narrow for the 3-column inline layout (the BR pill is wide). Use a
+       2-row grid here: logos centered on top, title-left + nav-right on the
+       second row. Much more compact than full mobile stacking. */
+    @media (max-width: 1100px) {
       header {
+        grid-template-columns: auto auto;
+        grid-template-areas:
+          "logos logos"
+          "title nav";
+        grid-template-rows: auto auto;
         height: auto;
-        padding: 8px 16px;
+        padding: 4px 12px;
+        gap: 4px 12px;
+      }
+      header h1 { grid-area: title; justify-self: start; }
+      header nav { grid-area: nav; justify-self: end; }
+      .header-logos {
+        grid-area: logos;
+        justify-self: center;
+        align-self: center;
+      }
+      .header-logos img,
+      .header-logos img.br-logo { height: 36px; }
+    }
+    /* True mobile / very narrow: title also drops to its own line. The user
+       confirmed this 3-row stack is fine at phone widths. */
+    @media (max-width: 540px) {
+      header {
         grid-template-columns: 1fr;
+        grid-template-areas:
+          "logos"
+          "title"
+          "nav";
+        grid-template-rows: auto auto auto;
         justify-items: center;
         text-align: center;
       }
-      header h1, header nav, .header-logos { justify-self: center; }
-      .header-logos { height: 48px; align-self: auto; }
+      header h1, header nav { justify-self: center; }
+      .header-logos { justify-self: center; }
+      .header-logos img,
+      .header-logos img.br-logo { height: 44px; }
     }
     main { padding: 16px; max-width: 1200px; margin: 0 auto; }
     main.live-open { max-width: none; padding: 8px 12px; }
