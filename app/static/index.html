@@ -118,6 +118,9 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--bd); }
     .pill.run { border-color: var(--ok); color: var(--ok); }
     .pill.bad { border-color: var(--err); color: var(--err); }
+    /* Legacy small status chip kept around for any future use; the live UI
+       now uses .dvr-banner below header for the primary auto-download
+       status surface. */
     .autodl-chip {
       display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
       padding: 6px 12px; border-radius: 8px; margin-bottom: 12px;
@@ -125,6 +128,79 @@
     }
     .autodl-chip.draining { border-color: var(--warn); background: #2d2a1b; }
     .autodl-chip code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85em; }
+
+    /* Global auto-download banner: visible directly under the header on
+       every tab. Left side has an icon-style toggle + status text/countdown.
+       Right side has the Stop & finish downloads button. Color encodes the
+       system state — see `bannerState` computed in the Vue component for
+       the truth table:
+         red     = recording, folder picked, downloads streaming silently
+         amber   = recording, no folder picked (Save-As prompts will fire)
+         yellow  = post-stop drain in progress OR pending segments queued
+         green   = idle, all downloads complete
+         neutral = auto-download paused, or no recording activity yet
+       Border + background are tinted; the text stays white-on-dark for
+       legibility regardless of state. */
+    .dvr-banner {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+      border: 1px solid var(--bd); background: var(--card);
+      font-size: 0.92rem; flex-wrap: wrap;
+    }
+    .dvr-banner .left {
+      display: flex; align-items: center; gap: 10px;
+      flex: 1 1 auto; min-width: 0; flex-wrap: wrap;
+    }
+    .dvr-banner .right { display: flex; align-items: center; gap: 8px; }
+    .dvr-banner .label { font-weight: 500; }
+    .dvr-banner .countdown {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .dvr-banner .sublabel { font-size: 0.82rem; color: var(--muted); }
+    .dvr-banner.red    { border-color: var(--err);  background: #3d1b1b; }
+    .dvr-banner.amber  { border-color: #d29922;     background: #2d2418; }
+    .dvr-banner.yellow { border-color: var(--warn); background: #2d2a1b; }
+    .dvr-banner.green  { border-color: var(--ok);   background: #11271a; }
+    .dvr-banner.neutral{ border-color: var(--bd);   background: var(--card); }
+
+    /* Icon-style auto-download slider toggle (banner left). The label stays
+       hidden visually but is announced to screen readers; the slider track
+       and knob convey the on/off state. Latched-on color matches the
+       per-state banner color so the toggle visually agrees with whatever
+       the banner is currently asserting. */
+    .dvr-toggle {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .dvr-toggle input { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; }
+    .dvr-toggle .track {
+      width: 38px; height: 20px;
+      background: #30363d; border: 1px solid var(--bd);
+      border-radius: 999px; position: relative;
+      transition: background 120ms ease, border-color 120ms ease;
+    }
+    .dvr-toggle .knob {
+      position: absolute;
+      top: 1px; left: 1px;
+      width: 16px; height: 16px;
+      background: #c9d1d9;
+      border-radius: 50%;
+      transition: transform 120ms ease, background 120ms ease;
+    }
+    .dvr-toggle.on .track { background: var(--ok); border-color: var(--ok); }
+    .dvr-toggle.on .knob  { transform: translateX(18px); background: #ffffff; }
+    .dvr-toggle .toggle-label { font-size: 0.85rem; color: var(--muted); }
+    .dvr-toggle.on .toggle-label { color: var(--tx); }
+    .dvr-toggle.disabled { cursor: not-allowed; opacity: 0.6; }
     .live-layout { display: flex; flex-direction: column; gap: 6px; }
     /* Fill the remaining viewport below header + toolbar. Header is ~52px, the
        Live toolbar ~40px, main padding 8px top + 8px bottom, plus a few px of
@@ -269,41 +345,51 @@
     <div v-else-if="status.boot_stage && status.boot_stage !== 'recording'" class="banner">
       Boot: {{ status.boot_stage }}…
     </div>
-    <!-- Global auto-download chip: visible on every tab so the operator can
-         see download cadence / drain state while watching Live or browsing
-         Recordings, not just from the Status tab. Hidden when the feature is
-         off and nothing is being drained, so it doesn't add noise. -->
-    <div
-      v-if="status.auto_download_enabled || autoDl.draining"
-      class="autodl-chip"
-      :class="{ draining: autoDl.draining }"
-    >
-      <span class="pill" :class="{ run: !autoDl.draining }">
-        {{ autoDl.draining ? 'Finalizing' : 'Auto-download ON' }}
-      </span>
-      <span v-if="autoDl.draining" class="muted">{{ autoDl.drainLabel || 'draining queued segments…' }}</span>
-      <span v-else class="muted">{{ autoDl.nextLabel || 'scheduling…' }}</span>
-      <span v-if="fsApi.folderName" class="muted">
-        · saves silently to <code>{{ fsApi.folderName }}</code>
-      </span>
-      <span v-else class="muted">
-        · per-file Save-As dialog active (Status tab → <em>Choose download folder…</em>)
-      </span>
+    <!-- Global auto-download banner: visible directly under the header on
+         every tab. Single source of truth for system state — color encodes
+         recording / drain / idle, left side shows status text + 5-min
+         countdown to the next segment close, right side hosts the
+         Stop & finish downloads button. See `bannerState` computed for the
+         color truth table. -->
+    <div class="dvr-banner" :class="bannerState.color">
+      <div class="left">
+        <label
+          class="dvr-toggle"
+          :class="{ on: !!status.auto_download_enabled, disabled: settingsSaving }"
+          :title="status.auto_download_enabled ? 'Auto-download is ON — click to pause' : 'Auto-download is OFF — click to enable'"
+        >
+          <input
+            type="checkbox"
+            :checked="!!status.auto_download_enabled"
+            :disabled="settingsSaving"
+            @change="toggleAutoDownload"
+            aria-label="Auto-download"
+          />
+          <span class="track"><span class="knob"></span></span>
+          <span class="toggle-label">Auto-download</span>
+        </label>
+        <span class="label">{{ bannerState.label }}</span>
+        <span v-if="bannerState.showCountdown" class="countdown">{{ bannerCountdownLabel }}</span>
+        <span v-if="bannerState.sublabel" class="sublabel">{{ bannerState.sublabel }}</span>
+      </div>
+      <div class="right">
+        <button
+          v-if="bannerState.showStop"
+          type="button"
+          class="btn"
+          @click="stopAndFinalize"
+          :disabled="bannerState.stopDisabled"
+          title="Stop the recorders, tear down Live (frees the network for downloads), then immediately drain every closed segment that hasn't been auto-downloaded yet. Repeats until the cursor catches up to the last finalized segment so you can close the tab when it's done."
+        >
+          {{ autoDl.draining ? 'Finalizing…' : 'Stop & finish downloads' }}
+        </button>
+      </div>
     </div>
 
     <section v-show="tab==='status'">
       <div class="row" style="margin-bottom:12px">
         <button class="btn" @click="stopRec" :disabled="!status.cams?.length">Stop all</button>
         <button class="btn primary" @click="startRec" :disabled="!status.cams?.length && status.boot_error">Start / resume</button>
-        <button
-          type="button"
-          class="btn"
-          @click="stopAndFinalize"
-          :disabled="!status.cams?.length || autoDl.draining"
-          title="Stop the recorders, tear down Live (frees the network for downloads), then immediately drain every closed segment that hasn't been auto-downloaded yet. Repeats until the cursor catches up to the last finalized segment so you can close the tab when it's done."
-        >
-          {{ autoDl.draining ? 'Finalizing…' : 'Stop & finalize downloads' }}
-        </button>
         <button
           type="button"
           class="btn"
@@ -316,33 +402,10 @@
         </button>
         <span class="muted">Session: {{ status.session_id || '—' }}</span>
       </div>
-      <div class="row" style="margin-bottom:12px; align-items:center">
-        <button
-          type="button"
-          class="btn"
-          :class="{ latched: status.auto_download_enabled === true }"
-          :disabled="settingsSaving"
-          @click="toggleAutoDownload"
-          title="Every minute the timer checks for newly-closed segments. If there's something new and a download folder is selected, the segments stream silently into that folder. If nothing has closed since the last download, the tick is a quiet no-op (no status .txt drip). Without a download folder, the timer triggers a per-file Save-As prompt for each new batch."
-        >
-          Auto-download: {{ status.auto_download_enabled ? 'ON' : 'OFF' }}
-        </button>
-        <label class="muted" style="display:flex; align-items:center; gap:6px">
-          every
-          <input
-            type="number"
-            min="1"
-            max="1440"
-            v-model.number="autoDl.interval_minutes"
-            @change="saveAutoDownloadInterval"
-            :disabled="settingsSaving"
-            style="width:64px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
-          />
-          min
-        </label>
-        <span class="muted" v-if="status.auto_download_enabled">{{ autoDl.nextLabel || 'scheduling…' }}</span>
-        <span class="muted" v-else>recordings auto-zip per interval; each zip embeds a status .txt with Pi temp / disk free / load.</span>
-      </div>
+      <!-- Auto-download master toggle + Stop & finish moved into the global
+           banner above. Status tab now only carries the FS-API setup
+           controls (Choose folder / Reset cursor) and the diagnostic
+           strip. -->
       <div class="row" style="margin-bottom:12px; align-items:center; flex-wrap:wrap; gap:8px">
         <button
           v-if="fsApi.supported"
@@ -565,23 +628,31 @@ createApp({
       // Server is stateless wrt this — each open browser drives its own tick
       // and tracks the highest segment epoch it has already downloaded.
       autoDl: {
-        interval_minutes: 5,
         lastEpoch: 0,
         nextDueAt: 0,        // performance.now() ms when the next tick fires
-        nextLabel: '',       // human countdown rendered in the toolbar
+        nextLabel: '',       // human countdown (legacy; banner uses bannerCountdownLabel now)
         running: false,      // a tick is in flight (preflight + click)
         // Most-recent tick outcome (silent skip / save / Save-As request) so
-        // the operator can see what the every-N-min timer is actually doing
-        // without keeping the devtools console open.
+        // the operator can see what the timer is actually doing without
+        // keeping the devtools console open. Rendered in the Status-tab
+        // diagnostic strip.
         lastTickLabel: '',
         lastTickAt: 0,
+        // Cached body of the most recent /auto_download_zip/info response.
+        // Used by `bannerState` to decide whether "Pending downloads" is
+        // a meaningful banner state when recording is off.
+        lastInfo: null,
         // Stop-&-finalize drain: when true, we ignore the periodic schedule
         // and pull every still-pending segment as fast as the connection
-        // allows. `drainLabel` is the human-readable progress string shown
-        // in the global auto-download chip while the drain runs.
+        // allows. `drainLabel` is rendered in the global banner while the
+        // drain runs.
         draining: false,
         drainLabel: '',
       },
+      // Reactive 1s tick used by `bannerCountdownLabel`. Updated by the
+      // ticker started in mounted(); Vue re-renders the countdown whenever
+      // this changes.
+      _nowSec: Math.floor(Date.now() / 1000),
       // File System Access API state. `supported` reflects whether
       // `window.showDirectoryPicker` is defined; `secure` reflects
       // `window.isSecureContext`. The actual `showDirectoryPicker()` call
@@ -668,6 +739,107 @@ createApp({
     pageHost() {
       try { return window.location.hostname || '192.168.2.2'; } catch (_) { return '192.168.2.2'; }
     },
+    /**
+     * Color + label + button-state for the global auto-download banner.
+     * Single source of truth for the banner template.
+     *
+     * Truth table (see the v1.0.32 design plan):
+     *   recording + folder    + toggle on -> red    "Recording — next download in MM:SS"
+     *   recording + no folder + toggle on -> amber  "Recording — no folder picked, Save-As prompts will fire"
+     *   recording + toggle off            -> neutral "Recording — auto-download paused"
+     *   draining                          -> yellow "Finishing downloads — <drainLabel>"
+     *   !recording + pending segments     -> yellow "Pending downloads — N segment(s) waiting"
+     *   !recording + nothing pending      -> green  "Idle — all downloads complete"
+     */
+    bannerState() {
+      const recording = !!this.status.recording;
+      const enabled = !!this.status.auto_download_enabled;
+      const draining = !!this.autoDl.draining;
+      const folderPicked = !!this.fsApi.folderName;
+      const haveCams = !!(this.status.cams && this.status.cams.length);
+      const pendingFiles = (this.autoDl.lastInfo && this.autoDl.lastInfo.has_new)
+        ? (this.autoDl.lastInfo.file_count || 0)
+        : 0;
+      const pendingBytes = (this.autoDl.lastInfo && this.autoDl.lastInfo.has_new)
+        ? (this.autoDl.lastInfo.total_bytes || 0)
+        : 0;
+
+      // Drain path takes priority — operator explicitly hit Stop & finish.
+      if (draining) {
+        return {
+          color: 'yellow',
+          label: this.autoDl.drainLabel || 'Finishing downloads — draining queued segments…',
+          showCountdown: false,
+          sublabel: '',
+          showStop: true,
+          stopDisabled: true,
+        };
+      }
+      if (recording) {
+        if (!enabled) {
+          return {
+            color: 'neutral',
+            label: 'Recording — auto-download paused',
+            showCountdown: false,
+            sublabel: '',
+            showStop: true,
+            stopDisabled: !haveCams,
+          };
+        }
+        if (!folderPicked) {
+          return {
+            color: 'amber',
+            label: 'Recording — no folder picked, Save-As prompts will fire',
+            showCountdown: this.status.next_expected_close_epoch ? true : false,
+            sublabel: 'Status tab → Choose download folder…',
+            showStop: true,
+            stopDisabled: !haveCams,
+          };
+        }
+        return {
+          color: 'red',
+          label: 'Recording — next download in',
+          showCountdown: true,
+          sublabel: 'saves silently to ' + this.fsApi.folderName,
+          showStop: true,
+          stopDisabled: !haveCams,
+        };
+      }
+      // Not recording. Anything still on the server side?
+      if (pendingFiles > 0) {
+        return {
+          color: 'yellow',
+          label: 'Pending downloads — ' + pendingFiles + ' segment(s) waiting (~' + this.fmtBytes(pendingBytes) + ')',
+          showCountdown: false,
+          sublabel: '',
+          showStop: false,
+          stopDisabled: true,
+        };
+      }
+      return {
+        color: 'green',
+        label: 'Idle — all downloads complete',
+        showCountdown: false,
+        sublabel: '',
+        showStop: false,
+        stopDisabled: true,
+      };
+    },
+    /**
+     * Human countdown label rendered when bannerState.showCountdown is true.
+     * Driven by the server-provided `next_expected_close_epoch` (the earliest
+     * cam's `current_segment_first_epoch + segment_seconds`) minus the
+     * reactive `_nowSec` tick. We use `_nowSec` instead of `Date.now()` so
+     * Vue re-renders the countdown every second.
+     */
+    bannerCountdownLabel() {
+      const target = this.status.next_expected_close_epoch;
+      if (!target || target <= 0) return '—';
+      const remaining = Math.max(0, Math.floor(target - this._nowSec));
+      const m = Math.floor(remaining / 60);
+      const s = remaining % 60;
+      return m + ':' + String(s).padStart(2, '0');
+    },
   },
   watch: {
     tab(n, o) {
@@ -680,20 +852,11 @@ createApp({
     livePick() {
       if (this.tab === 'live' && this.liveViewMode === 'single') this.switchLiveStream();
     },
-    // Pick up server-side toggles (e.g. another browser flipped the setting,
-    // or settings_store clamped our interval) and (re)schedule accordingly.
+    // Pick up server-side toggles (e.g. another browser flipped the setting)
+    // and (re)schedule accordingly. The interval is now a hardcoded 30s
+    // poll cadence so we no longer watch auto_download_interval_minutes.
     'status.auto_download_enabled'(n) {
       this.restartAutoDownloadTimer();
-    },
-    'status.auto_download_interval_minutes'(n) {
-      if (typeof n === 'number' && n >= 1 && n <= 1440) {
-        // Don't clobber a value the user is mid-typing into the input element;
-        // only sync our local copy when the user isn't actively editing.
-        if (document.activeElement?.tagName !== 'INPUT') {
-          this.autoDl.interval_minutes = n;
-        }
-        this.restartAutoDownloadTimer();
-      }
     },
   },
   created() {
@@ -753,6 +916,11 @@ createApp({
     this._restoreDownloadFolder().catch(() => { /* non-fatal */ });
     this.tick().then(() => this.restartAutoDownloadTimer());
     this.poll = setInterval(this.tick, 2000);
+    // 1Hz ticker driving the banner countdown. Cheap (one assignment per
+    // second); Vue only re-renders the countdown span when _nowSec changes.
+    this._bannerTicker = setInterval(() => {
+      this._nowSec = Math.floor(Date.now() / 1000);
+    }, 1000);
     this.loadStreams();
     // Default tab is 'live', so bring up the player right away. The tab watcher
     // only fires on transitions, not on the initial value, so we kick it here.
@@ -762,6 +930,7 @@ createApp({
     clearInterval(this.poll);
     if (this._autoDlTimer) clearTimeout(this._autoDlTimer);
     if (this._autoDlCountdown) clearInterval(this._autoDlCountdown);
+    if (this._bannerTicker) clearInterval(this._bannerTicker);
     document.removeEventListener('visibilitychange', this._onVisibility);
     this.teardownLive();
   },
@@ -1346,29 +1515,22 @@ createApp({
         this.settingsSaving = false;
       }
     },
-    async saveAutoDownloadInterval() {
-      var n = parseInt(this.autoDl.interval_minutes, 10);
-      if (!Number.isFinite(n) || n < 1) n = 1;
-      if (n > 1440) n = 1440;
-      this.autoDl.interval_minutes = n;
-      this.settingsSaving = true;
-      try {
-        const r = await fetch('/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_download_interval_minutes: n }),
-        });
-        const j = await r.json();
-        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
-        await this.tick();
-        this.restartAutoDownloadTimer();
-      } catch (e) {
-        alert((e && e.message) ? e.message : String(e));
-      } finally {
-        this.settingsSaving = false;
-      }
-    },
-    /** Cancel any pending tick and (re)start it if auto-download is on. */
+    /**
+     * Cancel any pending tick and (re)start it if auto-download is on.
+     *
+     * Poll cadence is hardcoded to 30s (was a user-facing "every N minutes"
+     * setting until v1.0.31). Rationale:
+     *   - Downloads are driven by segment rotation (default 300s), not by
+     *     poll cadence — a 1-minute poll finds nothing new on 4 ticks out
+     *     of every 5 anyway.
+     *   - /auto_download_zip/info is cheap (one os.listdir per cam dir);
+     *     polling more often costs nothing.
+     *   - 30s means a freshly-closed segment shows up in the operator's
+     *     download folder within ~30s of rotation, which feels live.
+     * The legacy `auto_download_interval_minutes` server setting is still
+     * persisted by `settings_store` (for compatibility with older clients)
+     * but no longer drives anything here.
+     */
     restartAutoDownloadTimer() {
       if (this._autoDlTimer) {
         clearTimeout(this._autoDlTimer);
@@ -1380,21 +1542,9 @@ createApp({
       }
       this.autoDl.nextLabel = '';
       if (!this.status.auto_download_enabled) return;
-      var minutes = this.autoDl.interval_minutes;
-      if (typeof minutes !== 'number' || !(minutes >= 1)) {
-        minutes = this.status.auto_download_interval_minutes || 5;
-      }
-      var ms = Math.max(1, Math.floor(minutes)) * 60 * 1000;
+      var ms = 30 * 1000;
       this.autoDl.nextDueAt = performance.now() + ms;
       this._autoDlTimer = setTimeout(() => this._onAutoDlTick(), ms);
-      var self = this;
-      this._autoDlCountdown = setInterval(function () {
-        var remain = Math.max(0, self.autoDl.nextDueAt - performance.now());
-        var s = Math.ceil(remain / 1000);
-        var m = Math.floor(s / 60);
-        var rem = s % 60;
-        self.autoDl.nextLabel = 'Next download in ' + m + 'm ' + String(rem).padStart(2, '0') + 's';
-      }, 1000);
     },
     async _onAutoDlTick() {
       this._autoDlTimer = null;
@@ -1446,6 +1596,10 @@ createApp({
         if (r.ok) {
           try { info = await r.json(); } catch (_) { info = null; }
         }
+        // Cache the latest /info response so `bannerState` can render
+        // "Pending downloads — N segment(s) waiting" when recording is off
+        // and there are still un-shipped closed segments.
+        this.autoDl.lastInfo = info;
         // Quiet-tick guard. The 1.0.30 flow asked the server for the zip on
         // every tick regardless of whether new segments existed, and the
         // server obligingly returned a tiny status .txt as a fallback. That

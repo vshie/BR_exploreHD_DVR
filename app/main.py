@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.31"
+VERSION = "1.0.32"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -226,6 +226,22 @@ def route_status():
         auto_boot = True
         auto_dl_enabled = False
         auto_dl_interval = 5
+    # Banner countdown: predict when the next segment will close based on the
+    # earliest `current_segment_first_epoch` reported by any active recorder
+    # plus the configured segment duration. The frontend ticks this locally
+    # every second between /status polls. None when no cam has a current
+    # segment (idle, fresh boot before splitmuxsink runs, etc.).
+    try:
+        segment_seconds = int(os.environ.get("SEGMENT_SECONDS", str(SEGMENT_SECONDS_DEFAULT)))
+    except (TypeError, ValueError):
+        segment_seconds = SEGMENT_SECONDS_DEFAULT
+    next_close = None
+    for c in cams:
+        fe = c.get("current_segment_first_epoch")
+        if isinstance(fe, (int, float)) and fe > 0:
+            cand = fe + segment_seconds
+            if next_close is None or cand < next_close:
+                next_close = cand
     resp = jsonify(
         {
             "version": VERSION,
@@ -237,6 +253,8 @@ def route_status():
             "auto_record_on_boot": auto_boot,
             "auto_download_enabled": auto_dl_enabled,
             "auto_download_interval_minutes": auto_dl_interval,
+            "segment_seconds": segment_seconds,
+            "next_expected_close_epoch": next_close,
             "streams_count": len(snap),
             "streams_warning": warn_streams,
             "session_root": sr,

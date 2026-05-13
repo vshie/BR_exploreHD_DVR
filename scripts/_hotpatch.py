@@ -49,11 +49,16 @@ def paramiko_run(client: paramiko.SSHClient, cmd: str, *, timeout: int = 60) -> 
 
 def main() -> int:
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    local_index = os.path.join(here, "app", "static", "index.html")
-    local_main = os.path.join(here, "app", "main.py")
-    for p in (local_index, local_main):
-        if not os.path.isfile(p):
-            print(f"missing {p}", file=sys.stderr)
+    # (local_path, container_path) pairs. Everything we expect to iterate on
+    # during a development session lives here.
+    files = [
+        (os.path.join(here, "app", "static", "index.html"), "/app/static/index.html"),
+        (os.path.join(here, "app", "main.py"), "/app/main.py"),
+        (os.path.join(here, "app", "recorder.py"), "/app/recorder.py"),
+    ]
+    for local, _ in files:
+        if not os.path.isfile(local):
+            print(f"missing {local}", file=sys.stderr)
             return 2
 
     client = paramiko.SSHClient()
@@ -73,13 +78,15 @@ def main() -> int:
 
         print("==> Uploading files via SFTP ...")
         sftp = client.open_sftp()
-        sftp.put(local_index, "/tmp/br_explorehd_dvr_index.html")
-        sftp.put(local_main, "/tmp/br_explorehd_dvr_main.py")
+        for local, _ in files:
+            tmp = "/tmp/" + os.path.basename(local)
+            sftp.put(local, tmp)
         sftp.close()
 
         print("==> docker cp into container ...")
-        paramiko_run(client, f"docker cp /tmp/br_explorehd_dvr_index.html {container}:/app/static/index.html")
-        paramiko_run(client, f"docker cp /tmp/br_explorehd_dvr_main.py {container}:/app/main.py")
+        for local, remote in files:
+            tmp = "/tmp/" + os.path.basename(local)
+            paramiko_run(client, f"docker cp {tmp} {container}:{remote}")
 
         print("==> docker restart ...")
         paramiko_run(client, f"docker restart {container}")

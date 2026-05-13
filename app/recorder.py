@@ -565,6 +565,15 @@ class Recorder:
                     total_mb += os.path.getsize(fp) / (1024 * 1024)
         except OSError:
             pass
+        # First-observed wall time of the currently-active `seg_NNNNN.ts`. The
+        # watchdog samples this when the file first appears, so subtracting it
+        # from now() tells the UI how long the current segment has been
+        # accumulating bytes — and adding `segment_seconds` gives a useful
+        # prediction of when it will roll. None when no current segment is
+        # known (idle, just started, or between rotations).
+        cur_first = None
+        if self.current_segment:
+            cur_first = self._segment_first_observed.get(self.current_segment)
         return {
             "index": self.index,
             "name": self.stream["name"],
@@ -576,6 +585,7 @@ class Recorder:
             "restart_count": self.restart_count,
             "current_segment": self.current_segment,
             "current_segment_mb": size_mb,
+            "current_segment_first_epoch": cur_first,
             "session_total_mb": round(total_mb, 2),
         }
 

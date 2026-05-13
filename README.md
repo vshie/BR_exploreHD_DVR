@@ -171,9 +171,25 @@ When external storage is mounted at `/mnt/usb` with enough free space, recording
 
 ## Auto-download (per-tab)
 
-The **Status** tab has an **Auto-download** toggle that runs a periodic check (default every minute). When new segments have closed since the cursor it streams a zip of the new MPEG-TS segments (remuxed to fragmented MP4 with `ffmpeg -c copy`, no re-encode); when nothing new has closed since the last tick it does nothing — a single status `.txt` is downloaded once when the toggle is flipped on (warmup) and again at the end of **Stop & finalize**, but never on a "quiet" tick. Each open browser tab tracks its own cursor (`brdvr.autoDl.lastEpoch` in `localStorage`).
+Directly under the page header — visible on every tab — is the global **auto-download banner**. It is the single surface for everything related to background downloads:
 
-Below the toggle there is a small diagnostic strip showing the current origin, `isSecureContext`, whether `showDirectoryPicker` is defined, and the most recent tick outcome — so you can tell at a glance whether the timer just ran a silent save, a Save-As request, or a quiet no-op.
+- **Icon-style toggle (left):** master on/off for auto-download. Persisted as `auto_download_enabled` in `.br_explorehd_dvr_settings.json`.
+- **Status text + countdown (left, after the toggle):** state-appropriate label plus a MM:SS countdown to the next expected segment close (driven by `next_expected_close_epoch` in `/status`, which the recorder derives from the active segment's first-observed timestamp plus `SEGMENT_SECONDS`).
+- **Stop & finish downloads button (right):** stops the recorders, tears down Live (frees the tether), and drains every still-pending segment before going idle.
+
+The banner is color-coded:
+
+| Color   | Meaning                                                                 |
+|---------|-------------------------------------------------------------------------|
+| Red     | Recording, folder picked — every closed segment streams silently into your folder |
+| Amber   | Recording, no folder picked — downloads will fire per-file Save-As prompts        |
+| Yellow  | Stop-&-finish drain in progress, or recording stopped with segments still queued  |
+| Green   | Idle — no recording, no pending downloads, you can close the tab safely           |
+| Neutral | Recording is on but the auto-download toggle is paused                            |
+
+Each open browser tab tracks its own cursor (`brdvr.autoDl.lastEpoch` in `localStorage`). The Status tab still hosts the **Choose download folder…** button (needed for the FS Access API user-gesture), the **Reset cursor & re-download** recovery button, and a small diagnostic strip (origin / `isSecureContext` / `showDirectoryPicker` / last tick outcome).
+
+The poll cadence is a hardcoded 30s — the user-facing "every N minutes" knob was removed in 1.0.32 because download cadence is driven by segment rotation (default 300s), not by poll interval. Polling more often costs nothing (`/auto_download_zip/info` is one `os.listdir` per cam) and means a freshly-closed segment appears in your folder within ~30s of rotation.
 
 ### Silent saves (no per-file "Save As" prompt)
 
