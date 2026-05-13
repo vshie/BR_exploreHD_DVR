@@ -434,11 +434,58 @@
           Pick a folder once and every download streams in silently after that.
         </span>
         <span v-else-if="fsApi.supported && !fsApi.secure" class="muted" style="max-width:780px">
-          Folder picker is available, but this origin (<code>{{ fsApi.origin || pageHost }}</code>) is not yet a secure context, so Chrome will reject the picker with SecurityError. Open <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, paste <code>{{ fsApi.origin || pageHost }}</code> EXACTLY (including the port), enable the flag, relaunch Chrome, then click <em>Choose download folder…</em>. If this extension is opened inside the BlueOS UI iframe, add the BlueOS origin to that same list too. Until then downloads use the per-file Save-As prompt.
+          Folder picker is available, but this origin is not yet a secure context, so Chrome will reject the picker with SecurityError. Follow the Chrome setup steps below to allow-list the origin, then click <em>Choose download folder…</em>.
         </span>
         <span v-else class="muted" style="max-width:780px">
           Folder picker is not exposed by this browser (Firefox / Safari do not implement <code>showDirectoryPicker</code>). Downloads will use the per-file Save dialog; turn off Chrome → Settings → Downloads → <em>Ask where to save each file before downloading</em> to skip the prompt globally.
         </span>
+      </div>
+      <!-- Chrome setup helper: copy/pastable references for the flag that
+           unlocks silent saves on http:// origins. Always rendered (even
+           when silent saves are already working) so an operator can apply
+           the same fix to a different browser / laptop without having to
+           memorize the URL or the port-specific origin. Chrome won't let
+           a webpage navigate to chrome:// URLs, so a clickable link is
+           impossible — copy-to-clipboard is the best we can do. -->
+      <div class="card" style="margin-bottom:12px; padding:10px 14px">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px">
+          <strong>Chrome setup</strong>
+          <span class="muted" style="font-size:0.82rem">— needed once per browser to allow silent saves from this <code>http://</code> origin</span>
+        </div>
+        <ol style="margin:6px 0 0 0; padding-left:22px; font-size:0.88rem; line-height:1.55">
+          <li style="margin-bottom:4px">
+            Copy the chrome flag URL and paste it into Chrome's address bar:
+            <div class="row" style="margin-top:4px; gap:6px">
+              <code style="background:var(--card); padding:2px 6px; border-radius:4px; border:1px solid var(--bd)">chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
+              <button
+                type="button"
+                class="btn"
+                @click="copyText('chrome://flags/#unsafely-treat-insecure-origin-as-secure', 'flagUrl')"
+                title="Chrome blocks webpage links to chrome:// URLs, so this is the closest we can get to one-click. Paste it into the address bar after clicking."
+              >
+                {{ copyHint === 'flagUrl' ? 'Copied!' : 'Copy URL' }}
+              </button>
+            </div>
+          </li>
+          <li style="margin-bottom:4px">
+            Paste this origin into the flag's <em>Insecure origins treated as secure</em> textbox:
+            <div class="row" style="margin-top:4px; gap:6px">
+              <code style="background:var(--card); padding:2px 6px; border-radius:4px; border:1px solid var(--bd)">{{ fsApi.origin || pageHost }}</code>
+              <button
+                type="button"
+                class="btn"
+                @click="copyText(fsApi.origin || pageHost, 'origin')"
+                title="The exact origin Chrome will treat as secure. The chrome:// flag does NOT wildcard ports, so the port number must match this string exactly."
+              >
+                {{ copyHint === 'origin' ? 'Copied!' : 'Copy origin' }}
+              </button>
+            </div>
+          </li>
+          <li>
+            Set the flag's dropdown to <strong>Enabled</strong>, click <strong>Relaunch</strong>, come back here, and click <em>Choose download folder…</em> above.
+            <div class="muted" style="font-size:0.82rem; margin-top:2px">If you open this extension through the BlueOS UI iframe, add the BlueOS origin (<code>http://{{ pageHost }}</code>) to the same comma-separated list.</div>
+          </li>
+        </ol>
       </div>
       <!-- Tiny diagnostic strip so operators can self-debug the
            secure-context / FS-API state without opening devtools. -->
@@ -653,6 +700,11 @@ createApp({
       // ticker started in mounted(); Vue re-renders the countdown whenever
       // this changes.
       _nowSec: Math.floor(Date.now() / 1000),
+      // Last-clicked copy button (for transient "Copied!" feedback in the
+      // Chrome-setup helper on the Status tab). Cleared after 1.5s.
+      // No underscore prefix — Vue 3 strips _-prefixed properties from
+      // the template proxy, so direct {{ copyHint }} reads work.
+      copyHint: '',
       // File System Access API state. `supported` reflects whether
       // `window.showDirectoryPicker` is defined; `secure` reflects
       // `window.isSecureContext`. The actual `showDirectoryPicker()` call
@@ -1679,6 +1731,56 @@ createApp({
       // Don't auto-fire here — let the timer's next tick (or a manual click
       // on the toggle) run inside a user-gesture stack frame so the
       // anchor-click fallback isn't blocked by Chrome's gesture rules.
+    },
+    /**
+     * Copy `text` to the clipboard, then mark `key` as the most-recently
+     * copied item so the matching button shows a transient "Copied!" hint.
+     *
+     * navigator.clipboard.writeText only works in secure contexts, which is
+     * exactly the situation operators do NOT have when they're trying to
+     * copy the chrome:// flag URL that would make them secure in the first
+     * place. So we fall back to the legacy execCommand('copy') idiom: it's
+     * deprecated-but-universally-supported and works on plain HTTP.
+     */
+    async copyText(text, key) {
+      var ok = false;
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(text);
+          ok = true;
+        }
+      } catch (_) { /* fall through to execCommand */ }
+      if (!ok) {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          // off-screen, but still in the layout tree so select() works
+          ta.style.position = 'fixed';
+          ta.style.top = '-9999px';
+          ta.style.left = '-9999px';
+          ta.setAttribute('readonly', '');
+          document.body.appendChild(ta);
+          ta.select();
+          ta.setSelectionRange(0, text.length);
+          ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+        } catch (e) {
+          console.warn('clipboard copy failed:', e);
+          ok = false;
+        }
+      }
+      if (ok) {
+        this.copyHint = key;
+        // Auto-clear the "Copied!" hint after 1.5s.
+        if (this._copyHintTimer) clearTimeout(this._copyHintTimer);
+        this._copyHintTimer = setTimeout(() => { this.copyHint = ''; }, 1500);
+      } else {
+        // Surface the failure since the helper exists precisely to relieve
+        // operators from typing this stuff. Worst case they hand-type it.
+        try {
+          alert('Could not copy automatically. Text to copy:\n\n' + text);
+        } catch (_) {}
+      }
     },
     // ----- File System Access API: silent downloads to a user-picked folder.
     //
