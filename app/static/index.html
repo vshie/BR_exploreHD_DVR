@@ -118,6 +118,13 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--bd); }
     .pill.run { border-color: var(--ok); color: var(--ok); }
     .pill.bad { border-color: var(--err); color: var(--err); }
+    .autodl-chip {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+      padding: 6px 12px; border-radius: 8px; margin-bottom: 12px;
+      border: 1px solid var(--bd); background: var(--card); font-size: 0.85rem;
+    }
+    .autodl-chip.draining { border-color: var(--warn); background: #2d2a1b; }
+    .autodl-chip code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85em; }
     .live-layout { display: flex; flex-direction: column; gap: 6px; }
     /* Fill the remaining viewport below header + toolbar. Header is ~52px, the
        Live toolbar ~40px, main padding 8px top + 8px bottom, plus a few px of
@@ -262,11 +269,44 @@
     <div v-else-if="status.boot_stage && status.boot_stage !== 'recording'" class="banner">
       Boot: {{ status.boot_stage }}…
     </div>
+    <!-- Global auto-download chip: visible on every tab so the operator can
+         see download cadence / drain state while watching Live or browsing
+         Recordings, not just from the Status tab. Hidden when the feature is
+         off and nothing is being drained, so it doesn't add noise. -->
+    <div
+      v-if="status.auto_download_enabled || autoDl.draining"
+      class="autodl-chip"
+      :class="{ draining: autoDl.draining }"
+    >
+      <span class="pill" :class="{ run: !autoDl.draining }">
+        {{ autoDl.draining ? 'Finalizing' : 'Auto-download ON' }}
+      </span>
+      <span v-if="autoDl.draining" class="muted">{{ autoDl.drainLabel || 'draining queued segments…' }}</span>
+      <span v-else class="muted">{{ autoDl.nextLabel || 'scheduling…' }}</span>
+      <span v-if="fsApi.available && fsApi.folderName" class="muted">
+        · saves silently to <code>{{ fsApi.folderName }}</code>
+      </span>
+      <span v-else-if="fsApi.available && !fsApi.folderName" class="muted">
+        · no folder picked yet (Status tab → <em>Choose folder…</em>) — Save-As dialog will appear per file
+      </span>
+      <span v-else class="muted">
+        · per-file Save-As dialog active (see Status tab for chrome:// flag fix)
+      </span>
+    </div>
 
     <section v-show="tab==='status'">
       <div class="row" style="margin-bottom:12px">
         <button class="btn" @click="stopRec" :disabled="!status.cams?.length">Stop all</button>
         <button class="btn primary" @click="startRec" :disabled="!status.cams?.length && status.boot_error">Start / resume</button>
+        <button
+          type="button"
+          class="btn"
+          @click="stopAndFinalize"
+          :disabled="!status.cams?.length || autoDl.draining"
+          title="Stop the recorders, tear down Live (frees the network for downloads), then immediately drain every closed segment that hasn't been auto-downloaded yet. Repeats until the cursor catches up to the last finalized segment so you can close the tab when it's done."
+        >
+          {{ autoDl.draining ? 'Finalizing…' : 'Stop & finalize downloads' }}
+        </button>
         <button
           type="button"
           class="btn"
@@ -286,7 +326,7 @@
           :class="{ latched: status.auto_download_enabled === true }"
           :disabled="settingsSaving"
           @click="toggleAutoDownload"
-          title="First time you enable this, Chrome will ask permission to download multiple files. Click Allow once — after that the downloads happen silently in the background. Each tick downloads a zip of newly-finalized segments (or a status .txt if nothing new has closed)."
+          title="When a download folder is selected (Choose folder…), every tick streams a zip of newly-finalized segments — or a status .txt if nothing new has closed — straight into that folder with no Save-As dialog. Without a folder (plain-HTTP origin and no chrome:// flag override) downloads still fire but Chrome will prompt for a save location per file."
         >
           Auto-download: {{ status.auto_download_enabled ? 'ON' : 'OFF' }}
         </button>
@@ -305,6 +345,28 @@
         </label>
         <span class="muted" v-if="status.auto_download_enabled">{{ autoDl.nextLabel || 'scheduling…' }}</span>
         <span class="muted" v-else>recordings auto-zip per interval; each zip embeds a status .txt with Pi temp / disk free / load.</span>
+      </div>
+      <div class="row" style="margin-bottom:12px; align-items:center; flex-wrap:wrap; gap:8px">
+        <button
+          v-if="fsApi.available"
+          type="button"
+          class="btn"
+          :class="{ latched: !!fsApi.folderName }"
+          :disabled="settingsSaving"
+          @click="pickDownloadFolder"
+          title="Pick a destination folder once. After that, every auto-download zip and status .txt streams straight to that folder with no Save-As prompt."
+        >
+          {{ fsApi.folderName ? ('Save to: ' + fsApi.folderName) : 'Choose download folder…' }}
+        </button>
+        <span v-if="fsApi.available && fsApi.folderName" class="muted">
+          Silent saves enabled — downloads stream directly to <code>{{ fsApi.folderName }}</code> with no per-file prompt.
+        </span>
+        <span v-else-if="fsApi.available && !fsApi.folderName" class="muted">
+          Pick a folder once to skip the per-file Save dialog — every download streams in silently after that.
+        </span>
+        <span v-else class="muted" style="max-width:780px">
+          Per-file Save prompts are coming from Chrome itself (this page is on plain HTTP, which disables the silent File System Access API). To eliminate them, either turn off Chrome → Settings → Downloads → <em>Ask where to save each file before downloading</em> (affects every site), <strong>or</strong> open <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, add <code>http://{{ pageHost }}</code>, relaunch Chrome, then come back here and a <em>Choose folder…</em> button will appear for one-time silent setup.
+        </span>
       </div>
       <div class="grid">
         <div class="card" v-for="cam in (status.cams||[])" :key="cam.index">
@@ -491,6 +553,25 @@ createApp({
         nextDueAt: 0,        // performance.now() ms when the next tick fires
         nextLabel: '',       // human countdown rendered in the toolbar
         running: false,      // a tick is in flight (preflight + click)
+        // Stop-&-finalize drain: when true, we ignore the periodic schedule
+        // and pull every still-pending segment as fast as the connection
+        // allows. `drainLabel` is the human-readable progress string shown
+        // in the global auto-download chip while the drain runs.
+        draining: false,
+        drainLabel: '',
+      },
+      // File System Access API state (only honored when the page is in a secure
+      // context). When `available` is true we can stream downloads directly into
+      // a user-picked folder via fetch + WritableStream — no per-file Save-As
+      // dialog. On plain-HTTP origins (Chrome's default for 192.168.x.x) the
+      // API is undefined; we fall back to anchor-click downloads and surface a
+      // banner with the chrome://flags workaround.
+      fsApi: {
+        available: false,    // showDirectoryPicker exists AND isSecureContext
+        folderName: '',      // user-visible display name of the chosen folder
+        // The actual FileSystemDirectoryHandle is stored on the instance as
+        // `this._downloadDir` (non-reactive — Vue would deep-proxy it and
+        // confuse the WritableStream consumer).
       },
       days: [],
       expanded: {},
@@ -556,6 +637,10 @@ createApp({
       }
       return this.selectedDates.length ? `${this.selectedDates.length} day(s) · ${this.fmtBytes(bytes)} · ${files} files` : 'No days selected';
     },
+    /** Hostname shown in the "add to chrome://flags" banner. */
+    pageHost() {
+      try { return window.location.hostname || '192.168.2.2'; } catch (_) { return '192.168.2.2'; }
+    },
   },
   watch: {
     tab(n, o) {
@@ -584,6 +669,26 @@ createApp({
       }
     },
   },
+  created() {
+    // FS Access API is only exposed when `isSecureContext` is true. Chrome
+    // treats https://, localhost, and 127.0.0.0/8 as secure by default but
+    // NOT private LAN IPs like 192.168.2.2 — operators on plain HTTP need
+    // either chrome://flags/#unsafely-treat-insecure-origin-as-secure or an
+    // HTTPS reverse proxy to unlock it. We check both `showDirectoryPicker`
+    // and `isSecureContext` so a sandboxed iframe that strips the API down
+    // doesn't trip us into thinking it works.
+    try {
+      this.fsApi.available = (typeof window.showDirectoryPicker === 'function')
+        && !!window.isSecureContext;
+    } catch (_) {
+      this.fsApi.available = false;
+    }
+    // Non-reactive handle slot. Vue's reactive proxy wraps native objects in
+    // a Proxy that breaks structured-clone / WritableStream consumers, so we
+    // keep the raw FileSystemDirectoryHandle on the instance rather than in
+    // `data`. Only the human-readable folder NAME goes into `this.fsApi`.
+    this._downloadDir = null;
+  },
   mounted() {
     // Tell the backend our local TZ so segment timestamps and the calendar-day
     // session directory match what the operator sees on this clock. We send on
@@ -602,6 +707,11 @@ createApp({
     } catch (e) { /* localStorage may be disabled; non-fatal */ }
     this._autoDlTimer = null;
     this._autoDlCountdown = null;
+    // Try to restore a previously-picked download folder so the operator
+    // doesn't have to re-pick after every page reload. Permission state is
+    // origin-scoped and persists across sessions for FS Access API handles
+    // stored in IndexedDB, so once granted this is silent on subsequent loads.
+    this._restoreDownloadFolder().catch(() => { /* non-fatal */ });
     this.tick().then(() => this.restartAutoDownloadTimer());
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
@@ -1117,21 +1227,53 @@ createApp({
     /**
      * Click handler for the "Auto-download: ON/OFF" button.
      *
-     * CRITICAL: when turning ON, the warm-up download MUST fire BEFORE any
-     * `await`. Once the function awaits, the JS task ends and Chrome no
-     * longer treats subsequent code as inside the user-gesture stack frame —
-     * meaning the very first programmatic download would be silently blocked.
-     * Firing _autoDlClickHidden() synchronously here guarantees Chrome counts
-     * this as a real user-gesture download (the first one is always allowed),
-     * which gives the operator immediate feedback (a status .txt download)
-     * and primes the origin so the next periodic tick triggers Chrome's
-     * "Allow multiple downloads from this site?" prompt instead of being
-     * dropped on the floor.
+     * Two execution paths depending on whether the FS Access API is usable:
+     *
+     *   A) `fsApi.available` is true (HTTPS / localhost / origin in
+     *      chrome://flags/#unsafely-treat-insecure-origin-as-secure):
+     *      - If we already have a folder handle with permission, fire a warm-up
+     *        write straight into the folder (silent — no Save dialog).
+     *      - If we don't, open `showDirectoryPicker()` to let the operator pick
+     *        one. This step IS the user-gesture; the API rejects without one.
+     *        On cancel, we bail without flipping the toggle.
+     *      - In both cases the on-disk write completes via `_writeToFolder`,
+     *        which uses fetch + pipeTo so multi-GB zips stream without
+     *        buffering.
+     *
+     *   B) FS Access API not available (plain HTTP, no flag override):
+     *      - Synchronous hidden `<a>` click for the warm-up. CRITICAL: this
+     *        MUST fire BEFORE any `await` because Chrome only treats code in
+     *        the current micro-task as part of the user-gesture stack frame.
+     *        Awaiting first would push subsequent clicks out of the gesture
+     *        and silently block the warm-up download. The user will see the
+     *        per-file Save-As prompt (see the banner under the toggle for the
+     *        chrome:// flag that flips us into path A).
      */
-    toggleAutoDownload() {
+    async toggleAutoDownload() {
       var turningOn = !this.status.auto_download_enabled;
       if (turningOn) {
-        this._autoDlClickHidden('/auto_download_zip?warmup=1');
+        if (this.fsApi.available) {
+          // Need a folder before we can write. Reuse the cached handle if it
+          // still has permission; otherwise prompt for a new one.
+          if (!this._downloadDir || !(await this._ensureDownloadDirGranted(true))) {
+            const picked = await this.pickDownloadFolder();
+            if (!picked) {
+              // User cancelled; abort the toggle. The setting stays OFF.
+              return;
+            }
+          }
+          // Initial warm-up. We don't await this far enough back to abort the
+          // toggle on a write failure — instead we fall through to anchor-click
+          // so the operator still gets immediate feedback even when something
+          // is wrong with the folder (e.g. read-only mount).
+          this._writeToFolder('/auto_download_zip?warmup=1').catch((e) => {
+            console.warn('warmup _writeToFolder failed, falling back to anchor:', e);
+            this._autoDlClickHidden('/auto_download_zip?warmup=1');
+          });
+        } else {
+          // No FS API — synchronous anchor click (user-gesture path).
+          this._autoDlClickHidden('/auto_download_zip?warmup=1');
+        }
       }
       this._persistAutoDownload(turningOn);
     },
@@ -1219,12 +1361,20 @@ createApp({
     },
     /**
      * Periodic tick: ask the server what the latest closed segment is, advance
-     * the localStorage cursor, then trigger the actual download via a hidden
-     * `<a>` click so the bytes never pass through JS memory.
+     * the localStorage cursor, then write the download bytes to disk.
+     *
+     * Two delivery paths:
+     *   - FS Access API + valid folder handle: fetch + pipeTo into the chosen
+     *     folder. No Save-As dialog, never buffered in JS memory.
+     *   - Fallback: hidden `<a>` click. Chrome routes this through the native
+     *     download manager, which surfaces the Save-As dialog on plain-HTTP
+     *     origins. The operator can switch to the silent path via the banner
+     *     under the auto-download toggle.
      *
      * Chrome can't expose response headers from a hidden-`<a>` download to JS,
-     * so we use the small JSON `/auto_download_zip/info` companion endpoint to
-     * learn `latest_epoch` reliably and update the cursor. Cursor advances
+     * so we always call the small JSON `/auto_download_zip/info` companion
+     * endpoint first to learn `latest_epoch` and update the cursor reliably
+     * (and only once per tick, regardless of delivery path). Cursor advances
      * even when no new segments were waiting (server returns a status .txt)
      * so the cursor stays meaningful and we never re-download nothing.
      */
@@ -1246,10 +1396,23 @@ createApp({
         if (r.ok) {
           try { info = await r.json(); } catch (_) { info = null; }
         }
-        // Trigger the download (zip if has_new, otherwise status .txt).
-        // No user gesture here — relies on the multi-download permission
-        // having been granted via the warm-up flow.
-        this._autoDlClickHidden(url);
+        // Prefer FS Access API write when a folder is selected. We don't need
+        // a user gesture for `_writeToFolder` once permission is granted —
+        // the cached handle keeps its grant across timer-driven calls.
+        var wrote = false;
+        if (this.fsApi.available && this._downloadDir) {
+          try {
+            const fname = await this._writeToFolder(url);
+            wrote = !!fname;
+          } catch (e) {
+            console.warn('FS API write failed, falling back to anchor click:', e);
+          }
+        }
+        if (!wrote) {
+          // Either no folder picked, or the write failed. Use the anchor
+          // fallback — operator will see the per-file Save dialog.
+          this._autoDlClickHidden(url);
+        }
         if (info && typeof info.latest_epoch === 'number') {
           // Advance the cursor to the highest segment epoch we just shipped.
           // If has_new is false, latest_epoch == since, so this is a no-op.
@@ -1262,11 +1425,212 @@ createApp({
         this.autoDl.running = false;
       }
     },
+    // ----- File System Access API: silent downloads to a user-picked folder.
+    //
+    // Background: when the page is on plain HTTP (Chrome's default for
+    // 192.168.x.x BlueOS installs) the browser shows a "Save As" dialog for
+    // every download triggered from JS, because there's no way for the page
+    // to assert a destination. The FS Access API is the only browser surface
+    // that fixes this without a per-user config toggle — we ask once via
+    // `showDirectoryPicker()`, persist the resulting `FileSystemDirectoryHandle`
+    // in IndexedDB, and stream subsequent downloads directly into that folder
+    // via `fetch().body.pipeTo(writable)`. Zero dialogs, zero memory buffering.
+    //
+    // The API is gated on `isSecureContext`, so it's unavailable on plain HTTP
+    // unless the operator has added the origin to
+    // `chrome://flags/#unsafely-treat-insecure-origin-as-secure`. We surface
+    // that workaround in the Status-tab banner when `fsApi.available` is false.
+
+    /** Open the IndexedDB store used to persist the directory handle. */
+    _idbOpen() {
+      return new Promise((resolve, reject) => {
+        try {
+          const req = indexedDB.open('brdvr', 1);
+          req.onupgradeneeded = (ev) => {
+            ev.target.result.createObjectStore('handles');
+          };
+          req.onsuccess = (ev) => resolve(ev.target.result);
+          req.onerror = () => reject(req.error);
+        } catch (e) { reject(e); }
+      });
+    },
+    /** Read a value from the persistent IDB store by key. */
+    async _idbGet(key) {
+      const db = await this._idbOpen();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('handles', 'readonly');
+        const store = tx.objectStore('handles');
+        const r = store.get(key);
+        r.onsuccess = () => { try { db.close(); } catch (_) {} resolve(r.result); };
+        r.onerror = () => { try { db.close(); } catch (_) {} reject(r.error); };
+      });
+    },
+    /** Persist a value (typically a FileSystemDirectoryHandle) to IDB. */
+    async _idbPut(key, val) {
+      const db = await this._idbOpen();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('handles', 'readwrite');
+        tx.objectStore('handles').put(val, key);
+        tx.oncomplete = () => { try { db.close(); } catch (_) {} resolve(); };
+        tx.onerror = () => { try { db.close(); } catch (_) {} reject(tx.error); };
+      });
+    },
+    /** Delete a key from IDB (used when a saved handle is no longer usable). */
+    async _idbDel(key) {
+      try {
+        const db = await this._idbOpen();
+        await new Promise((resolve) => {
+          const tx = db.transaction('handles', 'readwrite');
+          tx.objectStore('handles').delete(key);
+          tx.oncomplete = () => { try { db.close(); } catch (_) {} resolve(); };
+          tx.onerror = () => { try { db.close(); } catch (_) {} resolve(); };
+        });
+      } catch (_) { /* non-fatal */ }
+    },
+    /**
+     * On page load: if we have a previously-picked folder and the user has
+     * already granted readwrite permission, restore it silently so the
+     * operator doesn't have to click "Choose folder" again after a reload.
+     *
+     * IMPORTANT: we deliberately don't call `requestPermission()` here —
+     * that API mandates a user gesture, and calling it from mounted() would
+     * either no-op or throw. We only call `queryPermission()` (passive) and
+     * defer the upgrade to the toggle-on click path if needed.
+     */
+    async _restoreDownloadFolder() {
+      if (!this.fsApi.available) return;
+      let handle = null;
+      try { handle = await this._idbGet('downloadDir'); } catch (_) { return; }
+      if (!handle || typeof handle.queryPermission !== 'function') return;
+      let perm = 'denied';
+      try { perm = await handle.queryPermission({ mode: 'readwrite' }); } catch (_) { return; }
+      if (perm === 'granted') {
+        this._downloadDir = handle;
+        this.fsApi.folderName = handle.name || '';
+      }
+      // If perm === 'prompt' we keep `_downloadDir` null; the operator's next
+      // toggle-on click will reuse the stored handle and call requestPermission
+      // (a user gesture is available there).
+    },
+    /**
+     * Open the native folder picker. Returns true on success, false on user
+     * cancel / API failure. Must be invoked from a user-gesture handler.
+     */
+    async pickDownloadFolder() {
+      if (!this.fsApi.available) return false;
+      try {
+        const dir = await window.showDirectoryPicker({
+          mode: 'readwrite',
+          // Hint Chrome to open the picker at the user's downloads tree by
+          // default; falls back gracefully on browsers that don't honor it.
+          startIn: 'downloads',
+        });
+        // showDirectoryPicker only resolves after the user picks AND grants
+        // readwrite, so we don't need to re-call requestPermission here.
+        this._downloadDir = dir;
+        this.fsApi.folderName = dir.name || '';
+        try { await this._idbPut('downloadDir', dir); } catch (e) {
+          console.warn('persisting downloadDir to IDB failed:', e);
+        }
+        return true;
+      } catch (e) {
+        if (e && (e.name === 'AbortError' || e.name === 'NotAllowedError')) {
+          // User cancelled the picker. Silent — don't alert.
+          return false;
+        }
+        console.error('pickDownloadFolder failed:', e);
+        try { alert('Could not open folder picker: ' + (e.message || e.name || e)); } catch (_) {}
+        return false;
+      }
+    },
+    /**
+     * Ensure the cached handle has readwrite permission. Returns true if
+     * granted, false otherwise. When `interactive` is true we may invoke
+     * `requestPermission()` (requires user gesture — caller must be in one).
+     */
+    async _ensureDownloadDirGranted(interactive) {
+      const h = this._downloadDir;
+      if (!h || typeof h.queryPermission !== 'function') return false;
+      const opts = { mode: 'readwrite' };
+      try {
+        const p = await h.queryPermission(opts);
+        if (p === 'granted') return true;
+        if (!interactive) return false;
+        const req = await h.requestPermission(opts);
+        return req === 'granted';
+      } catch (_) {
+        return false;
+      }
+    },
+    /**
+     * Stream a download URL straight into the user's chosen folder via the
+     * FS Access API. The response is piped end-to-end (no buffering) so a
+     * multi-GB zip uses bounded memory regardless of size.
+     *
+     * Returns the filename written on success, or null when the API is not
+     * usable / a fallback should run. Throws on actual write errors so the
+     * caller can decide whether to retry via the anchor-click fallback.
+     */
+    async _writeToFolder(url) {
+      if (!this.fsApi.available || !this._downloadDir) return null;
+      // Permission may have decayed since the last write (Chrome can revoke
+      // when the tab has been backgrounded across origin changes). Re-check
+      // without prompting; if we're not granted any more, return null and let
+      // the caller fall back to an anchor click.
+      const ok = await this._ensureDownloadDirGranted(false);
+      if (!ok) return null;
+
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status + ' for ' + url);
+
+      // Prefer the server's Content-Disposition filename so the file on disk
+      // matches what every other download path produces (and the timestamp
+      // baked into the .txt header / .zip entries). RFC 6266 'filename*' is
+      // unlikely here (ASCII-only timestamps) but we accept both forms.
+      let filename = 'BR_exploreHD_DVR.bin';
+      const cd = resp.headers.get('Content-Disposition') || '';
+      const star = cd.match(/filename\*\s*=\s*[^']*''([^;]+)/i);
+      const plain = cd.match(/filename\s*=\s*"?([^";]+)"?/i);
+      if (star && star[1]) {
+        try { filename = decodeURIComponent(star[1]); } catch (_) { filename = star[1]; }
+      } else if (plain && plain[1]) {
+        filename = plain[1].trim();
+      }
+      // Defensive sanitize: FS Access API rejects names with path separators.
+      filename = filename.replace(/[\\/]+/g, '_').replace(/^\.+/, '').slice(0, 240) || 'download.bin';
+
+      const fileHandle = await this._downloadDir.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      try {
+        if (resp.body && typeof resp.body.pipeTo === 'function') {
+          // pipeTo closes the destination on successful completion (and
+          // surfaces stream errors as rejections), so we don't call close()
+          // manually in the happy path.
+          await resp.body.pipeTo(writable);
+        } else {
+          // Old WebKit fallback: buffer once. Only triggers on browsers
+          // without ReadableStream.pipeTo, which is rare in 2025+.
+          const buf = await resp.arrayBuffer();
+          await writable.write(buf);
+          await writable.close();
+        }
+      } catch (e) {
+        // Abort the writable to discard the partially-written file rather
+        // than leave a truncated artifact in the operator's folder.
+        try { await writable.abort(); } catch (_) {}
+        throw e;
+      }
+      return filename;
+    },
+
     /**
      * Trigger a download by synthesizing a hidden `<a>` element and clicking
      * it. Browser handles the actual byte streaming (resumable, progress in
      * the native download tray, never buffered in JS memory). Same idiom
      * already used by `_beginDownload` for the manual day/session flow.
+     *
+     * Used as the fallback when the FS Access API path is unavailable (the
+     * primary silent-save mechanism is `_writeToFolder`).
      */
     _autoDlClickHidden(url) {
       var a = document.createElement('a');
@@ -1284,6 +1648,98 @@ createApp({
       }
     },
     async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
+    /**
+     * "Stop & finalize downloads" — the explicit end-of-activity flow:
+     *
+     *   1. Tear down any active Live (WebRTC) streams. WebRTC and the
+     *      auto-download stream both consume the same vehicle <-> operator
+     *      uplink; on a 7-9 MB/s tether this can drop the effective download
+     *      bandwidth in half, so cutting WebRTC first ensures the drain runs
+     *      at full speed.
+     *   2. POST /stop. The recorder threads SIGINT each gst-launch pipeline,
+     *      then run `_finalize_completed_segments(include_active=True)` —
+     *      that's what renames the trailing `seg_NNNNN.ts` of each cam to
+     *      its real `YYYYMMDD_HHMMSS.ts` so the next /auto_download_zip/info
+     *      call sees it.
+     *   3. Loop: ask /info for `has_new`; if yes, run one auto-download tick
+     *      and wait for it to actually complete (FS Access API write awaits
+     *      the WritableStream close; anchor-click fallback uses a generous
+     *      sleep since the browser owns the byte stream). Repeat until
+     *      `has_new: false`.
+     *
+     * The drain banner stays visible across all tabs (it's bound to the
+     * top-of-page `autodl-chip`) so the operator can switch to Recordings
+     * mid-drain and still watch progress.
+     */
+    async stopAndFinalize() {
+      if (this.autoDl.draining) return;
+      this.autoDl.draining = true;
+      this.autoDl.drainLabel = 'Tearing down Live and stopping recorders…';
+      try {
+        // Step 1: free network for the drain.
+        try { this.teardownLive(); } catch (_) {}
+        // Step 2: stop recorders. /stop blocks until the recorder threads
+        // have finalized + renamed their trailing segments, so when this
+        // resolves the segment cursor is guaranteed to see everything.
+        try {
+          await fetch('/stop', { method: 'POST' });
+        } catch (e) {
+          this.autoDl.drainLabel = 'Could not contact /stop: ' + (e.message || e);
+        }
+        await this.tick();
+
+        // Step 3: drain loop. We cap the iteration count so a permanently
+        // broken /info endpoint can't pin the UI in "Finalizing…" forever.
+        var loops = 0, maxLoops = 60;  // 60 ticks worst-case (~5–10 min)
+        while (loops < maxLoops) {
+          loops += 1;
+          var since = this.autoDl.lastEpoch || 0;
+          var info = null;
+          try {
+            const r = await fetch('/auto_download_zip/info?since=' + encodeURIComponent(since));
+            if (r.ok) info = await r.json();
+          } catch (e) {
+            this.autoDl.drainLabel = 'Drain check failed: ' + (e.message || e);
+            break;
+          }
+          if (!info || !info.has_new) {
+            this.autoDl.drainLabel = 'Done — all closed segments downloaded.';
+            break;
+          }
+          var mb = Math.round((info.total_bytes || 0) / (1024 * 1024));
+          this.autoDl.drainLabel =
+            'Downloading ' + info.file_count + ' segment(s) · ~' + mb + ' MB remaining…';
+          // Use the normal tick path so the FS Access API (silent) path is
+          // preferred and the anchor-click fallback still works. We await
+          // the whole tick so the next /info call only sees what's truly
+          // still pending.
+          try {
+            await this.runAutoDownloadTick();
+          } catch (e) {
+            console.warn('drain tick failed:', e);
+          }
+          // For the anchor-click fallback the browser owns the byte stream
+          // after `_autoDlClickHidden` returns — runAutoDownloadTick resolves
+          // immediately and /info will still show the same segments until
+          // the download finishes. Sleep proportional to remaining bytes
+          // (capped) so we don't bombard /info while a real download is in
+          // flight. On the FS API path the write has already completed and
+          // this sleep is just a small jitter; it's cheap either way.
+          var waitMs = Math.min(20000, 1500 + Math.round((info.total_bytes || 0) / (8 * 1024 * 1024) * 1000));
+          await new Promise(function (resolve) { setTimeout(resolve, waitMs); });
+        }
+        if (loops >= maxLoops) {
+          this.autoDl.drainLabel = 'Stopped after ' + maxLoops + ' iterations — re-run if /recordings shows more pending.';
+        }
+      } finally {
+        // Keep the final status message visible for a few seconds before
+        // we clear `draining` so the operator can read "Done — …" on screen.
+        setTimeout(() => {
+          this.autoDl.draining = false;
+          this.autoDl.drainLabel = '';
+        }, 6000);
+      }
+    },
     async startRec() {
       // Send our TZ first so the new session directory and any segment
       // rolls happen in the operator's local time on the very first tick.

@@ -169,6 +169,35 @@ The day directory and segment filenames are written in the **operator's browser-
 
 When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
 
+## Auto-download (per-tab)
+
+The **Status** tab has an **Auto-download** toggle that periodically pulls everything new since the last tick — a streaming zip of newly-finalized segments (TS remuxed to fragmented MP4 with `ffmpeg -c copy`, no re-encode) plus a status `.txt` with Pi temp / disk free / per-cam state. Each open browser tab tracks its own cursor (`brdvr.autoDl.lastEpoch` in `localStorage`).
+
+### Silent saves (no per-file "Save As" prompt)
+
+Chrome shows a per-file Save dialog for downloads from plain HTTP origins. The extension uses the **File System Access API** to bypass that — click **Choose folder…**, pick a destination once, and every subsequent zip / status `.txt` streams straight into that folder with no prompt. The handle is stored in `IndexedDB` so it survives reloads (no re-pick needed unless you revoke permission or clear site data).
+
+The File System Access API is gated on `isSecureContext`. Chrome treats `https://`, `localhost`, and `127.0.0.0/8` as secure by default, but **not** private LAN IPs like `192.168.2.2`. To unlock it on a plain-HTTP BlueOS install:
+
+1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` in Chrome.
+2. Add `http://192.168.2.2` (or whatever IP / hostname you use to reach BlueOS — comma-separated entries are supported).
+3. Set the flag to **Enabled** and relaunch Chrome.
+4. Back in the extension's Status tab, the **Choose folder…** button now appears. Pick a folder once; you're done.
+
+If you don't want to flip the flag, the simpler alternative is to turn off Chrome → Settings → Downloads → *Ask where to save each file before downloading* — that silences the dialog for **all** downloads from every site, which may or may not be desirable.
+
+The extension falls back to the standard hidden-`<a>` download path when the API isn't usable, so the feature stays functional either way; you just get the per-file dialog instead.
+
+### Bandwidth — does the link keep up?
+
+Four exploreHD cameras at ~10 Mbps each generate **~5 MB/s** of MPEG-TS on disk. A typical BlueROV tether saturates around **7–9 MB/s** between the vehicle and the operator, which leaves **2–4 MB/s of headroom** for the auto-download stream after recording is accounted for — i.e. each `/auto_download_zip` tick drains data slightly faster than it arrives, so the cursor stays caught up live.
+
+WebRTC playback in the Live tab competes with downloads for the same uplink (≈5 MB/s for four cameras), so when the Live tab is open during recording, downloads may fall a few MB behind. That's what the **Stop & finalize downloads** button on the Status tab is for: it tears down Live (frees the uplink), POSTs `/stop` (which finalizes and renames the trailing segments inside the container), then loops `/auto_download_zip/info` → `/auto_download_zip` until every closed segment has been pulled. On the FS Access API path the loop awaits each silent write before checking again, so it finishes within seconds of the link draining. After a 15–20 min activity (~6 GB) the post-stop drain typically completes in **1–3 minutes**.
+
+### Status chip everywhere
+
+The auto-download status (next-tick countdown, drain progress, current save folder) appears as a small pill above the tab content on **every tab** — Live, Recordings, Status — so the operator can watch a quad live while still tracking the download cursor and don't need to flip back to Status mid-dive.
+
 ## API (short)
 
 - `GET /status` — boot stage, errors, per-camera recorder status, telemetry, USB.
