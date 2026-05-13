@@ -283,14 +283,11 @@
       </span>
       <span v-if="autoDl.draining" class="muted">{{ autoDl.drainLabel || 'draining queued segments…' }}</span>
       <span v-else class="muted">{{ autoDl.nextLabel || 'scheduling…' }}</span>
-      <span v-if="fsApi.available && fsApi.folderName" class="muted">
+      <span v-if="fsApi.folderName" class="muted">
         · saves silently to <code>{{ fsApi.folderName }}</code>
       </span>
-      <span v-else-if="fsApi.available && !fsApi.folderName" class="muted">
-        · no folder picked yet (Status tab → <em>Choose folder…</em>) — Save-As dialog will appear per file
-      </span>
       <span v-else class="muted">
-        · per-file Save-As dialog active (see Status tab for chrome:// flag fix)
+        · per-file Save-As dialog active (Status tab → <em>Choose download folder…</em>)
       </span>
     </div>
 
@@ -326,7 +323,7 @@
           :class="{ latched: status.auto_download_enabled === true }"
           :disabled="settingsSaving"
           @click="toggleAutoDownload"
-          title="When a download folder is selected (Choose folder…), every tick streams a zip of newly-finalized segments — or a status .txt if nothing new has closed — straight into that folder with no Save-As dialog. Without a folder (plain-HTTP origin and no chrome:// flag override) downloads still fire but Chrome will prompt for a save location per file."
+          title="Every minute the timer checks for newly-closed segments. If there's something new and a download folder is selected, the segments stream silently into that folder. If nothing has closed since the last download, the tick is a quiet no-op (no status .txt drip). Without a download folder, the timer triggers a per-file Save-As prompt for each new batch."
         >
           Auto-download: {{ status.auto_download_enabled ? 'ON' : 'OFF' }}
         </button>
@@ -348,7 +345,7 @@
       </div>
       <div class="row" style="margin-bottom:12px; align-items:center; flex-wrap:wrap; gap:8px">
         <button
-          v-if="fsApi.available"
+          v-if="fsApi.supported"
           type="button"
           class="btn"
           :class="{ latched: !!fsApi.folderName }"
@@ -358,15 +355,35 @@
         >
           {{ fsApi.folderName ? ('Save to: ' + fsApi.folderName) : 'Choose download folder…' }}
         </button>
-        <span v-if="fsApi.available && fsApi.folderName" class="muted">
-          Silent saves enabled — downloads stream directly to <code>{{ fsApi.folderName }}</code> with no per-file prompt.
+        <button
+          type="button"
+          class="btn"
+          :disabled="settingsSaving"
+          @click="resetAutoDownloadCursor"
+          title="Wipes the local 'last downloaded segment' marker. The next tick will re-download every closed segment in the active session — use this after an aborted Save-As prompt or after granting the FS API folder to recover any segments the previous flow skipped."
+        >
+          Reset cursor &amp; re-download
+        </button>
+        <span v-if="fsApi.folderName" class="muted">
+          Silent saves to <code>{{ fsApi.folderName }}</code> — no per-file prompt while this tab is open.
         </span>
-        <span v-else-if="fsApi.available && !fsApi.folderName" class="muted">
-          Pick a folder once to skip the per-file Save dialog — every download streams in silently after that.
+        <span v-else-if="fsApi.supported && fsApi.secure" class="muted">
+          Pick a folder once and every download streams in silently after that.
+        </span>
+        <span v-else-if="fsApi.supported && !fsApi.secure" class="muted" style="max-width:780px">
+          Folder picker is available, but this origin (<code>{{ fsApi.origin || pageHost }}</code>) is not yet a secure context, so Chrome will reject the picker with SecurityError. Open <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, paste <code>{{ fsApi.origin || pageHost }}</code> EXACTLY (including the port), enable the flag, relaunch Chrome, then click <em>Choose download folder…</em>. If this extension is opened inside the BlueOS UI iframe, add the BlueOS origin to that same list too. Until then downloads use the per-file Save-As prompt.
         </span>
         <span v-else class="muted" style="max-width:780px">
-          Per-file Save prompts are coming from Chrome itself (this page is on plain HTTP, which disables the silent File System Access API). To eliminate them, either turn off Chrome → Settings → Downloads → <em>Ask where to save each file before downloading</em> (affects every site), <strong>or</strong> open <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, add <code>http://{{ pageHost }}</code>, relaunch Chrome, then come back here and a <em>Choose folder…</em> button will appear for one-time silent setup.
+          Folder picker is not exposed by this browser (Firefox / Safari do not implement <code>showDirectoryPicker</code>). Downloads will use the per-file Save dialog; turn off Chrome → Settings → Downloads → <em>Ask where to save each file before downloading</em> to skip the prompt globally.
         </span>
+      </div>
+      <!-- Tiny diagnostic strip so operators can self-debug the
+           secure-context / FS-API state without opening devtools. -->
+      <div class="row" style="margin-bottom:12px; gap:14px; flex-wrap:wrap; font-size:0.85rem; color:var(--muted)">
+        <span>Origin: <code>{{ fsApi.origin || '(unknown)' }}</code></span>
+        <span>Secure context: <code>{{ fsApi.secure ? 'yes' : 'no' }}</code></span>
+        <span>showDirectoryPicker: <code>{{ fsApi.supported ? 'yes' : 'no' }}</code></span>
+        <span v-if="autoDl.lastTickLabel">Last tick: <code>{{ autoDl.lastTickLabel }}</code></span>
       </div>
       <div class="grid">
         <div class="card" v-for="cam in (status.cams||[])" :key="cam.index">
@@ -553,6 +570,11 @@ createApp({
         nextDueAt: 0,        // performance.now() ms when the next tick fires
         nextLabel: '',       // human countdown rendered in the toolbar
         running: false,      // a tick is in flight (preflight + click)
+        // Most-recent tick outcome (silent skip / save / Save-As request) so
+        // the operator can see what the every-N-min timer is actually doing
+        // without keeping the devtools console open.
+        lastTickLabel: '',
+        lastTickAt: 0,
         // Stop-&-finalize drain: when true, we ignore the periodic schedule
         // and pull every still-pending segment as fast as the connection
         // allows. `drainLabel` is the human-readable progress string shown
@@ -560,15 +582,20 @@ createApp({
         draining: false,
         drainLabel: '',
       },
-      // File System Access API state (only honored when the page is in a secure
-      // context). When `available` is true we can stream downloads directly into
-      // a user-picked folder via fetch + WritableStream — no per-file Save-As
-      // dialog. On plain-HTTP origins (Chrome's default for 192.168.x.x) the
-      // API is undefined; we fall back to anchor-click downloads and surface a
-      // banner with the chrome://flags workaround.
+      // File System Access API state. `supported` reflects whether
+      // `window.showDirectoryPicker` is defined; `secure` reflects
+      // `window.isSecureContext`. The actual `showDirectoryPicker()` call
+      // requires BOTH (Chrome throws SecurityError on plain HTTP), but we
+      // intentionally render the "Choose folder…" button on `supported` alone
+      // so the operator can attempt the picker and see the exact reason it
+      // fails — that's much more useful than silently hiding the button when
+      // our heuristic says "won't work".
       fsApi: {
-        available: false,    // showDirectoryPicker exists AND isSecureContext
+        supported: false,    // showDirectoryPicker exists at all
+        secure: false,       // isSecureContext is true for this document
+        available: false,    // alias kept for templates: same as `supported`
         folderName: '',      // user-visible display name of the chosen folder
+        origin: '',          // window.location.origin for the chrome:// flag UI
         // The actual FileSystemDirectoryHandle is stored on the instance as
         // `this._downloadDir` (non-reactive — Vue would deep-proxy it and
         // confuse the WritableStream consumer).
@@ -670,19 +697,31 @@ createApp({
     },
   },
   created() {
-    // FS Access API is only exposed when `isSecureContext` is true. Chrome
-    // treats https://, localhost, and 127.0.0.0/8 as secure by default but
-    // NOT private LAN IPs like 192.168.2.2 — operators on plain HTTP need
-    // either chrome://flags/#unsafely-treat-insecure-origin-as-secure or an
-    // HTTPS reverse proxy to unlock it. We check both `showDirectoryPicker`
-    // and `isSecureContext` so a sandboxed iframe that strips the API down
-    // doesn't trip us into thinking it works.
+    // FS Access API surface. The picker itself requires `isSecureContext`
+    // (Chrome treats https://, localhost, 127.0.0.0/8, and origins listed in
+    // chrome://flags/#unsafely-treat-insecure-origin-as-secure as secure,
+    // and rejects everything else with SecurityError). We still want to
+    // render the button on plain HTTP though, because:
+    //
+    //   - On default-config BlueOS installs the page is on
+    //     http://<vehicle-ip>:<extension-port>/, which is insecure.
+    //   - Operators DO have a one-time fix (the chrome:// flag), but they
+    //     need to know which origin to flag — the easiest way to surface
+    //     that is to let them click the button and read the resulting
+    //     SecurityError with the exact origin printed in the banner.
+    //
+    // So `supported` gates the button, `secure` gates the silent-write
+    // path, and the call site below knows the difference.
     try {
-      this.fsApi.available = (typeof window.showDirectoryPicker === 'function')
-        && !!window.isSecureContext;
+      this.fsApi.supported = (typeof window.showDirectoryPicker === 'function');
+      this.fsApi.secure = !!window.isSecureContext;
+      this.fsApi.available = this.fsApi.supported;
     } catch (_) {
+      this.fsApi.supported = false;
+      this.fsApi.secure = false;
       this.fsApi.available = false;
     }
+    try { this.fsApi.origin = window.location.origin || ''; } catch (_) {}
     // Non-reactive handle slot. Vue's reactive proxy wraps native objects in
     // a Proxy that breaks structured-clone / WritableStream consumers, so we
     // keep the raw FileSystemDirectoryHandle on the instance rather than in
@@ -1252,26 +1291,38 @@ createApp({
     async toggleAutoDownload() {
       var turningOn = !this.status.auto_download_enabled;
       if (turningOn) {
-        if (this.fsApi.available) {
-          // Need a folder before we can write. Reuse the cached handle if it
-          // still has permission; otherwise prompt for a new one.
-          if (!this._downloadDir || !(await this._ensureDownloadDirGranted(true))) {
-            const picked = await this.pickDownloadFolder();
-            if (!picked) {
-              // User cancelled; abort the toggle. The setting stays OFF.
-              return;
+        // Three execution paths:
+        //   1. FS API supported + secure context + already have a folder
+        //      handle with permission -> silent warmup write straight to it.
+        //   2. FS API supported + secure context + no handle yet -> abort
+        //      the toggle and let the operator pick a folder explicitly via
+        //      the Status-tab button. (We don't auto-pop the picker here
+        //      anymore because doing so on insecure-but-flagged origins
+        //      surprises operators who just wanted to enable the feature.)
+        //   3. Anything else -> synchronous anchor-click warmup. Chrome
+        //      surfaces per-file Save-As prompts; the banner under the
+        //      toggle tells operators how to suppress them globally or by
+        //      flagging the origin.
+        //
+        // CRITICAL: the anchor click MUST happen BEFORE any `await` because
+        // Chrome only treats code in the current micro-task as part of the
+        // user-gesture stack frame. Awaiting first would push the click out
+        // of the gesture and Chrome would silently block it.
+        var canSilent = this.fsApi.supported && this.fsApi.secure && !!this._downloadDir;
+        if (canSilent) {
+          // Async permission re-check is fine here because the FS API path
+          // doesn't require a fresh user gesture for cached granted handles.
+          this._ensureDownloadDirGranted(false).then((ok) => {
+            if (ok) {
+              this._writeToFolder('/auto_download_zip?warmup=1').catch((e) => {
+                console.warn('warmup _writeToFolder failed, falling back to anchor:', e);
+                this._autoDlClickHidden('/auto_download_zip?warmup=1');
+              });
+            } else {
+              this._autoDlClickHidden('/auto_download_zip?warmup=1');
             }
-          }
-          // Initial warm-up. We don't await this far enough back to abort the
-          // toggle on a write failure — instead we fall through to anchor-click
-          // so the operator still gets immediate feedback even when something
-          // is wrong with the folder (e.g. read-only mount).
-          this._writeToFolder('/auto_download_zip?warmup=1').catch((e) => {
-            console.warn('warmup _writeToFolder failed, falling back to anchor:', e);
-            this._autoDlClickHidden('/auto_download_zip?warmup=1');
           });
         } else {
-          // No FS API — synchronous anchor click (user-gesture path).
           this._autoDlClickHidden('/auto_download_zip?warmup=1');
         }
       }
@@ -1383,7 +1434,6 @@ createApp({
       this.autoDl.running = true;
       try {
         var since = this.autoDl.lastEpoch || 0;
-        var url = '/auto_download_zip?since=' + encodeURIComponent(since);
         var r;
         try {
           r = await fetch('/auto_download_zip/info?since=' + encodeURIComponent(since));
@@ -1396,11 +1446,23 @@ createApp({
         if (r.ok) {
           try { info = await r.json(); } catch (_) { info = null; }
         }
-        // Prefer FS Access API write when a folder is selected. We don't need
-        // a user gesture for `_writeToFolder` once permission is granted —
-        // the cached handle keeps its grant across timer-driven calls.
+        // Quiet-tick guard. The 1.0.30 flow asked the server for the zip on
+        // every tick regardless of whether new segments existed, and the
+        // server obligingly returned a tiny status .txt as a fallback. That
+        // produced the "one .txt every minute forever" symptom even when
+        // no segments had rolled (default rotation is 300s, so most ticks
+        // close nothing). Skip the download entirely when has_new is false.
+        if (!info || !info.has_new || !info.file_count) {
+          this.autoDl.lastTickLabel = info
+            ? 'No new segments (cursor at ' + this._fmtEpochShort(since) + ')'
+            : 'Info fetch returned no JSON';
+          this.autoDl.lastTickAt = Date.now();
+          return;
+        }
+
+        var url = '/auto_download_zip?since=' + encodeURIComponent(since);
         var wrote = false;
-        if (this.fsApi.available && this._downloadDir) {
+        if (this.fsApi.supported && this._downloadDir) {
           try {
             const fname = await this._writeToFolder(url);
             wrote = !!fname;
@@ -1408,22 +1470,61 @@ createApp({
             console.warn('FS API write failed, falling back to anchor click:', e);
           }
         }
-        if (!wrote) {
-          // Either no folder picked, or the write failed. Use the anchor
-          // fallback — operator will see the per-file Save dialog.
-          this._autoDlClickHidden(url);
-        }
-        if (info && typeof info.latest_epoch === 'number') {
-          // Advance the cursor to the highest segment epoch we just shipped.
-          // If has_new is false, latest_epoch == since, so this is a no-op.
+        if (wrote) {
+          // FS API path is the only delivery channel where we can prove the
+          // bytes actually landed on disk. Safe to advance the cursor past
+          // every segment in this tick's batch.
           this.autoDl.lastEpoch = info.latest_epoch;
           try {
             localStorage.setItem('brdvr.autoDl.lastEpoch', String(info.latest_epoch));
           } catch (_) { /* non-fatal */ }
+          this.autoDl.lastTickLabel = 'Saved ' + info.file_count + ' segment(s) (~' + this.fmtBytes(info.total_bytes) + ')';
+        } else {
+          // Anchor-click fallback. We have no way to confirm the browser
+          // actually accepted the download (Chrome silently blocks the second
+          // "multiple-file" download on a fresh origin, partial-network
+          // failures are invisible, etc.), so we DO NOT advance the cursor
+          // here. The same batch will be re-attempted next tick, which is
+          // wasteful but safe — the operator can keep clicking "Save" or
+          // flip on the FS API path to make the cursor advance.
+          //
+          // Operators who want a one-shot recovery can hit "Reset cursor &
+          // re-download" on the Status tab to wipe the cursor and start
+          // fresh.
+          this._autoDlClickHidden(url);
+          this.autoDl.lastTickLabel = 'Requested ' + info.file_count + ' segment(s) via Save-As (cursor stays at ' + this._fmtEpochShort(since) + ' until silent path is configured)';
         }
+        this.autoDl.lastTickAt = Date.now();
       } finally {
         this.autoDl.running = false;
       }
+    },
+    /** Compact MM:SS or HH:MM tag for an epoch, for the "last tick" status line. */
+    _fmtEpochShort(epoch) {
+      if (!epoch || epoch <= 0) return '0';
+      try {
+        const d = new Date(epoch * 1000);
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        return hh + ':' + mm;
+      } catch (_) {
+        return String(Math.floor(epoch));
+      }
+    },
+    /**
+     * Reset the persistent cursor so the next tick re-downloads every closed
+     * segment in the active session. Use after an aborted Save-As, after
+     * granting the FS API folder, or any time the operator wants to re-pull
+     * skipped material from the current session.
+     */
+    resetAutoDownloadCursor() {
+      this.autoDl.lastEpoch = 0;
+      try { localStorage.removeItem('brdvr.autoDl.lastEpoch'); } catch (_) {}
+      this.autoDl.lastTickLabel = 'Cursor reset to 0 — next tick will pull every closed segment.';
+      this.autoDl.lastTickAt = Date.now();
+      // Don't auto-fire here — let the timer's next tick (or a manual click
+      // on the toggle) run inside a user-gesture stack frame so the
+      // anchor-click fallback isn't blocked by Chrome's gesture rules.
     },
     // ----- File System Access API: silent downloads to a user-picked folder.
     //
@@ -1498,7 +1599,7 @@ createApp({
      * defer the upgrade to the toggle-on click path if needed.
      */
     async _restoreDownloadFolder() {
-      if (!this.fsApi.available) return;
+      if (!this.fsApi.supported) return;
       let handle = null;
       try { handle = await this._idbGet('downloadDir'); } catch (_) { return; }
       if (!handle || typeof handle.queryPermission !== 'function') return;
@@ -1517,7 +1618,12 @@ createApp({
      * cancel / API failure. Must be invoked from a user-gesture handler.
      */
     async pickDownloadFolder() {
-      if (!this.fsApi.available) return false;
+      if (!this.fsApi.supported) {
+        try {
+          alert('Folder picker is not available in this browser. Chrome 86+, Edge 86+, and Opera 72+ ship the File System Access API; Firefox/Safari do not. Falling back to per-file Save dialogs.');
+        } catch (_) {}
+        return false;
+      }
       try {
         const dir = await window.showDirectoryPicker({
           mode: 'readwrite',
@@ -1529,6 +1635,11 @@ createApp({
         // readwrite, so we don't need to re-call requestPermission here.
         this._downloadDir = dir;
         this.fsApi.folderName = dir.name || '';
+        // If we got here we now know the document IS a secure context (Chrome
+        // would have rejected the call with SecurityError otherwise), so
+        // unlock the silent-write path even if our static check at created()
+        // said no.
+        this.fsApi.secure = true;
         try { await this._idbPut('downloadDir', dir); } catch (e) {
           console.warn('persisting downloadDir to IDB failed:', e);
         }
@@ -1538,8 +1649,22 @@ createApp({
           // User cancelled the picker. Silent — don't alert.
           return false;
         }
+        // SecurityError on plain HTTP is the high-frequency failure mode for
+        // BlueOS installs. Print the exact origin so the operator can paste
+        // it into chrome://flags without guessing about ports / iframe
+        // parentage.
+        const isSecurityErr = !!(e && (e.name === 'SecurityError' || /secure context/i.test(String(e.message || ''))));
         console.error('pickDownloadFolder failed:', e);
-        try { alert('Could not open folder picker: ' + (e.message || e.name || e)); } catch (_) {}
+        const origin = this.fsApi.origin || (function () {
+          try { return window.location.origin; } catch (_) { return '(unknown origin)'; }
+        })();
+        const detail = isSecurityErr
+          ? ('Chrome rejected the folder picker because this page is not a secure context.\n\n'
+             + 'Origin to allow-list: ' + origin + '\n\n'
+             + 'Fix: open chrome://flags/#unsafely-treat-insecure-origin-as-secure, paste the origin above EXACTLY (including the port), set the flag to Enabled, relaunch Chrome, and try again.\n\n'
+             + 'Note: if the extension is opened from inside the BlueOS UI iframe, both the BlueOS origin AND this extension origin may need to be in the list (comma-separated).')
+          : ('Could not open folder picker: ' + (e.message || e.name || e));
+        try { alert(detail); } catch (_) {}
         return false;
       }
     },
@@ -1572,7 +1697,15 @@ createApp({
      * caller can decide whether to retry via the anchor-click fallback.
      */
     async _writeToFolder(url) {
-      if (!this.fsApi.available || !this._downloadDir) return null;
+      // Require BOTH the API surface and a granted folder handle. Note we
+      // intentionally don't check `fsApi.secure` because:
+      //   - Pages that ARE secure but had `secure` set false at created()
+      //     time (e.g. Chrome flag flipped after page load) shouldn't be
+      //     blocked here; we let the actual createWritable() call decide.
+      //   - The handle itself can only exist on a secure context (the
+      //     picker won't issue one otherwise), so its presence is a stronger
+      //     signal than our cached `secure` boolean anyway.
+      if (!this.fsApi.supported || !this._downloadDir) return null;
       // Permission may have decayed since the last write (Chrome can revoke
       // when the tab has been backgrounded across origin changes). Re-check
       // without prompting; if we're not granted any more, return null and let

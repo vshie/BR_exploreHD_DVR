@@ -171,22 +171,30 @@ When external storage is mounted at `/mnt/usb` with enough free space, recording
 
 ## Auto-download (per-tab)
 
-The **Status** tab has an **Auto-download** toggle that periodically pulls everything new since the last tick — a streaming zip of newly-finalized segments (TS remuxed to fragmented MP4 with `ffmpeg -c copy`, no re-encode) plus a status `.txt` with Pi temp / disk free / per-cam state. Each open browser tab tracks its own cursor (`brdvr.autoDl.lastEpoch` in `localStorage`).
+The **Status** tab has an **Auto-download** toggle that runs a periodic check (default every minute). When new segments have closed since the cursor it streams a zip of the new MPEG-TS segments (remuxed to fragmented MP4 with `ffmpeg -c copy`, no re-encode); when nothing new has closed since the last tick it does nothing — a single status `.txt` is downloaded once when the toggle is flipped on (warmup) and again at the end of **Stop & finalize**, but never on a "quiet" tick. Each open browser tab tracks its own cursor (`brdvr.autoDl.lastEpoch` in `localStorage`).
+
+Below the toggle there is a small diagnostic strip showing the current origin, `isSecureContext`, whether `showDirectoryPicker` is defined, and the most recent tick outcome — so you can tell at a glance whether the timer just ran a silent save, a Save-As request, or a quiet no-op.
 
 ### Silent saves (no per-file "Save As" prompt)
 
-Chrome shows a per-file Save dialog for downloads from plain HTTP origins. The extension uses the **File System Access API** to bypass that — click **Choose folder…**, pick a destination once, and every subsequent zip / status `.txt` streams straight into that folder with no prompt. The handle is stored in `IndexedDB` so it survives reloads (no re-pick needed unless you revoke permission or clear site data).
+Chrome shows a per-file Save dialog for downloads from plain HTTP origins. The extension uses the **File System Access API** to bypass that — click **Choose download folder…**, pick a destination once, and every subsequent zip streams straight into that folder with no prompt. The handle is stored in `IndexedDB` so it survives reloads (no re-pick needed unless you revoke permission or clear site data).
 
 The File System Access API is gated on `isSecureContext`. Chrome treats `https://`, `localhost`, and `127.0.0.0/8` as secure by default, but **not** private LAN IPs like `192.168.2.2`. To unlock it on a plain-HTTP BlueOS install:
 
 1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` in Chrome.
-2. Add `http://192.168.2.2` (or whatever IP / hostname you use to reach BlueOS — comma-separated entries are supported).
+2. Add the **exact** origin shown in the diagnostic strip on the Status tab — typically `http://<vehicle-ip>:6010` (note the port — the chrome flag does **not** wildcard ports, so a bare `http://192.168.2.2` entry only matches port 80). If the extension is opened from inside the BlueOS UI iframe, add the BlueOS origin (`http://192.168.2.2`) to the same comma-separated list too.
 3. Set the flag to **Enabled** and relaunch Chrome.
-4. Back in the extension's Status tab, the **Choose folder…** button now appears. Pick a folder once; you're done.
+4. Back in the extension's Status tab, click **Choose download folder…** and pick a folder once. The "Silent saves to …" hint replaces the chrome-flag instructions and you're done.
 
 If you don't want to flip the flag, the simpler alternative is to turn off Chrome → Settings → Downloads → *Ask where to save each file before downloading* — that silences the dialog for **all** downloads from every site, which may or may not be desirable.
 
-The extension falls back to the standard hidden-`<a>` download path when the API isn't usable, so the feature stays functional either way; you just get the per-file dialog instead.
+The extension falls back to the standard hidden-`<a>` download path when the FS API isn't usable, so the feature stays functional either way; you just get the per-file dialog instead.
+
+### Cursor management
+
+The persistent `brdvr.autoDl.lastEpoch` cursor only advances after the FS API path proves a write completed. The anchor-click fallback can't confirm whether Chrome actually accepted the download (Chrome silently blocks the second multi-file request on a fresh origin until you click *Allow*), so on the anchor path the cursor is **left where it was** and the same batch is re-attempted next tick. That's deliberately wasteful — better that than a one-time silent download miss losing 20 minutes of video.
+
+If you do lose visibility (e.g. you missed a Save-As prompt and the missing segments aren't being re-attempted because the cursor advanced earlier), click **Reset cursor & re-download** on the Status tab. The cursor goes back to zero and the next tick pulls everything in the active session.
 
 ### Bandwidth — does the link keep up?
 
