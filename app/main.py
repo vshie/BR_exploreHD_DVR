@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.32"
+VERSION = "1.0.33"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -1392,5 +1392,6 @@ def route_auto_download_zip():
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
-    # Default 6010: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "6010")))
+    # Default 4444: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
+    # Was 6010 through v1.0.32; changed by user request in 1.0.33.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "4444")))

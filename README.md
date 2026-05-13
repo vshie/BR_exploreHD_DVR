@@ -8,7 +8,7 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 - **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
 - **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Web UI** (default port **6010**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
+- **Web UI** (default port **4444**, well clear of MCM's 6020–6040): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default. (The default port was **6010** through v1.0.32 and changed to **4444** in v1.0.33 by user request.)
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
 
 ## Hardware setup (Raspberry Pi 5)
@@ -34,7 +34,7 @@ ext4 is preferred over exFAT/vfat for this workload: many small `.ts` segments w
 The 30 s storage probe will mount the new partition at `/mnt/usb` automatically; no extension restart required. Verify with:
 
 ```bash
-curl -s http://127.0.0.1:6010/status | python3 -m json.tool | grep -A6 '"usb"'
+curl -s http://127.0.0.1:4444/status | python3 -m json.tool | grep -A6 '"usb"'
 ```
 
 You should see `"mounted": true` and the device path. If auto-detection misses an unusual enclosure, set `EXTERNAL_STORAGE_DEVICE=/dev/nvme0n1p1` (or the matching `sdX1`) on the extension to force it.
@@ -95,7 +95,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
 ```json
 {
   "ExposedPorts": {
-    "6010/tcp": {}
+    "4444/tcp": {}
   },
   "HostConfig": {
     "Binds": [
@@ -106,7 +106,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
       "host.docker.internal:host-gateway"
     ],
     "PortBindings": {
-      "6010/tcp": [
+      "4444/tcp": [
         {
           "HostPort": ""
         }
@@ -118,7 +118,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
 }
 ```
 
-Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:6010/**.
+Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:4444/**.
 
 What each piece does:
 - `Binds` — persists recordings to `/usr/blueos/extensions/br_explorehd_dvr` on the host (so they survive extension reinstalls) and exposes `/dev` so USB storage can be mounted from inside the container.
@@ -152,7 +152,7 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 |----------|---------|-------------|
 | `MCM_BASE` | `http://127.0.0.1:6020` | MCM REST base URL |
 | `SEGMENT_SECONDS` | `300` | TS segment duration |
-| `PORT` | `6010` | Flask listen port (override if needed) |
+| `PORT` | `4444` | Flask listen port (override if needed) |
 | `BOOT_MIN_SLEEP_S` | `20` | Minimum sleep before loadavg gate |
 | `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
@@ -198,7 +198,7 @@ Chrome shows a per-file Save dialog for downloads from plain HTTP origins. The e
 The File System Access API is gated on `isSecureContext`. Chrome treats `https://`, `localhost`, and `127.0.0.0/8` as secure by default, but **not** private LAN IPs like `192.168.2.2`. To unlock it on a plain-HTTP BlueOS install:
 
 1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` in Chrome.
-2. Add the **exact** origin shown in the diagnostic strip on the Status tab — typically `http://<vehicle-ip>:6010` (note the port — the chrome flag does **not** wildcard ports, so a bare `http://192.168.2.2` entry only matches port 80). If the extension is opened from inside the BlueOS UI iframe, add the BlueOS origin (`http://192.168.2.2`) to the same comma-separated list too.
+2. Add the **exact** origin shown in the diagnostic strip on the Status tab — typically `http://<vehicle-ip>:4444` (note the port — the chrome flag does **not** wildcard ports, so a bare `http://192.168.2.2` entry only matches port 80). If the extension is opened from inside the BlueOS UI iframe, add the BlueOS origin (`http://192.168.2.2`) to the same comma-separated list too.
 3. Set the flag to **Enabled** and relaunch Chrome.
 4. Back in the extension's Status tab, click **Choose download folder…** and pick a folder once. The "Silent saves to …" hint replaces the chrome-flag instructions and you're done.
 

@@ -1,6 +1,6 @@
 docker exec extension-vshieblueosbrexplorehddvrmain python3 -c '
 import urllib.request, json, time
-r = urllib.request.urlopen("http://127.0.0.1:6010/status", timeout=5)
+r = urllib.request.urlopen("http://127.0.0.1:4444/status", timeout=5)
 s = json.loads(r.read())
 print("version=", s.get("version"))
 print("recording=", s.get("recording"))
