@@ -27,7 +27,21 @@ _DEFAULTS: Dict[str, Any] = {
     "auto_record_on_boot": True,
     "browser_tz_offset_minutes": None,
     "browser_tz_name": None,
+    # Auto-download: when enabled, every open browser tab pulls a fresh zip
+    # of newly-finalized recording segments every N minutes. Persisted here
+    # (alongside auto_record_on_boot) so the toggle survives container/host
+    # restarts via the BlueOS recordings bind mount.
+    "auto_download_enabled": False,
+    "auto_download_interval_minutes": 5,
 }
+
+# Bounds for the periodic-download cadence. 1 minute floor: shorter than that
+# and most ticks would carry no new closed segments (default segment length
+# is 300s) so we'd just be hammering the operator with status .txt files.
+# 1440 minutes (24h) ceiling is a sanity cap; the localStorage cursor still
+# works for longer gaps when the tab is closed and reopened.
+AUTO_DOWNLOAD_INTERVAL_MIN = 1
+AUTO_DOWNLOAD_INTERVAL_MAX = 1440
 
 
 def load_settings() -> Dict[str, Any]:
@@ -53,6 +67,16 @@ def load_settings() -> Dict[str, Any]:
         if "browser_tz_name" in raw:
             v = raw["browser_tz_name"]
             out["browser_tz_name"] = str(v) if isinstance(v, str) and v else None
+        if "auto_download_enabled" in raw:
+            out["auto_download_enabled"] = bool(raw["auto_download_enabled"])
+        if "auto_download_interval_minutes" in raw:
+            v = raw["auto_download_interval_minutes"]
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                iv = None
+            if iv is not None and AUTO_DOWNLOAD_INTERVAL_MIN <= iv <= AUTO_DOWNLOAD_INTERVAL_MAX:
+                out["auto_download_interval_minutes"] = iv
     except Exception as e:
         logger.warning("Could not read %s: %s", SETTINGS_PATH, e)
     return out
@@ -80,6 +104,19 @@ def save_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     if "browser_tz_name" in updates:
         v = updates["browser_tz_name"]
         cur["browser_tz_name"] = str(v) if isinstance(v, str) and v else None
+    if "auto_download_enabled" in updates:
+        cur["auto_download_enabled"] = bool(updates["auto_download_enabled"])
+    if "auto_download_interval_minutes" in updates:
+        v = updates["auto_download_interval_minutes"]
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            iv = None
+        if iv is not None:
+            # Clamp rather than reject — the UI uses min/max on the input element
+            # but a stale or out-of-band POST shouldn't be able to poison the file.
+            iv = max(AUTO_DOWNLOAD_INTERVAL_MIN, min(AUTO_DOWNLOAD_INTERVAL_MAX, iv))
+            cur["auto_download_interval_minutes"] = iv
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
         tmp = SETTINGS_PATH + ".tmp"

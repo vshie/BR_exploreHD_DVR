@@ -279,6 +279,33 @@
         </button>
         <span class="muted">Session: {{ status.session_id || '—' }}</span>
       </div>
+      <div class="row" style="margin-bottom:12px; align-items:center">
+        <button
+          type="button"
+          class="btn"
+          :class="{ latched: status.auto_download_enabled === true }"
+          :disabled="settingsSaving"
+          @click="toggleAutoDownload"
+          title="First time you enable this, Chrome will ask permission to download multiple files. Click Allow once — after that the downloads happen silently in the background. Each tick downloads a zip of newly-finalized segments (or a status .txt if nothing new has closed)."
+        >
+          Auto-download: {{ status.auto_download_enabled ? 'ON' : 'OFF' }}
+        </button>
+        <label class="muted" style="display:flex; align-items:center; gap:6px">
+          every
+          <input
+            type="number"
+            min="1"
+            max="1440"
+            v-model.number="autoDl.interval_minutes"
+            @change="saveAutoDownloadInterval"
+            :disabled="settingsSaving"
+            style="width:64px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+          />
+          min
+        </label>
+        <span class="muted" v-if="status.auto_download_enabled">{{ autoDl.nextLabel || 'scheduling…' }}</span>
+        <span class="muted" v-else>recordings auto-zip per interval; each zip embeds a status .txt with Pi temp / disk free / load.</span>
+      </div>
       <div class="grid">
         <div class="card" v-for="cam in (status.cams||[])" :key="cam.index">
           <h3>{{ cam.name }}</h3>
@@ -455,6 +482,16 @@ createApp({
       _liveSwitchGen: 0,
       _liveSwitchPromise: null,
       settingsSaving: false,
+      // Auto-download (per-tab timer; localStorage cursor).
+      // Server is stateless wrt this — each open browser drives its own tick
+      // and tracks the highest segment epoch it has already downloaded.
+      autoDl: {
+        interval_minutes: 5,
+        lastEpoch: 0,
+        nextDueAt: 0,        // performance.now() ms when the next tick fires
+        nextLabel: '',       // human countdown rendered in the toolbar
+        running: false,      // a tick is in flight (preflight + click)
+      },
       days: [],
       expanded: {},
       selectedDates: [],
@@ -531,6 +568,21 @@ createApp({
     livePick() {
       if (this.tab === 'live' && this.liveViewMode === 'single') this.switchLiveStream();
     },
+    // Pick up server-side toggles (e.g. another browser flipped the setting,
+    // or settings_store clamped our interval) and (re)schedule accordingly.
+    'status.auto_download_enabled'(n) {
+      this.restartAutoDownloadTimer();
+    },
+    'status.auto_download_interval_minutes'(n) {
+      if (typeof n === 'number' && n >= 1 && n <= 1440) {
+        // Don't clobber a value the user is mid-typing into the input element;
+        // only sync our local copy when the user isn't actively editing.
+        if (document.activeElement?.tagName !== 'INPUT') {
+          this.autoDl.interval_minutes = n;
+        }
+        this.restartAutoDownloadTimer();
+      }
+    },
   },
   mounted() {
     // Tell the backend our local TZ so segment timestamps and the calendar-day
@@ -539,7 +591,18 @@ createApp({
     // when the user clicks Start/resume.
     this.reportBrowserTz();
     document.addEventListener('visibilitychange', this._onVisibility);
-    this.tick();
+    // Restore persistent auto-download cursor BEFORE the first tick so the
+    // timer starts from where the previous session left off.
+    try {
+      var raw = localStorage.getItem('brdvr.autoDl.lastEpoch');
+      if (raw) {
+        var n = parseFloat(raw);
+        if (!Number.isNaN(n) && n >= 0) this.autoDl.lastEpoch = n;
+      }
+    } catch (e) { /* localStorage may be disabled; non-fatal */ }
+    this._autoDlTimer = null;
+    this._autoDlCountdown = null;
+    this.tick().then(() => this.restartAutoDownloadTimer());
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
     // Default tab is 'live', so bring up the player right away. The tab watcher
@@ -548,6 +611,8 @@ createApp({
   },
   unmounted() {
     clearInterval(this.poll);
+    if (this._autoDlTimer) clearTimeout(this._autoDlTimer);
+    if (this._autoDlCountdown) clearInterval(this._autoDlCountdown);
     document.removeEventListener('visibilitychange', this._onVisibility);
     this.teardownLive();
   },
@@ -1047,6 +1112,175 @@ createApp({
         alert((e && e.message) ? e.message : String(e));
       } finally {
         this.settingsSaving = false;
+      }
+    },
+    /**
+     * Click handler for the "Auto-download: ON/OFF" button.
+     *
+     * CRITICAL: when turning ON, the warm-up download MUST fire BEFORE any
+     * `await`. Once the function awaits, the JS task ends and Chrome no
+     * longer treats subsequent code as inside the user-gesture stack frame —
+     * meaning the very first programmatic download would be silently blocked.
+     * Firing _autoDlClickHidden() synchronously here guarantees Chrome counts
+     * this as a real user-gesture download (the first one is always allowed),
+     * which gives the operator immediate feedback (a status .txt download)
+     * and primes the origin so the next periodic tick triggers Chrome's
+     * "Allow multiple downloads from this site?" prompt instead of being
+     * dropped on the floor.
+     */
+    toggleAutoDownload() {
+      var turningOn = !this.status.auto_download_enabled;
+      if (turningOn) {
+        this._autoDlClickHidden('/auto_download_zip?warmup=1');
+      }
+      this._persistAutoDownload(turningOn);
+    },
+    async _persistAutoDownload(enabled) {
+      this.settingsSaving = true;
+      try {
+        const r = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_download_enabled: !!enabled }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
+        await this.tick();
+        this.restartAutoDownloadTimer();
+      } catch (e) {
+        alert((e && e.message) ? e.message : String(e));
+      } finally {
+        this.settingsSaving = false;
+      }
+    },
+    async saveAutoDownloadInterval() {
+      var n = parseInt(this.autoDl.interval_minutes, 10);
+      if (!Number.isFinite(n) || n < 1) n = 1;
+      if (n > 1440) n = 1440;
+      this.autoDl.interval_minutes = n;
+      this.settingsSaving = true;
+      try {
+        const r = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_download_interval_minutes: n }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
+        await this.tick();
+        this.restartAutoDownloadTimer();
+      } catch (e) {
+        alert((e && e.message) ? e.message : String(e));
+      } finally {
+        this.settingsSaving = false;
+      }
+    },
+    /** Cancel any pending tick and (re)start it if auto-download is on. */
+    restartAutoDownloadTimer() {
+      if (this._autoDlTimer) {
+        clearTimeout(this._autoDlTimer);
+        this._autoDlTimer = null;
+      }
+      if (this._autoDlCountdown) {
+        clearInterval(this._autoDlCountdown);
+        this._autoDlCountdown = null;
+      }
+      this.autoDl.nextLabel = '';
+      if (!this.status.auto_download_enabled) return;
+      var minutes = this.autoDl.interval_minutes;
+      if (typeof minutes !== 'number' || !(minutes >= 1)) {
+        minutes = this.status.auto_download_interval_minutes || 5;
+      }
+      var ms = Math.max(1, Math.floor(minutes)) * 60 * 1000;
+      this.autoDl.nextDueAt = performance.now() + ms;
+      this._autoDlTimer = setTimeout(() => this._onAutoDlTick(), ms);
+      var self = this;
+      this._autoDlCountdown = setInterval(function () {
+        var remain = Math.max(0, self.autoDl.nextDueAt - performance.now());
+        var s = Math.ceil(remain / 1000);
+        var m = Math.floor(s / 60);
+        var rem = s % 60;
+        self.autoDl.nextLabel = 'Next download in ' + m + 'm ' + String(rem).padStart(2, '0') + 's';
+      }, 1000);
+    },
+    async _onAutoDlTick() {
+      this._autoDlTimer = null;
+      try {
+        await this.runAutoDownloadTick();
+      } catch (e) {
+        console.warn('auto-download tick failed:', e);
+      } finally {
+        // Reschedule regardless of success/failure so a transient error
+        // doesn't silently kill the recurring schedule.
+        if (this.status.auto_download_enabled) {
+          this.restartAutoDownloadTimer();
+        }
+      }
+    },
+    /**
+     * Periodic tick: ask the server what the latest closed segment is, advance
+     * the localStorage cursor, then trigger the actual download via a hidden
+     * `<a>` click so the bytes never pass through JS memory.
+     *
+     * Chrome can't expose response headers from a hidden-`<a>` download to JS,
+     * so we use the small JSON `/auto_download_zip/info` companion endpoint to
+     * learn `latest_epoch` reliably and update the cursor. Cursor advances
+     * even when no new segments were waiting (server returns a status .txt)
+     * so the cursor stays meaningful and we never re-download nothing.
+     */
+    async runAutoDownloadTick() {
+      if (this.autoDl.running) return;
+      this.autoDl.running = true;
+      try {
+        var since = this.autoDl.lastEpoch || 0;
+        var url = '/auto_download_zip?since=' + encodeURIComponent(since);
+        var r;
+        try {
+          r = await fetch('/auto_download_zip/info?since=' + encodeURIComponent(since));
+        } catch (e) {
+          // Network blip — skip this tick; the next one will retry.
+          console.warn('auto-download info fetch failed:', e);
+          return;
+        }
+        var info = null;
+        if (r.ok) {
+          try { info = await r.json(); } catch (_) { info = null; }
+        }
+        // Trigger the download (zip if has_new, otherwise status .txt).
+        // No user gesture here — relies on the multi-download permission
+        // having been granted via the warm-up flow.
+        this._autoDlClickHidden(url);
+        if (info && typeof info.latest_epoch === 'number') {
+          // Advance the cursor to the highest segment epoch we just shipped.
+          // If has_new is false, latest_epoch == since, so this is a no-op.
+          this.autoDl.lastEpoch = info.latest_epoch;
+          try {
+            localStorage.setItem('brdvr.autoDl.lastEpoch', String(info.latest_epoch));
+          } catch (_) { /* non-fatal */ }
+        }
+      } finally {
+        this.autoDl.running = false;
+      }
+    },
+    /**
+     * Trigger a download by synthesizing a hidden `<a>` element and clicking
+     * it. Browser handles the actual byte streaming (resumable, progress in
+     * the native download tray, never buffered in JS memory). Same idiom
+     * already used by `_beginDownload` for the manual day/session flow.
+     */
+    _autoDlClickHidden(url) {
+      var a = document.createElement('a');
+      a.href = url;
+      a.style.display = 'none';
+      // No `download` attribute: we rely on the server's Content-Disposition
+      // so the suggested filename includes the timestamp the file was built
+      // with (matching the timestamp the server burns into the header line
+      // of the status .txt and the segment names inside the zip).
+      document.body.appendChild(a);
+      try {
+        a.click();
+      } finally {
+        document.body.removeChild(a);
       }
     },
     async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
