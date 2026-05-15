@@ -342,6 +342,15 @@
             <a href="#" @click.prevent="tab='neuralx'; loadNeuralX()">Configure</a>
           </span>
         </div>
+        <div v-if="(status.neuralx?.current || []).length" class="muted" style="margin-top:4px">
+          <span v-for="(c, i) in status.neuralx.current" :key="'sccur'+i">
+            <span v-if="i>0"> · </span>
+            uploading <strong>{{ c.basename || c.filename }}</strong>
+            (cam {{ c.camera_id }}) {{ c.percent || 0 }}%
+            · {{ c.mbps || 0 }} Mbps
+            <span v-if="c.eta_s != null">· {{ formatEta(c.eta_s) }} left</span>
+          </span>
+        </div>
       </div>
       <div class="card" style="margin-top:12px; padding:0; overflow:hidden">
         <img src="/static/brdvr-banner.png" alt="BR_exploreHD_DVR" style="display:block; width:100%; height:auto" />
@@ -515,19 +524,80 @@
         </div>
       </div>
 
-      <div class="card" style="margin-bottom:12px">
-        <h3>Queue</h3>
-        <div class="muted">
-          Pending {{ neuralx.server.queue?.pending || 0 }}
-          · In flight {{ neuralx.server.queue?.in_flight || 0 }}
-          · Failed {{ neuralx.server.queue?.failed || 0 }}
-          · Uploaded {{ neuralx.server.totals?.files || 0 }} ({{ fmtBytes(neuralx.server.totals?.bytes || 0) }})
-          · Avg {{ neuralx.server.totals?.avg_mbps || 0 }} Mbps
+      <div
+        class="card"
+        style="margin-bottom:12px"
+        v-if="(neuralx.server.current && neuralx.server.current.length) || neuralx.server.queue?.pending"
+      >
+        <h3>Currently uploading</h3>
+        <div v-if="!(neuralx.server.current && neuralx.server.current.length)" class="muted">
+          Worker idle — waiting for the next pending file.
         </div>
-        <div class="muted" v-if="neuralx.server.totals?.last_success_epoch">
+        <div v-for="(c, i) in (neuralx.server.current || [])" :key="'cur'+i" style="margin-bottom:10px">
+          <div class="row" style="justify-content:space-between; align-items:baseline; gap:8px">
+            <div>
+              <strong>{{ c.basename || c.filename }}</strong>
+              <span class="pill">cam {{ c.camera_id }}</span>
+              <span v-if="c.phase==='presign'" class="muted" style="margin-left:6px">requesting URL…</span>
+            </div>
+            <div class="muted">
+              {{ fmtBytes(c.sent_bytes || 0) }} / {{ fmtBytes(c.total_bytes || 0) }}
+              · {{ c.mbps || 0 }} Mbps
+              · {{ Math.round(c.elapsed_s || 0) }}s elapsed
+              <span v-if="c.eta_s != null">· {{ Math.round(c.eta_s) }}s left</span>
+            </div>
+          </div>
+          <div
+            style="margin-top:6px; height:8px; background:var(--bd); border-radius:4px; overflow:hidden"
+          >
+            <div
+              style="height:100%; background:var(--ok); transition:width 0.3s linear"
+              :style="{ width: (c.percent || 0) + '%' }"
+            ></div>
+          </div>
+          <div class="muted" style="margin-top:2px">
+            uploads to NeuralX as <code>{{ c.filename }}</code>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:12px">
+        <h3>Queue &amp; totals</h3>
+        <div class="row" style="gap:18px; flex-wrap:wrap">
+          <div>
+            <div class="muted">Pending</div>
+            <div style="font-size:1.4rem">{{ neuralx.server.queue?.pending || 0 }}</div>
+          </div>
+          <div>
+            <div class="muted">In flight</div>
+            <div style="font-size:1.4rem">{{ neuralx.server.queue?.in_flight || 0 }}</div>
+          </div>
+          <div>
+            <div class="muted">Failed</div>
+            <div style="font-size:1.4rem" :style="(neuralx.server.queue?.failed || 0) > 0 ? 'color:var(--err)' : ''">
+              {{ neuralx.server.queue?.failed || 0 }}
+            </div>
+          </div>
+          <div>
+            <div class="muted">Uploaded (session totals)</div>
+            <div style="font-size:1.4rem">
+              {{ neuralx.server.totals?.files || 0 }}
+              <span class="muted" style="font-size:0.9rem">files · {{ fmtBytes(neuralx.server.totals?.bytes || 0) }}</span>
+            </div>
+          </div>
+          <div>
+            <div class="muted">Avg throughput</div>
+            <div style="font-size:1.4rem">{{ neuralx.server.totals?.avg_mbps || 0 }} <span class="muted" style="font-size:0.9rem">Mbps</span></div>
+          </div>
+        </div>
+        <div class="muted" style="margin-top:10px" v-if="neuralx.server.queue?.remaining_bytes">
+          Remaining to ship: {{ fmtBytes(neuralx.server.queue.remaining_bytes) }}<span v-if="neuralx.server.queue.eta_s != null">
+          · approx {{ formatEta(neuralx.server.queue.eta_s) }} at current rate</span>
+        </div>
+        <div class="muted" v-if="neuralx.server.totals?.last_success_epoch" style="margin-top:4px">
           Last successful upload: {{ neuralxLastSuccessLabel }}
         </div>
-        <div class="muted" v-if="neuralx.server.last_error" style="color:var(--err)">
+        <div class="muted" v-if="neuralx.server.last_error" style="color:var(--err); margin-top:4px">
           Last error: {{ neuralx.server.last_error }}
         </div>
       </div>
@@ -1545,7 +1615,9 @@ createApp({
     startNeuralXPolling() {
       if (this.neuralx.poll) return;
       this.loadNeuralX();
-      this.neuralx.poll = setInterval(() => this.loadNeuralX(), 3000);
+      // 1s while the operator is on the NeuralX tab so the progress bar
+      // feels live; the periodic /status poll stays at 2s elsewhere.
+      this.neuralx.poll = setInterval(() => this.loadNeuralX(), 1000);
     },
     stopNeuralXPolling() {
       if (this.neuralx.poll) {
@@ -1634,6 +1706,18 @@ createApp({
       } catch (_) {
         return String(epoch);
       }
+    },
+    /** Format a seconds-remaining number as "1h 5m", "23m 14s", or "47s". */
+    formatEta(secs) {
+      if (secs == null) return '—';
+      const s = Math.max(0, Math.round(secs));
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      const sr = s % 60;
+      if (m < 60) return m + 'm ' + sr + 's';
+      const h = Math.floor(m / 60);
+      const mr = m % 60;
+      return h + 'h ' + mr + 'm';
     },
   },
 }).mount('#app');

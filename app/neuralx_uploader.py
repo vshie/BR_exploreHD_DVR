@@ -100,6 +100,79 @@ _PUT_TIMEOUT_S = 600.0
 # Recent-uploads ring buffer size for the status payload.
 _RECENT_LIMIT = 20
 
+# Update cadence for the in-flight bytes_sent counter. Throttling the
+# `on_progress` callback is important because `requests` reads the file in
+# 8 KiB chunks by default — at 70 Mbps that's ~1000 callbacks per second,
+# and each one acquires the uploader lock to update shared state. Coalescing
+# to ~5 Hz keeps the counter visibly moving without burning the GIL.
+_PROGRESS_UPDATE_INTERVAL_S = 0.2
+
+
+class _CountingFile:
+    """File wrapper that reports bytes-read deltas to a callback.
+
+    `requests` reads the body in chunks (default 8192 bytes) when handed a
+    file-like object. We forward every `read()` to the underlying file,
+    accumulate the byte count, and call `on_progress(sent_bytes)` at most
+    once per _PROGRESS_UPDATE_INTERVAL_S so the worker's progress dict is
+    refreshed without thrashing the lock.
+
+    `__len__` is exposed so `requests.utils.super_len` returns the real
+    Content-Length (otherwise requests falls back to chunked Transfer-Encoding
+    which S3 presigned PUTs reject).
+    """
+
+    __slots__ = ("_f", "_total", "_sent", "_on_progress", "_last_update_mono")
+
+    def __init__(self, f, total: int, on_progress: Callable[[int], None]):
+        self._f = f
+        self._total = int(total)
+        self._sent = 0
+        self._on_progress = on_progress
+        self._last_update_mono = 0.0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._f.read(size)
+        if chunk:
+            self._sent += len(chunk)
+            now = time.monotonic()
+            if (now - self._last_update_mono) >= _PROGRESS_UPDATE_INTERVAL_S or self._sent >= self._total:
+                self._last_update_mono = now
+                try:
+                    self._on_progress(self._sent)
+                except Exception:
+                    pass
+        return chunk
+
+    def __len__(self) -> int:
+        return self._total
+
+    def __iter__(self):
+        # urllib3 may iterate the body when chunked transfer is in use; we
+        # don't want that branch (it disables Content-Length) but expose a
+        # safe fallback just in case.
+        while True:
+            chunk = self.read(65536)
+            if not chunk:
+                return
+            yield chunk
+
+    # Forwarded helpers requests / urllib3 may use during prepare_body.
+    def fileno(self) -> int:
+        return self._f.fileno()
+
+    def tell(self) -> int:
+        return self._f.tell()
+
+    def seek(self, *a, **kw):
+        # If `requests` seeks the body (e.g. for a retry), reset our counter
+        # so the displayed bytes_sent doesn't run past the file size.
+        self._sent = 0
+        return self._f.seek(*a, **kw)
+
+    def close(self):
+        return self._f.close()
+
 
 def _now() -> float:
     return time.time()
@@ -465,6 +538,18 @@ class NeuralXUploader:
         self._queue: List[Tuple[str, int]] = []  # (path, cam_index)
         self._queue_cv = threading.Condition()
         self._in_flight: int = 0
+        # Per-active-upload metadata so the UI can render a "Currently uploading"
+        # progress card. Keyed by absolute source path; value is a small dict
+        # mutated under `self._lock`. Each entry lives for the duration of one
+        # PUT and is removed when the worker finishes (success or failure).
+        # Keying by path means concurrent worker handles for the same path
+        # collide cleanly (which can't happen — scanner dedupes — but keeps
+        # the invariant simple).
+        self._in_flight_meta: Dict[str, Dict[str, Any]] = {}
+        # Pending-bytes total so the UI can show queue ETA without us having
+        # to re-stat every file in the queue on each status call. Recomputed
+        # by the scanner after each sweep.
+        self._pending_bytes: int = 0
         self._last_scan_at: float = 0.0
         self._last_error: str = ""
 
@@ -599,21 +684,26 @@ class NeuralXUploader:
 
     def _scan_once(self) -> None:
         candidates = _walk_closed_segments(_storage_roots())
-        if not candidates:
-            return
         now = _now()
+        pending_bytes = 0
         with self._queue_cv:
             queued_paths = {p for p, _ in self._queue if p}
             for path, cam_index in candidates:
                 if path in queued_paths:
+                    # Already queued — still counts toward pending_bytes.
+                    try:
+                        pending_bytes += os.path.getsize(path)
+                    except OSError:
+                        pass
                     continue
                 if self._state.is_done(path):
                     continue
-                # Stability guard: skip very recently modified files.
                 try:
                     mtime = os.path.getmtime(path)
+                    size = os.path.getsize(path)
                 except OSError:
                     continue
+                # Stability guard: skip very recently modified files.
                 if (now - mtime) < _MIN_AGE_S:
                     continue
                 # Failed entries respect the backoff schedule.
@@ -621,11 +711,16 @@ class NeuralXUploader:
                 if entry and entry.get("status") == "failed":
                     next_at = float(entry.get("next_retry_epoch", 0.0) or 0.0)
                     if now < next_at:
+                        # Still count toward pending_bytes since it's not done.
+                        pending_bytes += size
                         continue
                 self._state.set_pending(path)
                 self._queue.append((path, cam_index))
                 queued_paths.add(path)
+                pending_bytes += size
             self._queue_cv.notify_all()
+        with self._lock:
+            self._pending_bytes = pending_bytes
 
     # -- workers -------------------------------------------------------------
 
@@ -650,6 +745,9 @@ class NeuralXUploader:
             finally:
                 with self._lock:
                     self._in_flight = max(0, self._in_flight - 1)
+                    # Always drop the in-flight meta — _upload_one cannot do
+                    # it on all exit paths without a redundant try/finally.
+                    self._in_flight_meta.pop(path, None)
 
     def _upload_one(self, path: str, cam_index: int) -> None:
         if not os.path.isfile(path):
@@ -684,6 +782,34 @@ class NeuralXUploader:
             "NeuralX uploading %s (%.1f MB) as %s [camera_id=%s]",
             basename, size_bytes / (1024 * 1024), upload_name, cam_id,
         )
+
+        # Seed the in-flight progress record before any I/O so the UI shows
+        # the file as soon as the worker picks it up (presign + first PUT
+        # bytes can take a couple of seconds).
+        started_epoch = _now()
+        started_mono = time.monotonic()
+        with self._lock:
+            self._in_flight_meta[path] = {
+                "path": path,
+                "basename": basename,
+                "upload_name": upload_name,
+                "camera_id": cam_id,
+                "total_bytes": int(size_bytes),
+                "sent_bytes": 0,
+                "started_epoch": started_epoch,
+                "started_mono": started_mono,
+                "updated_mono": started_mono,
+                "phase": "presign",
+            }
+
+        def _progress(sent: int) -> None:
+            with self._lock:
+                meta = self._in_flight_meta.get(path)
+                if meta is not None:
+                    meta["sent_bytes"] = int(sent)
+                    meta["updated_mono"] = time.monotonic()
+                    meta["phase"] = "uploading"
+
         try:
             # Step 1 — presign request.
             r = requests.get(
@@ -697,12 +823,19 @@ class NeuralXUploader:
             if not upload_url:
                 raise ValueError(f"presign response missing upload_url: {data!r}")
 
-            # Step 2 — PUT bytes. Streamed from disk; `requests` will use
-            # chunked Transfer-Encoding when handed a file-like object, which
-            # matches what the PDF reference script does.
+            with self._lock:
+                meta = self._in_flight_meta.get(path)
+                if meta is not None:
+                    meta["phase"] = "uploading"
+
+            # Step 2 — PUT bytes. Wrap the file so the worker can report
+            # bytes-sent in near-real-time (throttled to ~5 Hz to avoid
+            # lock contention). __len__ forces a proper Content-Length so
+            # the AWS presigned URL doesn't reject chunked transfer.
             t0 = time.monotonic()
             with open(path, "rb") as f:
-                r2 = requests.put(upload_url, data=f, timeout=_PUT_TIMEOUT_S)
+                wrapped = _CountingFile(f, int(size_bytes), _progress)
+                r2 = requests.put(upload_url, data=wrapped, timeout=_PUT_TIMEOUT_S)
             r2.raise_for_status()
             duration = max(1e-3, time.monotonic() - t0)
             mbps = (size_bytes * 8) / duration / 1_000_000
@@ -773,11 +906,35 @@ class NeuralXUploader:
                 pending += 1
             elif s == "failed":
                 failed += 1
+        now_mono = time.monotonic()
+        current: List[Dict[str, Any]] = []
         with self._lock:
             in_flight = self._in_flight
             running = bool(self._scanner and self._scanner.is_alive())
             last_scan = self._last_scan_at
             cam_map = dict(self._cam_map)
+            pending_bytes_total = int(self._pending_bytes)
+            for meta in self._in_flight_meta.values():
+                elapsed = max(1e-3, now_mono - float(meta.get("started_mono", now_mono)))
+                sent = int(meta.get("sent_bytes", 0) or 0)
+                total = int(meta.get("total_bytes", 0) or 0)
+                mbps = (sent * 8) / elapsed / 1_000_000 if sent > 0 else 0.0
+                remaining = max(0, total - sent)
+                eta_s = remaining / (mbps * 1_000_000 / 8) if mbps > 0.05 else None
+                pct = (sent * 100.0 / total) if total > 0 else 0.0
+                current.append({
+                    "filename": meta.get("upload_name", ""),
+                    "basename": meta.get("basename", ""),
+                    "camera_id": meta.get("camera_id", ""),
+                    "total_bytes": total,
+                    "sent_bytes": sent,
+                    "percent": round(pct, 1),
+                    "elapsed_s": round(elapsed, 2),
+                    "mbps": round(mbps, 2),
+                    "eta_s": (round(eta_s, 1) if eta_s is not None else None),
+                    "started_epoch": float(meta.get("started_epoch", 0.0) or 0.0),
+                    "phase": meta.get("phase", "uploading"),
+                })
         totals = snap["totals"]
         n_files = int(totals.get("files", 0) or 0)
         total_bytes = int(totals.get("bytes", 0) or 0)
@@ -788,6 +945,21 @@ class NeuralXUploader:
             if r.get("status") in ("done", "done_deleted")
         ]
         avg_mbps = round(sum(mbps_vals) / len(mbps_vals), 2) if mbps_vals else 0.0
+        # Account for the in-flight file's remaining bytes alongside the
+        # queue-still-pending bytes so the ETA covers everything left to do.
+        remaining_in_flight = sum(
+            max(0, c["total_bytes"] - c["sent_bytes"]) for c in current
+        )
+        remaining_bytes = max(0, pending_bytes_total - remaining_in_flight) + remaining_in_flight
+        # Prefer the running session's instantaneous throughput when one is
+        # in flight; fall back to the average of recent finished uploads.
+        instant_mbps = max((c["mbps"] for c in current if c["mbps"] > 0), default=0.0)
+        eta_mbps = instant_mbps if instant_mbps > 0 else avg_mbps
+        queue_eta_s = (
+            (remaining_bytes * 8) / (eta_mbps * 1_000_000)
+            if eta_mbps > 0.05 and remaining_bytes > 0
+            else None
+        )
         return {
             "enabled": self._enabled,
             "running": running,
@@ -800,7 +972,11 @@ class NeuralXUploader:
                 "pending": pending,
                 "failed": failed,
                 "in_flight": in_flight,
+                "pending_bytes": pending_bytes_total,
+                "remaining_bytes": remaining_bytes,
+                "eta_s": (round(queue_eta_s, 1) if queue_eta_s is not None else None),
             },
+            "current": current,
             "totals": {
                 "files": n_files,
                 "bytes": total_bytes,
@@ -821,6 +997,7 @@ class NeuralXUploader:
             "node_id": st["node_id"],
             "queue": st["queue"],
             "totals": st["totals"],
+            "current": st["current"],
             "last_error": st["last_error"],
         }
 
