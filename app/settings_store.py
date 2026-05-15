@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -16,6 +17,28 @@ logger = logging.getLogger(__name__)
 # Same bind mount BlueOS uses for recordings; survives reboot when host path is bound.
 SETTINGS_DIR = "/app/recordings"
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, ".br_explorehd_dvr_settings.json")
+
+# NeuralX upload defaults (see app/neuralx_uploader.py). The endpoint is the
+# documented public test bucket from the NeuralX integration guide; treat as
+# a default rather than a secret. `NEURALX_ENDPOINT` env var overrides it on
+# first boot only — once persisted in the settings file the operator's UI
+# value wins so that re-pointing at a staging endpoint survives container
+# restarts without env-var gymnastics.
+NEURALX_DEFAULT_ENDPOINT = os.environ.get(
+    "NEURALX_ENDPOINT",
+    "https://vv4ki4fa6b.execute-api.us-west-2.amazonaws.com/test-upload-url",
+)
+NEURALX_ALLOWED_CAM_IDS = ("01", "02", "03", "04")
+NEURALX_DEFAULT_CAM_MAP: Dict[str, str] = {"0": "01", "1": "02", "2": "03", "3": "04"}
+NEURALX_DELETE_THRESHOLD_DEFAULT_MB = 50 * 1024  # 50 GB
+NEURALX_DELETE_THRESHOLD_MAX_MB = 10_000_000
+NEURALX_MAX_CONCURRENT_MIN = 1
+NEURALX_MAX_CONCURRENT_MAX = 4
+# node_id and the filename portion both have to satisfy the PDF's whitelist
+# (`letters, digits, dots, underscores, hyphens — no spaces`). We use the same
+# regex for both, plus a length cap on the node_id so it doesn't bloat every
+# uploaded filename.
+NEURALX_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 
 # `browser_tz_offset_minutes` is signed minutes EAST of UTC (so Hawaii / UTC-10
 # is -600, Australia / UTC+10 is +600). It's the inverted form of JS's
@@ -33,6 +56,14 @@ _DEFAULTS: Dict[str, Any] = {
     # restarts via the BlueOS recordings bind mount.
     "auto_download_enabled": False,
     "auto_download_interval_minutes": 5,
+    # NeuralX continuous-uploader settings. Disabled by default — opt-in only
+    # because the documented endpoint is a public, unauthenticated test bucket.
+    "neuralx_enabled": False,
+    "neuralx_node_id": "",
+    "neuralx_endpoint": NEURALX_DEFAULT_ENDPOINT,
+    "neuralx_cam_map": dict(NEURALX_DEFAULT_CAM_MAP),
+    "neuralx_max_concurrent": 1,
+    "neuralx_delete_below_free_mb": NEURALX_DELETE_THRESHOLD_DEFAULT_MB,
 }
 
 # Bounds for the periodic-download cadence. 1 minute floor: shorter than that
@@ -42,6 +73,50 @@ _DEFAULTS: Dict[str, Any] = {
 # works for longer gaps when the tab is closed and reopened.
 AUTO_DOWNLOAD_INTERVAL_MIN = 1
 AUTO_DOWNLOAD_INTERVAL_MAX = 1440
+
+
+def _validate_neuralx_cam_map(value: Any) -> Optional[Dict[str, str]]:
+    """Return a normalized cam_map ({"0":"01", ...}) or None when invalid.
+
+    Rules: keys are stringified cam indices "0".."3"; each value is in
+    NEURALX_ALLOWED_CAM_IDS; values must be unique across the four slots so
+    two cams on the same node can't accidentally share a server-side bucket.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: Dict[str, str] = {}
+    for k in ("0", "1", "2", "3"):
+        v = value.get(k) or value.get(int(k))
+        if not isinstance(v, str):
+            return None
+        if v not in NEURALX_ALLOWED_CAM_IDS:
+            return None
+        out[k] = v
+    if len(set(out.values())) != len(out):
+        return None
+    return out
+
+
+def _validate_neuralx_endpoint(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s.startswith(("https://", "http://")):
+        return None
+    return s
+
+
+def _validate_neuralx_node_id(value: Any) -> Optional[str]:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if not NEURALX_TOKEN_RE.match(s):
+        return None
+    return s
 
 
 def load_settings() -> Dict[str, Any]:
@@ -77,6 +152,34 @@ def load_settings() -> Dict[str, Any]:
                 iv = None
             if iv is not None and AUTO_DOWNLOAD_INTERVAL_MIN <= iv <= AUTO_DOWNLOAD_INTERVAL_MAX:
                 out["auto_download_interval_minutes"] = iv
+        if "neuralx_enabled" in raw:
+            out["neuralx_enabled"] = bool(raw["neuralx_enabled"])
+        if "neuralx_node_id" in raw:
+            v = _validate_neuralx_node_id(raw["neuralx_node_id"])
+            if v is not None:
+                out["neuralx_node_id"] = v
+        if "neuralx_endpoint" in raw:
+            v = _validate_neuralx_endpoint(raw["neuralx_endpoint"])
+            if v is not None:
+                out["neuralx_endpoint"] = v
+        if "neuralx_cam_map" in raw:
+            cm = _validate_neuralx_cam_map(raw["neuralx_cam_map"])
+            if cm is not None:
+                out["neuralx_cam_map"] = cm
+        if "neuralx_max_concurrent" in raw:
+            try:
+                iv = int(raw["neuralx_max_concurrent"])
+                iv = max(NEURALX_MAX_CONCURRENT_MIN, min(NEURALX_MAX_CONCURRENT_MAX, iv))
+                out["neuralx_max_concurrent"] = iv
+            except (TypeError, ValueError):
+                pass
+        if "neuralx_delete_below_free_mb" in raw:
+            try:
+                iv = int(raw["neuralx_delete_below_free_mb"])
+                iv = max(0, min(NEURALX_DELETE_THRESHOLD_MAX_MB, iv))
+                out["neuralx_delete_below_free_mb"] = iv
+            except (TypeError, ValueError):
+                pass
     except Exception as e:
         logger.warning("Could not read %s: %s", SETTINGS_PATH, e)
     return out
@@ -117,6 +220,50 @@ def save_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
             # but a stale or out-of-band POST shouldn't be able to poison the file.
             iv = max(AUTO_DOWNLOAD_INTERVAL_MIN, min(AUTO_DOWNLOAD_INTERVAL_MAX, iv))
             cur["auto_download_interval_minutes"] = iv
+    if "neuralx_enabled" in updates:
+        cur["neuralx_enabled"] = bool(updates["neuralx_enabled"])
+    if "neuralx_node_id" in updates:
+        v = _validate_neuralx_node_id(updates["neuralx_node_id"])
+        if v is None:
+            raise ValueError(
+                "neuralx_node_id must match [A-Za-z0-9._-]{1,40}"
+            )
+        cur["neuralx_node_id"] = v
+    if "neuralx_endpoint" in updates:
+        v = _validate_neuralx_endpoint(updates["neuralx_endpoint"])
+        if v is None:
+            raise ValueError("neuralx_endpoint must be an http(s) URL")
+        cur["neuralx_endpoint"] = v
+    if "neuralx_cam_map" in updates:
+        cm = _validate_neuralx_cam_map(updates["neuralx_cam_map"])
+        if cm is None:
+            raise ValueError(
+                "neuralx_cam_map must map cam indices 0..3 to unique values in "
+                f"{NEURALX_ALLOWED_CAM_IDS}"
+            )
+        cur["neuralx_cam_map"] = cm
+    if "neuralx_max_concurrent" in updates:
+        try:
+            iv = int(updates["neuralx_max_concurrent"])
+        except (TypeError, ValueError):
+            raise ValueError("neuralx_max_concurrent must be an integer")
+        cur["neuralx_max_concurrent"] = max(
+            NEURALX_MAX_CONCURRENT_MIN, min(NEURALX_MAX_CONCURRENT_MAX, iv)
+        )
+    if "neuralx_delete_below_free_mb" in updates:
+        try:
+            iv = int(updates["neuralx_delete_below_free_mb"])
+        except (TypeError, ValueError):
+            raise ValueError("neuralx_delete_below_free_mb must be an integer (MB)")
+        cur["neuralx_delete_below_free_mb"] = max(
+            0, min(NEURALX_DELETE_THRESHOLD_MAX_MB, iv)
+        )
+    # Cross-field check: enabling the uploader requires a node_id so we can
+    # disambiguate uploads from this Pi on the shared test bucket.
+    if cur.get("neuralx_enabled") and not cur.get("neuralx_node_id"):
+        raise ValueError(
+            "neuralx_enabled requires neuralx_node_id to be set first"
+        )
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
         tmp = SETTINGS_PATH + ".tmp"

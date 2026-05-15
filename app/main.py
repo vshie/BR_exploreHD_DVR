@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request, send_file
 
+import neuralx_uploader
 import usb_storage
 from boot_manager import SEGMENT_SECONDS_DEFAULT, run_boot_sequence
 from mcm_client import DEFAULT_MCM_BASE, fetch_streams_raw, kick_streams, list_h264_rtsp_streams
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.28"
+VERSION = "1.0.29"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -148,6 +149,12 @@ def _boot_worker():
                 logger.info("SD gate blocked auto-record; recorders created but not started")
             else:
                 logger.info("auto_record_on_boot is false; recorders created but not started (standby)")
+            # NeuralX uploader: start last (after recorders are running and
+            # USB is mounted) so the first scan sees the real `_storage_roots`.
+            try:
+                neuralx_uploader.start_if_enabled()
+            except Exception as e:
+                logger.exception("NeuralX uploader failed to start at boot: %s", e)
         except Exception as e:
             logger.exception("Boot worker failed")
             with _state_lock:
@@ -226,6 +233,18 @@ def route_status():
         auto_boot = True
         auto_dl_enabled = False
         auto_dl_interval = 5
+    try:
+        neuralx_summary = neuralx_uploader.get_or_create().summary()
+    except Exception:
+        logger.exception("neuralx summary failed")
+        neuralx_summary = {
+            "enabled": False,
+            "running": False,
+            "node_id": "",
+            "queue": {"pending": 0, "failed": 0, "in_flight": 0},
+            "totals": {"files": 0, "bytes": 0, "last_success_epoch": 0.0, "avg_mbps": 0.0},
+            "last_error": "",
+        }
     resp = jsonify(
         {
             "version": VERSION,
@@ -247,6 +266,7 @@ def route_status():
                 "usb": usb,
             },
             "telemetry": telem,
+            "neuralx": neuralx_summary,
         }
     )
     resp.headers["Cache-Control"] = "no-store"
@@ -360,6 +380,82 @@ def route_settings_post():
         return jsonify({"success": True, "settings": merged})
     except Exception as e:
         logger.exception("settings post failed")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/neuralx/status", methods=["GET"])
+def route_neuralx_status():
+    """Full NeuralX uploader payload: settings, queue counts, totals, recent table."""
+    try:
+        return jsonify(neuralx_uploader.get_or_create().status())
+    except Exception as e:
+        logger.exception("neuralx status failed")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/neuralx/settings", methods=["POST"])
+def route_neuralx_settings():
+    """Update NeuralX uploader settings and start/stop the workers as needed.
+
+    Body accepts any subset of:
+      { "enabled": bool, "node_id": "<token>", "endpoint": "https://...",
+        "cam_map": {"0":"01", "1":"02", "2":"03", "3":"04"},
+        "max_concurrent": int, "delete_below_free_mb": int }
+    """
+    data = request.get_json(silent=True) or {}
+    updates: Dict[str, Any] = {}
+    if "enabled" in data:
+        updates["neuralx_enabled"] = bool(data["enabled"])
+    if "node_id" in data:
+        updates["neuralx_node_id"] = data["node_id"]
+    if "endpoint" in data:
+        updates["neuralx_endpoint"] = data["endpoint"]
+    if "cam_map" in data:
+        updates["neuralx_cam_map"] = data["cam_map"]
+    if "max_concurrent" in data:
+        updates["neuralx_max_concurrent"] = data["max_concurrent"]
+    if "delete_below_free_mb" in data:
+        updates["neuralx_delete_below_free_mb"] = data["delete_below_free_mb"]
+    if not updates:
+        return jsonify({"success": False, "message": "No recognized fields"}), 400
+    try:
+        merged = save_settings(updates)
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    except Exception as e:
+        logger.exception("neuralx settings save failed")
+        return jsonify({"success": False, "message": str(e)}), 500
+    try:
+        neuralx_uploader.apply_settings_change()
+    except Exception as e:
+        logger.exception("neuralx apply_settings_change failed")
+        return jsonify({
+            "success": False,
+            "message": f"Settings saved but uploader refresh failed: {e}",
+            "settings": {k: merged.get(k) for k in (
+                "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
+                "neuralx_cam_map", "neuralx_max_concurrent",
+                "neuralx_delete_below_free_mb",
+            )},
+        }), 500
+    return jsonify({
+        "success": True,
+        "settings": {k: merged.get(k) for k in (
+            "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
+            "neuralx_cam_map", "neuralx_max_concurrent",
+            "neuralx_delete_below_free_mb",
+        )},
+    })
+
+
+@app.route("/neuralx/retry", methods=["POST"])
+def route_neuralx_retry():
+    """Reset every failed entry's retry timer so the next scan re-enqueues it."""
+    try:
+        n = neuralx_uploader.get_or_create().retry_failed_now()
+        return jsonify({"success": True, "reset": int(n)})
+    except Exception as e:
+        logger.exception("neuralx retry failed")
         return jsonify({"success": False, "message": str(e)}), 500
 
 

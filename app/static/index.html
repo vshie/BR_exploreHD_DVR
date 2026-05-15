@@ -240,6 +240,7 @@
       <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
       <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
       <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
+      <button :class="{active: tab==='neuralx'}" @click="tab='neuralx'; loadNeuralX()">NeuralX</button>
     </nav>
   </header>
   <main :class="{ 'live-open': tab === 'live' }">
@@ -325,6 +326,22 @@
         <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · SD free {{ status.telemetry?.disk_free_mb }} MB</div>
         <div class="muted">USB {{ status.storage?.usb?.mounted ? (status.storage.usb.free_mb + ' MB on ' + status.storage.usb.device) : 'not mounted' }} (usable if ≥ {{ status.storage?.usb?.min_free_gb || 5 }} GB free)</div>
         <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
+        <div class="muted">
+          NeuralX:
+          <span v-if="status.neuralx?.enabled">
+            <span class="pill run">ON</span>
+            node "{{ status.neuralx?.node_id || '—' }}"
+            · {{ status.neuralx?.queue?.pending || 0 }} queued
+            · {{ status.neuralx?.queue?.in_flight || 0 }} in flight
+            · {{ status.neuralx?.queue?.failed || 0 }} failed
+            · {{ status.neuralx?.totals?.files || 0 }} uploaded ({{ fmtBytes(status.neuralx?.totals?.bytes || 0) }})
+            <span v-if="status.neuralx?.last_error" style="color:var(--err)"> · last error: {{ status.neuralx.last_error }}</span>
+          </span>
+          <span v-else>
+            <span class="pill">OFF</span>
+            <a href="#" @click.prevent="tab='neuralx'; loadNeuralX()">Configure</a>
+          </span>
+        </div>
       </div>
       <div class="card" style="margin-top:12px; padding:0; overflow:hidden">
         <img src="/static/brdvr-banner.png" alt="BR_exploreHD_DVR" style="display:block; width:100%; height:auto" />
@@ -401,6 +418,153 @@
             </div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section v-show="tab==='neuralx'">
+      <div v-if="neuralx.loadError" class="banner err" style="margin-bottom:12px">
+        Failed to load NeuralX status: {{ neuralx.loadError }}
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <h3>NeuralX uploader</h3>
+        <p class="muted" style="margin-top:4px">
+          Continuous shipper for closed segments. Disabled by default — opt-in only because the
+          default endpoint is a public, unauthenticated test bucket. See the NeuralX integration
+          guide for camera_id assignments.
+        </p>
+        <div class="row" style="margin-top:8px; align-items:center; gap:8px">
+          <button
+            type="button"
+            class="btn"
+            :class="{ latched: neuralx.form.enabled, primary: neuralx.form.enabled }"
+            :disabled="neuralx.saving || (!neuralx.form.enabled && !neuralx.form.node_id)"
+            @click="toggleNeuralX"
+            :title="!neuralx.form.node_id ? 'Set a Node ID below before enabling' : ''"
+          >
+            Uploader: {{ neuralx.form.enabled ? 'ON' : 'OFF' }}
+          </button>
+          <span class="muted" v-if="neuralx.server.running">running</span>
+          <span class="muted" v-else-if="neuralx.form.enabled">starting…</span>
+          <span class="muted" v-if="neuralx.saveError" style="color:var(--err)">{{ neuralx.saveError }}</span>
+        </div>
+        <div class="row" style="margin-top:12px; align-items:center; gap:8px; flex-wrap:wrap">
+          <label class="muted" style="display:flex; align-items:center; gap:6px">
+            Node ID
+            <input
+              type="text"
+              v-model="neuralx.form.node_id"
+              maxlength="40"
+              placeholder="e.g. node-blueA"
+              :disabled="neuralx.saving"
+              style="width:180px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+            />
+          </label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px">
+            Endpoint
+            <input
+              type="text"
+              v-model="neuralx.form.endpoint"
+              :disabled="neuralx.saving"
+              style="min-width:360px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+            />
+          </label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px">
+            Workers
+            <input
+              type="number"
+              min="1" max="4"
+              v-model.number="neuralx.form.max_concurrent"
+              :disabled="neuralx.saving"
+              style="width:60px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+            />
+          </label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px"
+                 :title="'When free space on the volume holding a just-uploaded file is below this many MB, delete the local copy. Set to 0 to never delete.'">
+            Delete local when free &lt;
+            <input
+              type="number"
+              min="0"
+              step="1024"
+              v-model.number="neuralx.form.delete_below_free_mb"
+              :disabled="neuralx.saving"
+              style="width:90px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+            />
+            MB
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px; align-items:center; gap:12px; flex-wrap:wrap">
+          <div class="muted">Camera mapping:</div>
+          <label v-for="i in 4" :key="'nxc'+i" class="muted" style="display:flex; align-items:center; gap:4px">
+            cam{{ i-1 }} →
+            <select
+              v-model="neuralx.form.cam_map[String(i-1)]"
+              :disabled="neuralx.saving"
+              style="background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
+            >
+              <option v-for="cid in ['01','02','03','04']" :key="cid" :value="cid">{{ cid }}</option>
+            </select>
+          </label>
+          <span v-if="!neuralxCamMapUnique" class="muted" style="color:var(--err)">camera_ids must be unique</span>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" :disabled="neuralx.saving || !neuralxCamMapUnique" @click="saveNeuralX">Save</button>
+          <button class="btn" :disabled="neuralx.saving" @click="loadNeuralX">Reload</button>
+          <button class="btn" :disabled="neuralx.saving || !(neuralx.server.queue?.failed)" @click="retryNeuralX">
+            Retry failed ({{ neuralx.server.queue?.failed || 0 }})
+          </button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:12px">
+        <h3>Queue</h3>
+        <div class="muted">
+          Pending {{ neuralx.server.queue?.pending || 0 }}
+          · In flight {{ neuralx.server.queue?.in_flight || 0 }}
+          · Failed {{ neuralx.server.queue?.failed || 0 }}
+          · Uploaded {{ neuralx.server.totals?.files || 0 }} ({{ fmtBytes(neuralx.server.totals?.bytes || 0) }})
+          · Avg {{ neuralx.server.totals?.avg_mbps || 0 }} Mbps
+        </div>
+        <div class="muted" v-if="neuralx.server.totals?.last_success_epoch">
+          Last successful upload: {{ neuralxLastSuccessLabel }}
+        </div>
+        <div class="muted" v-if="neuralx.server.last_error" style="color:var(--err)">
+          Last error: {{ neuralx.server.last_error }}
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Recent uploads</h3>
+        <div v-if="!(neuralx.server.recent && neuralx.server.recent.length)" class="muted">
+          No upload activity yet.
+        </div>
+        <table v-else>
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Filename</th>
+              <th>camera_id</th>
+              <th>Size</th>
+              <th>Mbps</th>
+              <th>Status</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in neuralxRecentDesc" :key="i">
+              <td class="muted">{{ neuralxTimeLabel(r.epoch) }}</td>
+              <td>{{ r.filename }}</td>
+              <td>{{ r.camera_id }}</td>
+              <td>{{ fmtBytes(r.bytes || 0) }}</td>
+              <td>{{ r.mbps || 0 }}</td>
+              <td>
+                <span class="pill" :class="{ run: r.status==='done' || r.status==='done_deleted', bad: r.status==='failed' }">
+                  {{ r.status }}
+                </span>
+              </td>
+              <td class="muted" style="color:var(--err)">{{ r.error || '' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -492,6 +656,38 @@ createApp({
         nextLabel: '',       // human countdown rendered in the toolbar
         running: false,      // a tick is in flight (preflight + click)
       },
+      // NeuralX uploader UI state. `form` is what the operator is editing;
+      // `server` is the most recent /neuralx/status snapshot we rendered.
+      // Splitting them lets a partially-typed change not race the periodic
+      // server poll.
+      neuralx: {
+        form: {
+          enabled: false,
+          node_id: '',
+          endpoint: '',
+          cam_map: { '0': '01', '1': '02', '2': '03', '3': '04' },
+          max_concurrent: 1,
+          delete_below_free_mb: 51200,
+        },
+        server: {
+          enabled: false,
+          running: false,
+          node_id: '',
+          endpoint: '',
+          cam_map: { '0': '01', '1': '02', '2': '03', '3': '04' },
+          max_concurrent: 1,
+          delete_below_free_mb: 51200,
+          queue: { pending: 0, in_flight: 0, failed: 0 },
+          totals: { files: 0, bytes: 0, last_success_epoch: 0, avg_mbps: 0 },
+          recent: [],
+          last_error: '',
+        },
+        saving: false,
+        loaded: false,
+        loadError: '',
+        saveError: '',
+        poll: null,
+      },
       days: [],
       expanded: {},
       selectedDates: [],
@@ -556,11 +752,25 @@ createApp({
       }
       return this.selectedDates.length ? `${this.selectedDates.length} day(s) · ${this.fmtBytes(bytes)} · ${files} files` : 'No days selected';
     },
+    neuralxCamMapUnique() {
+      const cm = this.neuralx.form.cam_map || {};
+      const vals = ['0','1','2','3'].map((k) => cm[k]);
+      return new Set(vals).size === vals.length;
+    },
+    neuralxRecentDesc() {
+      return (this.neuralx.server.recent || []).slice().reverse();
+    },
+    neuralxLastSuccessLabel() {
+      const e = this.neuralx.server.totals?.last_success_epoch || 0;
+      return e ? this.neuralxTimeLabel(e) : '—';
+    },
   },
   watch: {
     tab(n, o) {
       if (o === 'live' && n !== 'live') this.teardownLive();
       if (n === 'live') this.scheduleLiveStart();
+      if (n === 'neuralx') this.startNeuralXPolling();
+      else this.stopNeuralXPolling();
     },
     liveViewMode() {
       if (this.tab === 'live') this.scheduleLiveStart();
@@ -613,6 +823,7 @@ createApp({
     clearInterval(this.poll);
     if (this._autoDlTimer) clearTimeout(this._autoDlTimer);
     if (this._autoDlCountdown) clearInterval(this._autoDlCountdown);
+    if (this.neuralx?.poll) clearInterval(this.neuralx.poll);
     document.removeEventListener('visibilitychange', this._onVisibility);
     this.teardownLive();
   },
@@ -1296,6 +1507,133 @@ createApp({
     async retryBoot() {
       await fetch('/boot/retry', { method: 'POST' });
       this.tab = 'status';
+    },
+    // ---- NeuralX uploader -------------------------------------------------
+    /** Snapshot the server payload into both `server` (always) and `form`
+     *  (only when the operator isn't mid-edit, to avoid clobbering typing).
+     */
+    _applyNeuralXServer(payload) {
+      const editing = this.neuralx.saving || document.activeElement?.tagName === 'INPUT';
+      this.neuralx.server = Object.assign(this.neuralx.server, payload || {});
+      if (!editing && !this.neuralx.loaded) {
+        // First load: prime the form from the server.
+        this.neuralx.form.enabled = !!payload.enabled;
+        this.neuralx.form.node_id = payload.node_id || '';
+        this.neuralx.form.endpoint = payload.endpoint || '';
+        if (payload.cam_map && typeof payload.cam_map === 'object') {
+          this.neuralx.form.cam_map = Object.assign(
+            { '0':'01', '1':'02', '2':'03', '3':'04' },
+            payload.cam_map,
+          );
+        }
+        this.neuralx.form.max_concurrent = payload.max_concurrent || 1;
+        this.neuralx.form.delete_below_free_mb = payload.delete_below_free_mb || 0;
+      }
+      this.neuralx.loaded = true;
+    },
+    async loadNeuralX() {
+      try {
+        const r = await fetch('/neuralx/status');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        this._applyNeuralXServer(j);
+        this.neuralx.loadError = '';
+      } catch (e) {
+        this.neuralx.loadError = String(e);
+      }
+    },
+    startNeuralXPolling() {
+      if (this.neuralx.poll) return;
+      this.loadNeuralX();
+      this.neuralx.poll = setInterval(() => this.loadNeuralX(), 3000);
+    },
+    stopNeuralXPolling() {
+      if (this.neuralx.poll) {
+        clearInterval(this.neuralx.poll);
+        this.neuralx.poll = null;
+      }
+    },
+    async saveNeuralX() {
+      if (!this.neuralxCamMapUnique) {
+        this.neuralx.saveError = 'camera_ids must be unique across cam0..cam3';
+        return;
+      }
+      this.neuralx.saving = true;
+      this.neuralx.saveError = '';
+      try {
+        const body = {
+          enabled: !!this.neuralx.form.enabled,
+          node_id: this.neuralx.form.node_id || '',
+          endpoint: this.neuralx.form.endpoint || '',
+          cam_map: this.neuralx.form.cam_map,
+          max_concurrent: this.neuralx.form.max_concurrent,
+          delete_below_free_mb: this.neuralx.form.delete_below_free_mb,
+        };
+        const r = await fetch('/neuralx/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          throw new Error(j.message || ('HTTP ' + r.status));
+        }
+      } catch (e) {
+        this.neuralx.saveError = String(e.message || e);
+      } finally {
+        this.neuralx.saving = false;
+      }
+      await this.loadNeuralX();
+    },
+    async toggleNeuralX() {
+      // Switching the toggle persists the new state right away — the rest of
+      // the form is intentionally only saved when the operator clicks Save,
+      // so they can pre-fill node_id / endpoint before flipping it on.
+      if (!this.neuralx.form.enabled && !this.neuralx.form.node_id) {
+        this.neuralx.saveError = 'Set a Node ID before enabling.';
+        return;
+      }
+      this.neuralx.form.enabled = !this.neuralx.form.enabled;
+      this.neuralx.saving = true;
+      this.neuralx.saveError = '';
+      try {
+        const r = await fetch('/neuralx/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: this.neuralx.form.enabled,
+            node_id: this.neuralx.form.node_id,
+          }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          // Revert the toggle if the server rejected it.
+          this.neuralx.form.enabled = !this.neuralx.form.enabled;
+          throw new Error(j.message || ('HTTP ' + r.status));
+        }
+      } catch (e) {
+        this.neuralx.saveError = String(e.message || e);
+      } finally {
+        this.neuralx.saving = false;
+      }
+      await this.loadNeuralX();
+    },
+    async retryNeuralX() {
+      try {
+        await fetch('/neuralx/retry', { method: 'POST' });
+      } catch (e) {
+        this.neuralx.saveError = String(e);
+      }
+      await this.loadNeuralX();
+    },
+    neuralxTimeLabel(epoch) {
+      if (!epoch) return '—';
+      try {
+        const d = new Date(epoch * 1000);
+        return d.toLocaleTimeString();
+      } catch (_) {
+        return String(epoch);
+      }
     },
   },
 }).mount('#app');
