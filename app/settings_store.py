@@ -30,8 +30,6 @@ NEURALX_DEFAULT_ENDPOINT = os.environ.get(
 )
 NEURALX_ALLOWED_CAM_IDS = ("01", "02", "03", "04")
 NEURALX_DEFAULT_CAM_MAP: Dict[str, str] = {"0": "01", "1": "02", "2": "03", "3": "04"}
-NEURALX_DELETE_THRESHOLD_DEFAULT_MB = 50 * 1024  # 50 GB
-NEURALX_DELETE_THRESHOLD_MAX_MB = 10_000_000
 NEURALX_MAX_CONCURRENT_MIN = 1
 NEURALX_MAX_CONCURRENT_MAX = 4
 # node_id and the filename portion both have to satisfy the PDF's whitelist
@@ -63,7 +61,6 @@ _DEFAULTS: Dict[str, Any] = {
     "neuralx_endpoint": NEURALX_DEFAULT_ENDPOINT,
     "neuralx_cam_map": dict(NEURALX_DEFAULT_CAM_MAP),
     "neuralx_max_concurrent": 1,
-    "neuralx_delete_below_free_mb": NEURALX_DELETE_THRESHOLD_DEFAULT_MB,
 }
 
 # Bounds for the periodic-download cadence. 1 minute floor: shorter than that
@@ -173,13 +170,11 @@ def load_settings() -> Dict[str, Any]:
                 out["neuralx_max_concurrent"] = iv
             except (TypeError, ValueError):
                 pass
-        if "neuralx_delete_below_free_mb" in raw:
-            try:
-                iv = int(raw["neuralx_delete_below_free_mb"])
-                iv = max(0, min(NEURALX_DELETE_THRESHOLD_MAX_MB, iv))
-                out["neuralx_delete_below_free_mb"] = iv
-            except (TypeError, ValueError):
-                pass
+        # `neuralx_delete_below_free_mb` was a configurable threshold up
+        # through 1.0.30. The deletion policy is now hardcoded inside
+        # neuralx_uploader (50 GB free-space floor + 3-day age cap), so
+        # we intentionally don't read the legacy key — leaving it on disk
+        # is harmless, the next save_settings will not write it back.
     except Exception as e:
         logger.warning("Could not read %s: %s", SETTINGS_PATH, e)
     return out
@@ -250,14 +245,9 @@ def save_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
         cur["neuralx_max_concurrent"] = max(
             NEURALX_MAX_CONCURRENT_MIN, min(NEURALX_MAX_CONCURRENT_MAX, iv)
         )
-    if "neuralx_delete_below_free_mb" in updates:
-        try:
-            iv = int(updates["neuralx_delete_below_free_mb"])
-        except (TypeError, ValueError):
-            raise ValueError("neuralx_delete_below_free_mb must be an integer (MB)")
-        cur["neuralx_delete_below_free_mb"] = max(
-            0, min(NEURALX_DELETE_THRESHOLD_MAX_MB, iv)
-        )
+    # `neuralx_delete_below_free_mb` deliberately ignored on POST (now
+    # hardcoded inside neuralx_uploader). Stale browsers may still send it
+    # — we no-op silently rather than 400 the entire save.
     # Cross-field check: enabling the uploader requires a node_id so we can
     # disambiguate uploads from this Pi on the shared test bucket.
     if cur.get("neuralx_enabled") and not cur.get("neuralx_node_id"):

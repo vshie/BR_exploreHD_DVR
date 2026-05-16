@@ -196,21 +196,27 @@ Open the **NeuralX** tab in the extension UI to configure:
 | Endpoint | Pre-filled with the documented NeuralX endpoint. Override per install if you have a private or staging URL. |
 | Camera mapping | Per-cam dropdown that maps cam index 0..3 onto NeuralX `camera_id` 01..04. Defaults to `cam0→01, cam1→02, cam2→03, cam3→04`. Values must be unique within the node. |
 | Workers | 1..4 concurrent uploads. Default `1` — fine for the four-camera ~24 Mbps aggregate over typical home internet. |
-| Delete local when free < N MB | After a successful upload, if free space on the volume holding the file is below this threshold, delete the local copy. Default `51200` (50 GB). Set to `0` to never delete. |
+
+**Local cleanup policy (hardcoded, no UI knob).** Once a segment is marked `done` in the NeuralX state file, the uploader deletes the local copy when **either**:
+
+- the file is older than **3 days** (mtime), or
+- free space on the volume holding the file is below **50 GB**.
+
+Both conditions are re-evaluated after each successful upload **and** by a periodic sweep every scan tick (~10 s), oldest-recording-first. Files that haven't uploaded successfully are **never** touched, so the rule cannot lose data the test bucket hasn't yet acknowledged.
 
 The protocol mirrors the [NeuralX Raspberry Pi integration guide](https://vv4ki4fa6b.execute-api.us-west-2.amazonaws.com/test-upload-url) verbatim:
 
 1. `GET {endpoint}?camera_id=<01..04>&filename=<node_id>_<basename>` → JSON `{ "upload_url": "..." }`.
 2. `PUT <upload_url>` with the raw `.ts` bytes (AWS signature is embedded in the URL — no auth header from our side).
 
-Per-file state (status, attempts, last error, Mbps, bytes) is persisted in `<recordings>/.br_explorehd_dvr_neuralx_state.json` and survives container restarts. The scanner walks every closed `YYYYMMDD_HHMMSS.ts` under both SD and USB roots, so when the uploader is enabled or the network recovers after an outage it will backfill anything that's still on disk and not yet marked as `done`.
+Per-file state (status, attempts, last error, Mbps, bytes) is persisted in `<recordings>/.br_explorehd_dvr_neuralx_state.json` and survives container restarts. The scanner walks every closed `YYYYMMDD_HHMMSS_cam<n>.ts` (and the legacy 1.0.29 `YYYYMMDD_HHMMSS.ts`) under both SD and USB roots, so when the uploader is enabled or the network recovers after an outage it will backfill anything that's still on disk and not yet marked as `done`.
 
-> **Caveat — delete-after-upload + session zips.** When delete-after-upload fires, the per-session `<session_id>.zip` archives built at boot by `zip_unfinished_sessions` may be partial (or absent) for sessions whose segments shipped before the zip pass ran. That's acceptable for the test-bucket workflow but worth knowing if you also rely on the per-session zip downloads in the Recordings tab.
+> **Caveat — automatic cleanup + session zips.** When the cleanup sweep fires, the per-session `<session_id>.zip` archives built at boot by `zip_unfinished_sessions` may be partial (or absent) for sessions whose segments shipped before the zip pass ran. That's acceptable for the test-bucket workflow but worth knowing if you also rely on the per-session zip downloads in the Recordings tab.
 
 Programmatic access:
 
-- `GET /neuralx/status` — full payload: settings, queue counts, totals, recent uploads.
-- `POST /neuralx/settings` — JSON body with any subset of `enabled`, `node_id`, `endpoint`, `cam_map`, `max_concurrent`, `delete_below_free_mb`. Validates camera_id whitelist + uniqueness and the `node_id` token regex.
+- `GET /neuralx/status` — full payload: settings, queue counts, totals, recent uploads, and `delete_policy` block (`free_mb_threshold`, `max_age_days`, last sweep counters).
+- `POST /neuralx/settings` — JSON body with any subset of `enabled`, `node_id`, `endpoint`, `cam_map`, `max_concurrent`. (The legacy `delete_below_free_mb` field is silently ignored — the cleanup policy is now hardcoded.) Validates camera_id whitelist + uniqueness and the `node_id` token regex.
 - `POST /neuralx/retry` — reset the retry timer on every failed entry so the next scan re-enqueues it.
 
 ## Live view

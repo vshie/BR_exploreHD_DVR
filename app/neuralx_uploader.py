@@ -1,8 +1,8 @@
 """
 NeuralX continuous uploader: ship each closed MPEG-TS segment to the NeuralX
-test endpoint, persist per-file upload state across restarts, and optionally
-delete the local copy after a successful upload once free space drops below
-a configured threshold.
+test endpoint, persist per-file upload state across restarts, and reclaim
+local disk space by deleting `done` segments either when the volume falls
+below the hardcoded 50 GB floor or when the segment is more than 3 days old.
 
 Design overview
 ---------------
@@ -110,6 +110,22 @@ _RECENT_LIMIT = 20
 # and each one acquires the uploader lock to update shared state. Coalescing
 # to ~5 Hz keeps the counter visibly moving without burning the GIL.
 _PROGRESS_UPDATE_INTERVAL_S = 0.2
+
+# Cleanup policy (HARDCODED — intentionally not user-configurable). A local
+# `.ts` is eligible for deletion only if it's already been uploaded
+# successfully (status=="done") AND at least one of these two conditions
+# holds:
+#   - free space on the file's volume is below _DELETE_FREE_MB_THRESHOLD
+#   - the file's mtime is older than _DELETE_AFTER_AGE_S
+#
+# The free-space rule keeps recording from stalling out on a full disk;
+# the age rule bounds long-term storage on a roomy NVMe / SD so the device
+# doesn't sit on weeks of duplicate footage that's already shipped to
+# NeuralX. Both thresholds are deliberately constants instead of settings
+# to avoid the previous footgun where an operator could disable cleanup
+# entirely and silently fill the disk.
+_DELETE_FREE_MB_THRESHOLD = 50 * 1024            # 50 GB
+_DELETE_AFTER_AGE_S = 3 * 24 * 3600              # 3 days
 
 
 class _CountingFile:
@@ -231,6 +247,33 @@ def _sanitize_basename(name: str) -> Optional[str]:
     if not re.match(r"^[A-Za-z0-9._-]+$", name):
         return None
     return name
+
+
+def _should_delete_now(path: str) -> Optional[str]:
+    """If `path` is eligible for cleanup right now, return a human reason.
+
+    The caller MUST also confirm that the file is in `done` state — this
+    helper only evaluates the volume-pressure / age side of the policy
+    so the same logic can serve both the post-upload check (one file) and
+    the periodic sweep (every done file).
+    Returns None when nothing matches (or `path` is gone). Free-space is
+    checked even when the age rule already fires so callers can include
+    the most descriptive reason in the log line.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    age_s = _now() - mtime
+    if age_s >= _DELETE_AFTER_AGE_S:
+        return f"age {age_s / 86400:.1f}d \u2265 {_DELETE_AFTER_AGE_S // 86400}d"
+    free_mb = _free_mb_for(path)
+    if free_mb is not None and free_mb < _DELETE_FREE_MB_THRESHOLD:
+        return (
+            f"free {free_mb:.0f} MB < {_DELETE_FREE_MB_THRESHOLD} MB "
+            f"(file age {age_s / 3600:.1f}h)"
+        )
+    return None
 
 
 def _build_upload_name(node_id: str, basename: str) -> Optional[str]:
@@ -370,11 +413,12 @@ class _State:
         duration_s: float,
         mbps: float,
         deleted: bool,
+        deleted_reason: str = "",
     ) -> None:
         with self._lock:
             cur = self.data["files"].get(path) or {}
             attempts = int(cur.get("attempts", 0) or 0) + 1
-            entry = {
+            entry: Dict[str, Any] = {
                 "status": "done_deleted" if deleted else "done",
                 "upload_name": upload_name,
                 "camera_id": camera_id,
@@ -384,6 +428,9 @@ class _State:
                 "mbps": round(float(mbps), 2),
                 "attempts": attempts,
             }
+            if deleted:
+                entry["deleted_reason"] = str(deleted_reason)[:200]
+                entry["deleted_epoch"] = entry["uploaded_epoch"]
             self.data["files"][path] = entry
             t = self.data["totals"]
             t["files"] = int(t.get("files", 0) or 0) + 1
@@ -399,6 +446,23 @@ class _State:
                     "epoch": entry["uploaded_epoch"],
                 }
             )
+            self._persist_locked()
+
+    def mark_deleted_local(self, path: str, reason: str) -> None:
+        """Flip a `done` entry to `done_deleted` after a sweep removes the file.
+
+        Leaves the entry around so the status table can show what we
+        cleaned up and so a re-walk of the disk doesn't re-enqueue a file
+        whose bytes are gone forever.
+        """
+        with self._lock:
+            cur = self.data["files"].get(path)
+            if not isinstance(cur, dict):
+                return
+            cur["status"] = "done_deleted"
+            cur["deleted_reason"] = str(reason)[:200]
+            cur["deleted_epoch"] = _now()
+            self.data["files"][path] = cur
             self._persist_locked()
 
     def mark_failure(self, path: str, error: str, *, camera_id: Optional[str] = None) -> None:
@@ -563,7 +627,11 @@ class NeuralXUploader:
         self._endpoint: str = ""
         self._cam_map: Dict[str, str] = dict(NEURALX_DEFAULT_CAM_MAP)
         self._max_concurrent: int = 1
-        self._delete_below_free_mb: int = 0
+        # Sticky counters surfaced via /neuralx/status so the UI can show
+        # what the most recent sweep did without us reaching into the log.
+        self._last_sweep_deleted_count: int = 0
+        self._last_sweep_deleted_bytes: int = 0
+        self._last_sweep_epoch: float = 0.0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -586,10 +654,6 @@ class NeuralXUploader:
             self._max_concurrent = int(s.get("neuralx_max_concurrent", 1) or 1)
         except (TypeError, ValueError):
             self._max_concurrent = 1
-        try:
-            self._delete_below_free_mb = int(s.get("neuralx_delete_below_free_mb", 0) or 0)
-        except (TypeError, ValueError):
-            self._delete_below_free_mb = 0
 
     def start(self) -> None:
         """Start the scanner and worker threads if not already running."""
@@ -615,8 +679,10 @@ class NeuralXUploader:
                 t.start()
                 self._workers.append(t)
             logger.info(
-                "NeuralX uploader started (node_id=%s, workers=%d, delete_below_free_mb=%d)",
-                self._node_id, len(self._workers), self._delete_below_free_mb,
+                "NeuralX uploader started (node_id=%s, workers=%d, "
+                "cleanup_free_mb_threshold=%d, cleanup_age_days=%d)",
+                self._node_id, len(self._workers),
+                _DELETE_FREE_MB_THRESHOLD, _DELETE_AFTER_AGE_S // 86400,
             )
 
     def stop(self, *, join_timeout: float = 5.0) -> None:
@@ -725,6 +791,58 @@ class NeuralXUploader:
             self._queue_cv.notify_all()
         with self._lock:
             self._pending_bytes = pending_bytes
+        self._sweep_done_for_deletion()
+
+    def _sweep_done_for_deletion(self) -> None:
+        """Re-evaluate every `done` file against the hardcoded cleanup policy.
+
+        Runs after each disk walk. We iterate state entries that:
+          - are in `done` state (already uploaded successfully)
+          - still have a real file on disk
+        sorted by mtime ascending so the oldest recordings disappear first
+        when free-space pressure is what triggered deletion. This keeps the
+        most recent footage on the device for as long as possible.
+
+        Deleting one file changes free space, so `_should_delete_now` is
+        re-evaluated on every iteration — once the volume crosses back
+        above the 50 GB floor the loop short-circuits even if there are
+        more `done` files we *could* nuke.
+        """
+        try:
+            snap = self._state.snapshot()
+        except Exception:
+            logger.exception("NeuralX sweep: snapshot failed")
+            return
+        candidates: List[Tuple[str, float, int]] = []
+        for path, entry in snap.get("files", {}).items():
+            if entry.get("status") != "done":
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            candidates.append((path, mtime, size))
+        candidates.sort(key=lambda t: t[1])
+        deleted = 0
+        deleted_bytes = 0
+        for path, _mtime, size in candidates:
+            reason = _should_delete_now(path)
+            if reason is None:
+                continue
+            try:
+                os.remove(path)
+            except OSError as e:
+                logger.warning("NeuralX sweep: could not delete %s: %s", path, e)
+                continue
+            self._state.mark_deleted_local(path, reason)
+            deleted += 1
+            deleted_bytes += size
+            logger.info("NeuralX sweep: deleted %s (%s)", path, reason)
+        with self._lock:
+            self._last_sweep_deleted_count = deleted
+            self._last_sweep_deleted_bytes = deleted_bytes
+            self._last_sweep_epoch = _now()
 
     # -- workers -------------------------------------------------------------
 
@@ -864,21 +982,22 @@ class NeuralXUploader:
             logger.warning("NeuralX upload failed for %s: %s", basename, msg)
             return
 
-        # Success — optionally delete to reclaim space.
+        # Success — apply the hardcoded cleanup policy to the file we just
+        # uploaded. The age branch fires immediately on a backfill of a
+        # >3-day-old segment; the free-space branch fires once the volume
+        # drops below 50 GB. Files outside both windows are left on disk
+        # and re-evaluated by the periodic sweep on subsequent scans.
         deleted = False
-        threshold = max(0, int(self._delete_below_free_mb))
-        if threshold > 0:
-            free_mb = _free_mb_for(path)
-            if free_mb is not None and free_mb < threshold:
-                try:
-                    os.remove(path)
-                    deleted = True
-                    logger.info(
-                        "NeuralX deleted local %s (free %.0f MB < %d MB threshold)",
-                        path, free_mb, threshold,
-                    )
-                except OSError as e:
-                    logger.warning("NeuralX could not delete %s after upload: %s", path, e)
+        reason = _should_delete_now(path)
+        delete_reason_str = ""
+        if reason is not None:
+            try:
+                os.remove(path)
+                deleted = True
+                delete_reason_str = reason
+                logger.info("NeuralX deleted local %s after upload (%s)", path, reason)
+            except OSError as e:
+                logger.warning("NeuralX could not delete %s after upload: %s", path, e)
         self._state.mark_success(
             path,
             upload_name=upload_name,
@@ -887,6 +1006,7 @@ class NeuralXUploader:
             duration_s=duration,
             mbps=mbps,
             deleted=deleted,
+            deleted_reason=delete_reason_str,
         )
         logger.info(
             "NeuralX uploaded %s in %.1fs (%.1f Mbps)%s",
@@ -918,6 +1038,9 @@ class NeuralXUploader:
             last_scan = self._last_scan_at
             cam_map = dict(self._cam_map)
             pending_bytes_total = int(self._pending_bytes)
+            last_sweep_count = int(self._last_sweep_deleted_count)
+            last_sweep_bytes = int(self._last_sweep_deleted_bytes)
+            last_sweep_epoch = float(self._last_sweep_epoch)
             for meta in self._in_flight_meta.values():
                 elapsed = max(1e-3, now_mono - float(meta.get("started_mono", now_mono)))
                 sent = int(meta.get("sent_bytes", 0) or 0)
@@ -971,7 +1094,13 @@ class NeuralXUploader:
             "endpoint": self._endpoint,
             "cam_map": cam_map,
             "max_concurrent": self._max_concurrent,
-            "delete_below_free_mb": self._delete_below_free_mb,
+            "delete_policy": {
+                "free_mb_threshold": _DELETE_FREE_MB_THRESHOLD,
+                "max_age_days": _DELETE_AFTER_AGE_S // 86400,
+                "last_sweep_epoch": last_sweep_epoch,
+                "last_sweep_deleted": last_sweep_count,
+                "last_sweep_bytes": last_sweep_bytes,
+            },
             "queue": {
                 "pending": pending,
                 "failed": failed,
@@ -1002,6 +1131,7 @@ class NeuralXUploader:
             "queue": st["queue"],
             "totals": st["totals"],
             "current": st["current"],
+            "delete_policy": st["delete_policy"],
             "last_error": st["last_error"],
         }
 

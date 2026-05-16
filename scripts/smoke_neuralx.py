@@ -12,9 +12,10 @@ What it covers
 5. Asserts:
    - Both segments are recorded as `done` in the state file.
    - Server-side filenames are `<node_id>_<basename>`.
-   - The lower of the two free-space thresholds (delete_below_free_mb very
-     large) causes the local file to be removed; threshold of 0 leaves it
-     in place.
+   - The hardcoded age rule (>3 days) deletes a backfilled old segment
+     immediately after its upload completes.
+   - The hardcoded free-space rule (<50 GB) deletes a freshly-uploaded
+     `done` file when _free_mb_for is patched to report low disk.
    - Failed uploads (forced via a poisoned cam_map entry) end up as `failed`
      with a populated last_error and are reset by `/neuralx/retry`.
    - State persists across a fresh `_State()` instantiation.
@@ -156,7 +157,6 @@ def main() -> int:
         "neuralx_node_id": "node-blueA",
         "neuralx_cam_map": {"0": "01", "1": "02", "2": "03", "3": "04"},
         "neuralx_max_concurrent": 2,
-        "neuralx_delete_below_free_mb": 0,  # don't delete in the happy-path stage
         "neuralx_enabled": True,
     })
 
@@ -193,7 +193,8 @@ def main() -> int:
         print("FAIL: active seg_00007 leaked into the uploads", file=sys.stderr)
         up.stop(); stub.stop(); return 1
 
-    # State entries are `done` (not `done_deleted`, threshold=0).
+    # State entries are `done` (not `done_deleted`, since fresh segments
+    # are <3 days old and free space on the test box is well above 50 GB).
     state = json.loads(Path(nx.STATE_PATH).read_text())
     for p in paths:
         e = state["files"].get(str(p))
@@ -201,7 +202,7 @@ def main() -> int:
             print("FAIL: file not done:", p, e, file=sys.stderr)
             up.stop(); stub.stop(); return 1
         if not p.exists():
-            print("FAIL: file deleted even though threshold=0:", p, file=sys.stderr)
+            print("FAIL: fresh file unexpectedly deleted:", p, file=sys.stderr)
             up.stop(); stub.stop(); return 1
 
     # --- Stage 6: state persists across a fresh _State() -------------------
@@ -212,28 +213,81 @@ def main() -> int:
             print("FAIL: state did not persist across reload:", p, file=sys.stderr)
             up.stop(); stub.stop(); return 1
 
-    # --- Stage 7: delete-after-upload triggers when threshold > free_mb ----
-    # Use a threshold of 10 PB so it must fire on whatever disk we're on.
-    new_file = cam0 / "20260515_121000.ts"
-    new_file.write_bytes(b"delete-me-" + b"y" * 4096)
-    os.utime(new_file, (time.time() - 60, time.time() - 60))
-    ss.save_settings({
-        "neuralx_delete_below_free_mb": 9_999_999,  # absurdly high
-    })
-    up.apply_settings()
+    # --- Stage 7: post-upload age-rule fires for backfilled old segments ---
+    # Drop a fake segment whose mtime is 4 days in the past. Once it
+    # uploads, the hardcoded age rule (>3d) must remove it from disk and
+    # flip the state entry to done_deleted.
+    old_file = cam0 / "20260511_121000.ts"
+    old_file.write_bytes(b"backfill-me-" + b"o" * 4096)
+    four_days_ago = time.time() - (4 * 24 * 3600)
+    os.utime(old_file, (four_days_ago, four_days_ago))
     up.wake()
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        if not new_file.exists():
+        if not old_file.exists():
             break
         time.sleep(0.2)
     else:
-        print("FAIL: delete-after-upload didn't fire", file=sys.stderr)
+        print("FAIL: age-rule delete did not fire on backfilled segment", file=sys.stderr)
         up.stop(); stub.stop(); return 1
     state = json.loads(Path(nx.STATE_PATH).read_text())
-    if state["files"][str(new_file)]["status"] != "done_deleted":
-        print("FAIL: status not done_deleted:", state["files"][str(new_file)], file=sys.stderr)
+    if state["files"][str(old_file)]["status"] != "done_deleted":
+        print("FAIL: age-rule did not mark status done_deleted:",
+              state["files"][str(old_file)], file=sys.stderr)
         up.stop(); stub.stop(); return 1
+    if "age" not in (state["files"][str(old_file)].get("deleted_reason") or ""):
+        print("FAIL: deleted_reason did not mention age:",
+              state["files"][str(old_file)], file=sys.stderr)
+        up.stop(); stub.stop(); return 1
+
+    # --- Stage 7b: free-space sweep fires on already-done files ------------
+    # Drop another fresh file, let it upload, then monkeypatch _free_mb_for
+    # to report below-threshold and confirm the periodic sweep deletes it
+    # even though the file is brand new (free-space branch).
+    fresh_file = cam1 / "20260515_122000.ts"
+    fresh_file.write_bytes(b"low-disk-cleanup-" + b"z" * 4096)
+    os.utime(fresh_file, (time.time() - 60, time.time() - 60))
+    up.wake()
+    # Wait for upload.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        e = up._state.get_file(str(fresh_file))
+        if e and e.get("status") == "done" and fresh_file.exists():
+            break
+        if e and e.get("status") == "done_deleted":
+            # Unexpected — would mean our real test box is actually below
+            # the 50 GB free-space floor. Skip the rest of this stage.
+            break
+        time.sleep(0.2)
+    e = up._state.get_file(str(fresh_file))
+    if e and e.get("status") == "done" and fresh_file.exists():
+        # Pretend the disk dropped below 50 GB by short-circuiting
+        # _free_mb_for. The next scan tick (≤10s away) sees the pressure
+        # and the sweep should evict the fresh `done` file.
+        original_free = nx._free_mb_for
+        nx._free_mb_for = lambda _p: 100.0  # 100 MB free → way under 50 GB
+        try:
+            up.wake()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if not fresh_file.exists():
+                    break
+                time.sleep(0.2)
+            else:
+                print("FAIL: free-space sweep did not delete fresh done file",
+                      file=sys.stderr)
+                up.stop(); stub.stop(); return 1
+            state = json.loads(Path(nx.STATE_PATH).read_text())
+            if state["files"][str(fresh_file)]["status"] != "done_deleted":
+                print("FAIL: free-space sweep did not set done_deleted",
+                      file=sys.stderr)
+                up.stop(); stub.stop(); return 1
+            if "free" not in (state["files"][str(fresh_file)].get("deleted_reason") or ""):
+                print("FAIL: deleted_reason did not mention free:",
+                      state["files"][str(fresh_file)], file=sys.stderr)
+                up.stop(); stub.stop(); return 1
+        finally:
+            nx._free_mb_for = original_free
 
     # --- Stage 8: forced failure + /neuralx/retry --------------------------
     bad_file = cam1 / "20260515_121500.ts"

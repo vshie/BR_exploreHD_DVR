@@ -487,19 +487,17 @@
               style="width:60px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
             />
           </label>
-          <label class="muted" style="display:flex; align-items:center; gap:6px"
-                 :title="'When free space on the volume holding a just-uploaded file is below this many MB, delete the local copy. Set to 0 to never delete.'">
-            Delete local when free &lt;
-            <input
-              type="number"
-              min="0"
-              step="1024"
-              v-model.number="neuralx.form.delete_below_free_mb"
-              :disabled="neuralx.saving"
-              style="width:90px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
-            />
-            MB
-          </label>
+        </div>
+        <div class="muted" style="margin-top:10px; font-size:13px"
+             :title="'Cleanup runs automatically after each successful upload and on every 10s scan. Both thresholds are hardcoded — set Workers, Node ID, and Endpoint above; you don\u2019t need to manage local disk by hand.'">
+          <strong>Cleanup policy:</strong>
+          a successfully-uploaded segment is deleted from local storage when
+          <em>either</em>
+          (a) it is older than
+          <code>{{ neuralx.server.delete_policy?.max_age_days ?? 3 }}</code> days,
+          or (b) free space on its volume drops below
+          <code>{{ fmtBytes(((neuralx.server.delete_policy?.free_mb_threshold) ?? 51200) * 1024 * 1024) }}</code>.
+          Segments are never deleted unless their NeuralX upload succeeded.
         </div>
         <div class="row" style="margin-top:12px; align-items:center; gap:12px; flex-wrap:wrap">
           <div class="muted">Camera mapping:</div>
@@ -596,6 +594,11 @@
         </div>
         <div class="muted" v-if="neuralx.server.totals?.last_success_epoch" style="margin-top:4px">
           Last successful upload: {{ neuralxLastSuccessLabel }}
+        </div>
+        <div class="muted" v-if="(neuralx.server.delete_policy?.last_sweep_deleted || 0) > 0" style="margin-top:4px"
+             :title="'Periodic cleanup: every 10s the uploader re-checks every successfully-uploaded segment and removes the file when free space is below the threshold or the file is older than the age limit.'">
+          Last cleanup sweep: removed {{ neuralx.server.delete_policy.last_sweep_deleted }} file{{ neuralx.server.delete_policy.last_sweep_deleted === 1 ? '' : 's' }}
+          ({{ fmtBytes(neuralx.server.delete_policy.last_sweep_bytes || 0) }}) — {{ neuralxTimeLabel(neuralx.server.delete_policy.last_sweep_epoch) }}
         </div>
         <div class="muted" v-if="neuralx.server.last_error" style="color:var(--err); margin-top:4px">
           Last error: {{ neuralx.server.last_error }}
@@ -737,7 +740,6 @@ createApp({
           endpoint: '',
           cam_map: { '0': '01', '1': '02', '2': '03', '3': '04' },
           max_concurrent: 1,
-          delete_below_free_mb: 51200,
         },
         server: {
           enabled: false,
@@ -746,7 +748,9 @@ createApp({
           endpoint: '',
           cam_map: { '0': '01', '1': '02', '2': '03', '3': '04' },
           max_concurrent: 1,
-          delete_below_free_mb: 51200,
+          delete_policy: { free_mb_threshold: 51200, max_age_days: 3,
+                           last_sweep_epoch: 0, last_sweep_deleted: 0,
+                           last_sweep_bytes: 0 },
           queue: { pending: 0, in_flight: 0, failed: 0 },
           totals: { files: 0, bytes: 0, last_success_epoch: 0, avg_mbps: 0 },
           recent: [],
@@ -1597,7 +1601,6 @@ createApp({
           );
         }
         this.neuralx.form.max_concurrent = payload.max_concurrent || 1;
-        this.neuralx.form.delete_below_free_mb = payload.delete_below_free_mb || 0;
       }
       this.neuralx.loaded = true;
     },
@@ -1639,7 +1642,6 @@ createApp({
           endpoint: this.neuralx.form.endpoint || '',
           cam_map: this.neuralx.form.cam_map,
           max_concurrent: this.neuralx.form.max_concurrent,
-          delete_below_free_mb: this.neuralx.form.delete_below_free_mb,
         };
         const r = await fetch('/neuralx/settings', {
           method: 'POST',

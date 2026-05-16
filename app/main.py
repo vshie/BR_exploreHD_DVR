@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.30"
+VERSION = "1.0.31"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -400,7 +400,11 @@ def route_neuralx_settings():
     Body accepts any subset of:
       { "enabled": bool, "node_id": "<token>", "endpoint": "https://...",
         "cam_map": {"0":"01", "1":"02", "2":"03", "3":"04"},
-        "max_concurrent": int, "delete_below_free_mb": int }
+        "max_concurrent": int }
+
+    The legacy `delete_below_free_mb` field is silently ignored: the
+    cleanup policy (50 GB free-space floor, 3-day age cap) is now
+    hardcoded inside `neuralx_uploader`.
     """
     data = request.get_json(silent=True) or {}
     updates: Dict[str, Any] = {}
@@ -414,8 +418,6 @@ def route_neuralx_settings():
         updates["neuralx_cam_map"] = data["cam_map"]
     if "max_concurrent" in data:
         updates["neuralx_max_concurrent"] = data["max_concurrent"]
-    if "delete_below_free_mb" in data:
-        updates["neuralx_delete_below_free_mb"] = data["delete_below_free_mb"]
     if not updates:
         return jsonify({"success": False, "message": "No recognized fields"}), 400
     try:
@@ -435,7 +437,6 @@ def route_neuralx_settings():
             "settings": {k: merged.get(k) for k in (
                 "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
                 "neuralx_cam_map", "neuralx_max_concurrent",
-                "neuralx_delete_below_free_mb",
             )},
         }), 500
     return jsonify({
@@ -443,7 +444,6 @@ def route_neuralx_settings():
         "settings": {k: merged.get(k) for k in (
             "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
             "neuralx_cam_map", "neuralx_max_concurrent",
-            "neuralx_delete_below_free_mb",
         )},
     })
 
