@@ -8,7 +8,7 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 - **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
 - **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Web UI** (default port **6010**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
+- **Web UI** (default port **4444**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
 
 ## Hardware setup (Raspberry Pi 5)
@@ -34,7 +34,7 @@ ext4 is preferred over exFAT/vfat for this workload: many small `.ts` segments w
 The 30 s storage probe will mount the new partition at `/mnt/usb` automatically; no extension restart required. Verify with:
 
 ```bash
-curl -s http://127.0.0.1:6010/status | python3 -m json.tool | grep -A6 '"usb"'
+curl -s http://127.0.0.1:4444/status | python3 -m json.tool | grep -A6 '"usb"'
 ```
 
 You should see `"mounted": true` and the device path. If auto-detection misses an unusual enclosure, set `EXTERNAL_STORAGE_DEVICE=/dev/nvme0n1p1` (or the matching `sdX1`) on the extension to force it.
@@ -95,7 +95,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
 ```json
 {
   "ExposedPorts": {
-    "6010/tcp": {}
+    "4444/tcp": {}
   },
   "HostConfig": {
     "Binds": [
@@ -106,7 +106,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
       "host.docker.internal:host-gateway"
     ],
     "PortBindings": {
-      "6010/tcp": [
+      "4444/tcp": [
         {
           "HostPort": ""
         }
@@ -118,7 +118,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
 }
 ```
 
-Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:6010/**.
+Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:4444/**.
 
 What each piece does:
 - `Binds` — persists recordings to `/usr/blueos/extensions/br_explorehd_dvr` on the host (so they survive extension reinstalls) and exposes `/dev` so USB storage can be mounted from inside the container.
@@ -152,7 +152,7 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 |----------|---------|-------------|
 | `MCM_BASE` | `http://127.0.0.1:6020` | MCM REST base URL |
 | `SEGMENT_SECONDS` | `300` | TS segment duration |
-| `PORT` | `6010` | Flask listen port (override if needed) |
+| `PORT` | `4444` | Flask listen port (override if needed) |
 | `BOOT_MIN_SLEEP_S` | `20` | Minimum sleep before loadavg gate |
 | `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
@@ -163,10 +163,10 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 ## Recording layout
 
 ```
-/app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/YYYYMMDD_HHMMSS.ts
+/app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/YYYYMMDD_HHMMSS_cam<n>.ts
 ```
 
-The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to its actual start time within ~5 s. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop).
+The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to `YYYYMMDD_HHMMSS_cam<n>.ts` within ~5 s. The `_cam<n>` suffix is important: four cams rolling on the same 5-minute boundary often finalize within the same wall-clock second, and the suffix is what keeps their filenames unique on disk and inside per-`camera_id` buckets on the NeuralX server. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop). Recordings produced by 1.0.29 and earlier (`YYYYMMDD_HHMMSS.ts`, no cam suffix) are still recognized by the auto-download cursor and the NeuralX uploader for backward compatibility.
 
 When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
 

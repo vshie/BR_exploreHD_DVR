@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.29"
+VERSION = "1.0.30"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -594,11 +594,20 @@ def _walk_session(date_str: str, session_id: str) -> List[Tuple[str, str]]:
 
 
 # Filename written by the recorder watchdog when a segment closes:
-#   YYYYMMDD_HHMMSS.ts                (normal case)
-#   YYYYMMDD_HHMMSS_N.ts              (rare collision: two segments same wall second)
+#   YYYYMMDD_HHMMSS_camN.ts           (1.0.30+: cam index embedded so two
+#                                      cams finalizing within the same
+#                                      wall-clock second don't collide on
+#                                      filename — crucial for the NeuralX
+#                                      uploader since the per-camera_id
+#                                      server bucket is keyed by filename)
+#   YYYYMMDD_HHMMSS_camN_M.ts         (rare: same cam, same second)
+#   YYYYMMDD_HHMMSS.ts                (legacy 1.0.29 and earlier, kept for
+#                                      backward compat so older recordings
+#                                      still match the auto-download cursor)
+#   YYYYMMDD_HHMMSS_N.ts              (legacy collision form)
 # The active segment is `seg_NNNNN.ts` and is intentionally excluded — auto-download
 # only ships *closed* segments so we never zip a file the muxer is still writing.
-_CLOSED_SEG_RE = re.compile(r"^(\d{8})_(\d{6})(?:_\d+)?\.ts$")
+_CLOSED_SEG_RE = re.compile(r"^(\d{8})_(\d{6})(?:_cam\d+)?(?:_\d+)?\.ts$")
 # Cam directories created by RecorderManager are `cam_<index>_<sanitized_name>`.
 _CAM_DIR_RE = re.compile(r"^cam_(\d+)_(.+)$")
 
@@ -1470,5 +1479,5 @@ def route_auto_download_zip():
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
-    # Default 6010: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "6010")))
+    # Default 4444: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "4444")))

@@ -70,8 +70,12 @@ RECORDINGS_LOCAL = "/app/recordings"
 
 # Filename patterns shared with main.py. We deliberately match only the
 # finalized timestamped name produced by recorder._format_segment_filename —
-# never the active `seg_NNNNN.ts` template.
-_CLOSED_SEG_RE = re.compile(r"^(\d{8})_(\d{6})(?:_\d+)?\.ts$")
+# never the active `seg_NNNNN.ts` template. Both shapes are accepted:
+#   1.0.30+:  YYYYMMDD_HHMMSS_camN(_M)?.ts
+#   legacy:   YYYYMMDD_HHMMSS(_M)?.ts
+# so segments left over on disk from a 1.0.29-era recorder still upload
+# after an in-place container upgrade.
+_CLOSED_SEG_RE = re.compile(r"^(\d{8})_(\d{6})(?:_cam\d+)?(?:_\d+)?\.ts$")
 _CAM_DIR_RE = re.compile(r"^cam_(\d+)_(.+)$")
 _DATE_RE = re.compile(r"^\d{8}$")
 

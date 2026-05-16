@@ -124,15 +124,19 @@ def _sanitize_dir_name(name: str) -> str:
 _TEMP_SEG_RE = re.compile(r"^seg_(\d+)\.ts$")
 
 
-def _format_segment_filename(epoch_seconds: float) -> str:
-    """Build a `YYYYMMDD_HHMMSS.ts` filename in the operator's browser-local time.
+def _format_segment_filename(epoch_seconds: float, cam_index: int) -> str:
+    """Build a `YYYYMMDD_HHMMSS_camN.ts` filename in the operator's browser-local time.
 
-    Sortable in shells/file browsers, contains no separators that would need
-    escaping, and matches what the user reads off their wall clock when they
-    are looking at the recordings on USB or SD after a dive.
+    The `_camN` suffix disambiguates segments across cameras that close
+    within the same wall-clock second (very common on a 5-minute segment
+    schedule: all four cams roll within ~1 second of each other). Without
+    it, two cams could finalize to the same filename, which the uploader
+    relies on for cross-cam uniqueness inside the per-camera_id bucket on
+    the NeuralX server. The timestamp stays first so sorting by name still
+    gives chronological order.
     """
     local = browser_local_datetime(epoch_seconds)
-    return local.strftime("%Y%m%d_%H%M%S") + ".ts"
+    return local.strftime("%Y%m%d_%H%M%S") + f"_cam{cam_index}.ts"
 
 
 def _read_session_bytes(cam_dir: str) -> Optional[int]:
@@ -351,7 +355,7 @@ class Recorder:
             if active_name is not None and name == active_name:
                 continue
             start_epoch = self._segment_first_observed.get(name, now_wall)
-            new_name = _format_segment_filename(start_epoch)
+            new_name = _format_segment_filename(start_epoch, self.index)
             src = os.path.join(self.cam_dir, name)
             dst = os.path.join(self.cam_dir, new_name)
             # Two segments could in theory finalize within the same wall-clock
