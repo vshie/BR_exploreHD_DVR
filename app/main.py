@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request, send_file
 
-import neuralx_uploader
+import cloud_relay
+import disk_cleanup
 import usb_storage
 from boot_manager import SEGMENT_SECONDS_DEFAULT, run_boot_sequence
 from mcm_client import DEFAULT_MCM_BASE, fetch_streams_raw, kick_streams, list_h264_rtsp_streams
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.31"
+VERSION = "1.0.32"
 
 RECORDINGS_LOCAL = "/app/recordings"
 # Minimum free space required to start a recording session on internal SD.
@@ -149,12 +150,21 @@ def _boot_worker():
                 logger.info("SD gate blocked auto-record; recorders created but not started")
             else:
                 logger.info("auto_record_on_boot is false; recorders created but not started (standby)")
-            # NeuralX uploader: start last (after recorders are running and
-            # USB is mounted) so the first scan sees the real `_storage_roots`.
+            # Cloud RTMP relay + disk cleanup: started AFTER recorders so the
+            # cleanup sweeper sees the live `session_root` value via its
+            # provider callback, and so the relay's stream list matches what
+            # the recorders are reading. Cleanup runs unconditionally; the
+            # relay is gated by the persisted `cloud_relay_enabled` toggle.
             try:
-                neuralx_uploader.start_if_enabled()
+                cloud_relay.configure(_current_streams_snapshot)
+                cloud_relay.start_if_enabled()
             except Exception as e:
-                logger.exception("NeuralX uploader failed to start at boot: %s", e)
+                logger.exception("Cloud relay failed to start at boot: %s", e)
+            try:
+                disk_cleanup.configure(_active_session_root_locked)
+                disk_cleanup.start()
+            except Exception as e:
+                logger.exception("Disk cleanup failed to start at boot: %s", e)
         except Exception as e:
             logger.exception("Boot worker failed")
             with _state_lock:
@@ -234,15 +244,31 @@ def route_status():
         auto_dl_enabled = False
         auto_dl_interval = 5
     try:
-        neuralx_summary = neuralx_uploader.get_or_create().summary()
+        cloud_summary = cloud_relay.summary()
     except Exception:
-        logger.exception("neuralx summary failed")
-        neuralx_summary = {
-            "enabled": False,
+        logger.exception("cloud_relay summary failed")
+        cloud_summary = {
+            "enabled": True,
             "running": False,
-            "node_id": "",
-            "queue": {"pending": 0, "failed": 0, "in_flight": 0},
-            "totals": {"files": 0, "bytes": 0, "last_success_epoch": 0.0, "avg_mbps": 0.0},
+            "streaming_count": 0,
+            "total_count": 0,
+            "total_restarts": 0,
+            "rtmp_base_url": cloud_relay.RTMP_BASE_URL,
+        }
+    try:
+        cleanup_summary = disk_cleanup.status()
+    except Exception:
+        logger.exception("disk_cleanup status failed")
+        cleanup_summary = {
+            "enabled": True,
+            "ssd_mounted": False,
+            "free_mb": None,
+            "total_mb": None,
+            "threshold_mb": disk_cleanup.CLEANUP_FREE_MB_THRESHOLD,
+            "last_sweep_epoch": 0.0,
+            "last_deleted_session": None,
+            "last_freed_mb": 0.0,
+            "deleted_total": 0,
             "last_error": "",
         }
     resp = jsonify(
@@ -266,7 +292,8 @@ def route_status():
                 "usb": usb,
             },
             "telemetry": telem,
-            "neuralx": neuralx_summary,
+            "cloud": cloud_summary,
+            "disk_cleanup": cleanup_summary,
         }
     )
     resp.headers["Cache-Control"] = "no-store"
@@ -374,89 +401,76 @@ def route_settings_post():
             # settings_store clamps; we let it through as-is so a JS string
             # (e.g. from a number input that round-trips as text) still parses.
             updates["auto_download_interval_minutes"] = data["auto_download_interval_minutes"]
+        if "cloud_relay_enabled" in data:
+            updates["cloud_relay_enabled"] = bool(data["cloud_relay_enabled"])
         if not updates:
             return jsonify({"success": False, "message": "No recognized fields"}), 400
         merged = save_settings(updates)
+        # If the relay toggle changed, push the change through. Cheap and
+        # idempotent if the value didn't actually change.
+        if "cloud_relay_enabled" in updates:
+            try:
+                cloud_relay.apply_settings_change()
+            except Exception:
+                logger.exception("cloud_relay apply_settings_change failed (settings POST)")
         return jsonify({"success": True, "settings": merged})
     except Exception as e:
         logger.exception("settings post failed")
         return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route("/neuralx/status", methods=["GET"])
-def route_neuralx_status():
-    """Full NeuralX uploader payload: settings, queue counts, totals, recent table."""
+@app.route("/cloud/status", methods=["GET"])
+def route_cloud_status():
+    """Full cloud-relay + disk-cleanup payload for the Cloud tab.
+
+    Returns per-cam relay state (running/restarting/error, restart counts,
+    last error) plus the SSD cleanup sweeper's free-space and last-sweep
+    state. The receive end of the RTMP relay is hardcoded; the only
+    operator-facing knob is the on/off toggle in `cloud_relay_enabled`.
+    """
     try:
-        return jsonify(neuralx_uploader.get_or_create().status())
+        return jsonify({
+            "cloud": cloud_relay.status(),
+            "disk_cleanup": disk_cleanup.status(),
+        })
     except Exception as e:
-        logger.exception("neuralx status failed")
+        logger.exception("cloud status failed")
         return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route("/neuralx/settings", methods=["POST"])
-def route_neuralx_settings():
-    """Update NeuralX uploader settings and start/stop the workers as needed.
+@app.route("/cloud/toggle", methods=["POST"])
+def route_cloud_toggle():
+    """Flip the persisted cloud-relay toggle and start/stop the relay.
 
-    Body accepts any subset of:
-      { "enabled": bool, "node_id": "<token>", "endpoint": "https://...",
-        "cam_map": {"0":"01", "1":"02", "2":"03", "3":"04"},
-        "max_concurrent": int }
-
-    The legacy `delete_below_free_mb` field is silently ignored: the
-    cleanup policy (50 GB free-space floor, 3-day age cap) is now
-    hardcoded inside `neuralx_uploader`.
+    Body: `{"enabled": bool}`. Accepts the alternate spelling
+    `cloud_relay_enabled` for parity with the unified `/settings` POST.
     """
     data = request.get_json(silent=True) or {}
-    updates: Dict[str, Any] = {}
     if "enabled" in data:
-        updates["neuralx_enabled"] = bool(data["enabled"])
-    if "node_id" in data:
-        updates["neuralx_node_id"] = data["node_id"]
-    if "endpoint" in data:
-        updates["neuralx_endpoint"] = data["endpoint"]
-    if "cam_map" in data:
-        updates["neuralx_cam_map"] = data["cam_map"]
-    if "max_concurrent" in data:
-        updates["neuralx_max_concurrent"] = data["max_concurrent"]
-    if not updates:
-        return jsonify({"success": False, "message": "No recognized fields"}), 400
+        new = bool(data["enabled"])
+    elif "cloud_relay_enabled" in data:
+        new = bool(data["cloud_relay_enabled"])
+    else:
+        return jsonify({"success": False, "message": "enabled required"}), 400
     try:
-        merged = save_settings(updates)
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+        merged = save_settings({"cloud_relay_enabled": new})
     except Exception as e:
-        logger.exception("neuralx settings save failed")
+        logger.exception("cloud toggle save failed")
         return jsonify({"success": False, "message": str(e)}), 500
     try:
-        neuralx_uploader.apply_settings_change()
+        cloud_relay.apply_settings_change()
     except Exception as e:
-        logger.exception("neuralx apply_settings_change failed")
+        logger.exception("cloud_relay apply_settings_change failed")
         return jsonify({
             "success": False,
-            "message": f"Settings saved but uploader refresh failed: {e}",
-            "settings": {k: merged.get(k) for k in (
-                "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
-                "neuralx_cam_map", "neuralx_max_concurrent",
-            )},
+            "message": f"Setting saved but relay refresh failed: {e}",
+            "cloud_relay_enabled": merged.get("cloud_relay_enabled", new),
         }), 500
     return jsonify({
         "success": True,
-        "settings": {k: merged.get(k) for k in (
-            "neuralx_enabled", "neuralx_node_id", "neuralx_endpoint",
-            "neuralx_cam_map", "neuralx_max_concurrent",
-        )},
+        "cloud_relay_enabled": merged.get("cloud_relay_enabled", new),
+        "cloud": cloud_relay.summary(),
     })
-
-
-@app.route("/neuralx/retry", methods=["POST"])
-def route_neuralx_retry():
-    """Reset every failed entry's retry timer so the next scan re-enqueues it."""
-    try:
-        n = neuralx_uploader.get_or_create().retry_failed_now()
-        return jsonify({"success": True, "reset": int(n)})
-    except Exception as e:
-        logger.exception("neuralx retry failed")
-        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route("/tz", methods=["POST"])
@@ -597,9 +611,7 @@ def _walk_session(date_str: str, session_id: str) -> List[Tuple[str, str]]:
 #   YYYYMMDD_HHMMSS_camN.ts           (1.0.30+: cam index embedded so two
 #                                      cams finalizing within the same
 #                                      wall-clock second don't collide on
-#                                      filename — crucial for the NeuralX
-#                                      uploader since the per-camera_id
-#                                      server bucket is keyed by filename)
+#                                      disk or in the auto-download zip)
 #   YYYYMMDD_HHMMSS_camN_M.ts         (rare: same cam, same second)
 #   YYYYMMDD_HHMMSS.ts                (legacy 1.0.29 and earlier, kept for
 #                                      backward compat so older recordings
@@ -643,6 +655,15 @@ def _active_session_root_locked() -> Optional[str]:
     """Snapshot the active session_root under the state lock."""
     with _state_lock:
         return session_root
+
+
+def _current_streams_snapshot() -> List[Dict[str, Any]]:
+    """Snapshot the current MCM stream list under the state lock. Used as the
+    provider callback for `cloud_relay`: lets a toggle-on after boot pick up
+    the same streams the recorders saw without re-running the boot sequence.
+    """
+    with _state_lock:
+        return list(streams_snapshot)
 
 
 def walk_active_session_closed_segments(after_epoch: float = 0.0) -> List[Tuple[int, str, str, float]]:

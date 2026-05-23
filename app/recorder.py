@@ -130,9 +130,9 @@ def _format_segment_filename(epoch_seconds: float, cam_index: int) -> str:
     The `_camN` suffix disambiguates segments across cameras that close
     within the same wall-clock second (very common on a 5-minute segment
     schedule: all four cams roll within ~1 second of each other). Without
-    it, two cams could finalize to the same filename, which the uploader
-    relies on for cross-cam uniqueness inside the per-camera_id bucket on
-    the NeuralX server. The timestamp stays first so sorting by name still
+    it, two cams could finalize to the same filename and the second one
+    would silently overwrite the first when the auto-download zip merges
+    cam directories. The timestamp stays first so sorting by name still
     gives chronological order.
     """
     local = browser_local_datetime(epoch_seconds)

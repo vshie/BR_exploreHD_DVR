@@ -8,7 +8,9 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 - **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
 - **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Web UI** (default port **4444**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
+- **Cloud RTMP relay** (on by default, toggle in the **Cloud** tab): for each MCM RTSP stream, an `ffmpeg -c:v copy -an -f flv` subprocess pushes the H.264 elementary stream to `rtmp://35.85.229.226/live/bom_cam0N`. Runs alongside disk recording and the MCM WebRTC live view; never re-encodes.
+- **External SSD auto-cleanup**: on the 256 GB NVMe (or whichever volume mounts at `/mnt/usb`), the oldest completed session directory (and its `.zip`) is deleted whenever free space drops below **10 GB**, oldest-first. The active session is never touched. Internal SD has its own separate 1 GB hard-stop in the recorder.
+- **Web UI** (default port **4444**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete), Cloud (RTMP relay on/off + per-cam state + SSD cleanup state). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
 
 ## Hardware setup (Raspberry Pi 5)
@@ -158,7 +160,6 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
 | `EXTERNAL_STORAGE_DEVICE` | _(unset)_ | Optional explicit partition to mount at `/mnt/usb` (e.g. `/dev/nvme0n1p1`) if auto-detection does not pick your drive |
 | `DVR_RTSP_PROTOCOLS` | `udp+tcp` | rtspsrc transport preference: `udp+tcp` (UDP with TCP fallback; default since 1.0.20), `tcp` (RTSP-over-TCP only — useful on lossy links), or `udp` (UDP only, no fallback). UDP avoids TCP head-of-line blocking when the MCM producer briefly glitches. |
-| `NEURALX_ENDPOINT` | `https://vv4ki4fa6b.execute-api.us-west-2.amazonaws.com/test-upload-url` | Default URL the NeuralX uploader presigns through. Used on first boot only — once a value is persisted via the UI (`POST /neuralx/settings`), the stored value wins. |
 
 ## Recording layout
 
@@ -166,7 +167,7 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 /app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/YYYYMMDD_HHMMSS_cam<n>.ts
 ```
 
-The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to `YYYYMMDD_HHMMSS_cam<n>.ts` within ~5 s. The `_cam<n>` suffix is important: four cams rolling on the same 5-minute boundary often finalize within the same wall-clock second, and the suffix is what keeps their filenames unique on disk and inside per-`camera_id` buckets on the NeuralX server. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop). Recordings produced by 1.0.29 and earlier (`YYYYMMDD_HHMMSS.ts`, no cam suffix) are still recognized by the auto-download cursor and the NeuralX uploader for backward compatibility.
+The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to `YYYYMMDD_HHMMSS_cam<n>.ts` within ~5 s. The `_cam<n>` suffix matters when four cams roll on the same 5-minute boundary and finalize within the same wall-clock second — without it, two cams' segments would collide on filename when the auto-download zip merges cam directories. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop). Recordings produced by 1.0.29 and earlier (`YYYYMMDD_HHMMSS.ts`, no cam suffix) are still recognized by the auto-download cursor for backward compatibility.
 
 When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
 
@@ -184,40 +185,40 @@ When external storage is mounted at `/mnt/usb` with enough free space, recording
 - `POST /recordings/delete` — JSON `{"dates":[...]}` (skips the calendar day of the active session).
 - `POST /tz` — JSON `{"tz_offset_minutes": <signed int east of UTC>, "tz_name": "<IANA tz>"}` to inform the extension of the operator's browser-local timezone. The Web UI sends this on load and on visibility changes; only needed externally if you drive the API without the bundled UI.
 
-## NeuralX upload (optional)
+## Cloud RTMP relay
 
-A continuous background uploader can ship each closed MPEG-TS segment to the [NeuralX test endpoint](https://vv4ki4fa6b.execute-api.us-west-2.amazonaws.com/test-upload-url) as it finalizes. **Disabled by default** — the documented endpoint is a public, unauthenticated test bucket with 7-day file retention, so this is opt-in per node.
+While the recorder writes `.ts` segments to disk and MCM serves the four cameras over WebRTC for the in-browser **Live** view, the extension can **simultaneously** push each H.264 stream to a hardcoded RTMP endpoint. The relay is **enabled by default** — flip it off from the **Cloud** tab if you don't want it. The toggle persists in the recordings bind mount (`/usr/blueos/extensions/br_explorehd_dvr/.br_explorehd_dvr_settings.json`) so it survives container/image rebuilds.
 
-Open the **NeuralX** tab in the extension UI to configure:
+Per cam, the extension spawns:
 
-| Setting | Notes |
-|---------|-------|
-| Node ID | A short token (matches `[A-Za-z0-9._-]{1,40}`) that's prepended to every uploaded filename. Each Pi must use a different Node ID so two Pis sharing the same `camera_id` don't overwrite each other on the server. |
-| Endpoint | Pre-filled with the documented NeuralX endpoint. Override per install if you have a private or staging URL. |
-| Camera mapping | Per-cam dropdown that maps cam index 0..3 onto NeuralX `camera_id` 01..04. Defaults to `cam0→01, cam1→02, cam2→03, cam3→04`. Values must be unique within the node. |
-| Workers | 1..4 concurrent uploads. Default `1` — fine for the four-camera ~24 Mbps aggregate over typical home internet. |
+```
+ffmpeg -rtsp_transport udp \
+       -i <rtsp_url_from_mcm> \
+       -c:v copy -an -f flv \
+       rtmp://35.85.229.226/live/bom_cam0N
+```
 
-**Local cleanup policy (hardcoded, no UI knob).** Once a segment is marked `done` in the NeuralX state file, the uploader deletes the local copy when **either**:
+`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
 
-- the file is older than **3 days** (mtime), or
-- free space on the volume holding the file is below **50 GB**.
-
-Both conditions are re-evaluated after each successful upload **and** by a periodic sweep every scan tick (~10 s), oldest-recording-first. Files that haven't uploaded successfully are **never** touched, so the rule cannot lose data the test bucket hasn't yet acknowledged.
-
-The protocol mirrors the [NeuralX Raspberry Pi integration guide](https://vv4ki4fa6b.execute-api.us-west-2.amazonaws.com/test-upload-url) verbatim:
-
-1. `GET {endpoint}?camera_id=<01..04>&filename=<node_id>_<basename>` → JSON `{ "upload_url": "..." }`.
-2. `PUT <upload_url>` with the raw `.ts` bytes (AWS signature is embedded in the URL — no auth header from our side).
-
-Per-file state (status, attempts, last error, Mbps, bytes) is persisted in `<recordings>/.br_explorehd_dvr_neuralx_state.json` and survives container restarts. The scanner walks every closed `YYYYMMDD_HHMMSS_cam<n>.ts` (and the legacy 1.0.29 `YYYYMMDD_HHMMSS.ts`) under both SD and USB roots, so when the uploader is enabled or the network recovers after an outage it will backfill anything that's still on disk and not yet marked as `done`.
-
-> **Caveat — automatic cleanup + session zips.** When the cleanup sweep fires, the per-session `<session_id>.zip` archives built at boot by `zip_unfinished_sessions` may be partial (or absent) for sessions whose segments shipped before the zip pass ran. That's acceptable for the test-bucket workflow but worth knowing if you also rely on the per-session zip downloads in the Recordings tab.
+If a camera's RTSP source dies (MCM glitch, network hiccup) ffmpeg exits and a per-cam watchdog respawns it with a 1 s → 10 s exponential backoff. A pipeline that has been running for ≥ 30 s is considered "healthy" so a transient drop after that point resets the backoff to 1 s.
 
 Programmatic access:
 
-- `GET /neuralx/status` — full payload: settings, queue counts, totals, recent uploads, and `delete_policy` block (`free_mb_threshold`, `max_age_days`, last sweep counters).
-- `POST /neuralx/settings` — JSON body with any subset of `enabled`, `node_id`, `endpoint`, `cam_map`, `max_concurrent`. (The legacy `delete_below_free_mb` field is silently ignored — the cleanup policy is now hardcoded.) Validates camera_id whitelist + uniqueness and the `node_id` token regex.
-- `POST /neuralx/retry` — reset the retry timer on every failed entry so the next scan re-enqueues it.
+- `GET /cloud/status` — full payload: relay enabled/running flags, per-cam state (state, restart_count, last_error, stream_key, rtmp_url), and the `disk_cleanup` block.
+- `POST /cloud/toggle` body `{ "enabled": true|false }` — flip the persisted toggle and start/stop the relay.
+- `POST /settings` accepts `{ "cloud_relay_enabled": true|false }` alongside the other settings keys.
+
+## External SSD auto-cleanup
+
+The recorder targets `/mnt/usb/BR_exploreHD_DVR/...` whenever an external SSD is mounted with ≥ 5 GB free (typically a 256 GB NVMe — see the hardware section above). To keep recording from ever filling that volume, a background sweeper runs every **30 s** and:
+
+1. Reads free space on the SSD.
+2. If `free < 10 GB`, walks the recordings tree, finds the **oldest session directory** (sorted by the oldest mtime among its files, with the active session always excluded), and deletes it together with its sibling `<session_id>.zip` if one exists.
+3. Re-checks free space and loops; stops as soon as the SSD is back above the 10 GB floor.
+
+That floor lets the recorder fill the disk to ~96% before cleanup begins; at the four-cam ~3 MB/s aggregate, 10 GB of headroom is several hours of recording. The internal SD card is **never** touched by this sweeper — `/app/recordings` is gated separately by the recorder's existing 1 GB hard-stop in `recorder.MIN_FREE_DISK_MB`, which remains the final safety net if cleanup ever fails to keep up.
+
+The Cloud tab in the UI shows free-of-total, the threshold, and the last delete (which session, how much space it freed).
 
 ## Live view
 
