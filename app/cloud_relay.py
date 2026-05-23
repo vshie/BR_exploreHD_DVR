@@ -58,17 +58,22 @@ HEALTHY_RUN_S = 30.0
 # our previous ffmpeg dies without cleanly tearing down its RTMP socket
 # (network glitch, abrupt MCM RTSP close, container restart, etc.), the
 # upstream RTMP server keeps the stale publisher's stream-key slot held
-# for its keepalive timeout — typically 30..90 seconds — and refuses any
-# new `publish` command for the same key with `Server error: Already
-# publishing`. The 1..10 s backoff is much shorter than that timeout, so
-# without this special case we end up thrashing: every retry hits the
-# same "Already publishing" wall, ffmpeg dies again, and the operator
-# sees the cam stuck in "restarting" indefinitely.
+# for its keepalive timeout — typically 5..90 s depending on which RTMP
+# server is running and how it's configured — and refuses any new
+# `publish` command for the same key with `Server error: Already
+# publishing`. The regular 1..10 s respawn backoff is too short for the
+# slow end of that range (we thrash and the cam stays stuck), but a
+# fixed long wait penalises the much more common fast-recovery case
+# (SRS/MediaMTX/Wowza all clear publisher slots within 5..15 s by
+# default).
 #
-# 90 s is long enough to comfortably clear the typical RTMP keepalive
-# window without making the operator wait forever after a transient
-# network drop. Anything shorter than ~60 s tends to race the server.
-STALE_PUBLISHER_BACKOFF_S = 90.0
+# Strategy: probe early, back off exponentially, cap at 90 s. We start
+# at 5 s, double on each consecutive "Already publishing" reject, and
+# clamp at 90 s. Schedule: 5, 10, 20, 40, 80, 90, 90, ... The counter
+# resets to zero the moment a pipeline runs healthily for HEALTHY_RUN_S
+# seconds, so a transient blip doesn't poison the next disconnect.
+STALE_PUBLISHER_BACKOFF_INITIAL_S = 5.0
+STALE_PUBLISHER_BACKOFF_MAX_S = 90.0
 
 # Stderr line patterns we treat as "the upstream RTMP server is still
 # holding our previous publisher session". Matched case-insensitively
@@ -121,14 +126,22 @@ class Relay:
 
         # Set by `_stderr_reader` when ffmpeg's stderr matches one of the
         # `_STALE_PUBLISHER_PATTERNS`. The watchdog reads this flag on
-        # subprocess exit to decide whether to apply the much longer
-        # `STALE_PUBLISHER_BACKOFF_S` instead of the regular 1..10 s
-        # backoff. Always cleared just before each new spawn so a fresh
-        # stale-publisher hit produces a fresh long-backoff decision.
+        # subprocess exit to decide whether to apply the
+        # stale-publisher exponential backoff instead of the regular
+        # 1..10 s backoff. Always cleared just before each new spawn so
+        # a fresh stale-publisher hit produces a fresh decision.
         self._stale_publisher_seen: bool = False
-        # Cumulative count of long-backoff waits. Surfaced via status_dict
-        # so the UI can render "waiting for server to release stream key
-        # (Nth time)" rather than a confusing growing restart_count.
+        # Counter of consecutive stale-publisher rejects since the last
+        # healthy run. Doubles the wait time per reject (capped at
+        # STALE_PUBLISHER_BACKOFF_MAX_S) so we probe early when the
+        # server clears slots quickly (e.g. SRS @ 5 s) and stretch out
+        # only when it doesn't (e.g. nginx-rtmp without
+        # drop_idle_publisher). Reset to 0 on any HEALTHY_RUN_S+ run.
+        self._stale_publisher_consecutive: int = 0
+        # Cumulative count of stale-publisher waits across the lifetime
+        # of this Relay. Surfaced via status_dict so the UI can render
+        # "waiting for server to release stream key (Nth time)" rather
+        # than a confusing growing restart_count.
         self.stale_publisher_waits: int = 0
 
     def _build_cmd(self) -> List[str]:
@@ -164,11 +177,17 @@ class Relay:
                 if any(p in low for p in _STALE_PUBLISHER_PATTERNS):
                     self._stale_publisher_seen = True
                     self.ff_errors += 1
+                    next_wait = min(
+                        STALE_PUBLISHER_BACKOFF_MAX_S,
+                        STALE_PUBLISHER_BACKOFF_INITIAL_S
+                        * (2 ** self._stale_publisher_consecutive),
+                    )
                     self.last_error = (
                         f"RTMP server still holds the previous publisher "
-                        f"session for {self.stream_key!r}; waiting "
-                        f"{int(STALE_PUBLISHER_BACKOFF_S)}s for it to "
-                        f"time out. ffmpeg said: {text[:200]}"
+                        f"session for {self.stream_key!r}; will retry in "
+                        f"{int(next_wait)}s (consecutive stale rejects: "
+                        f"{self._stale_publisher_consecutive + 1}). "
+                        f"ffmpeg said: {text[:200]}"
                     )
                     logger.warning(
                         f"[relay{self.index}] stale RTMP publisher: {text}"
@@ -263,26 +282,41 @@ class Relay:
                 )
                 if ran_for >= HEALTHY_RUN_S:
                     backoff = BACKOFF_START
+                    # A healthy run also clears any stale-publisher
+                    # streak — the next stale reject we see is treated
+                    # as the first one, so we probe early again.
+                    self._stale_publisher_consecutive = 0
                 # If the just-died ffmpeg saw "Already publishing" on
                 # stderr, the RTMP server is still holding our previous
-                # publisher slot and any retry shorter than its keepalive
-                # timeout (~30..90s) will keep hitting the same wall.
-                # Wait it out before respawning. Use the interruptible
-                # `_stop.wait` so a UI toggle-off / shutdown doesn't have
-                # to sit through the full 90 s sleep.
+                # publisher slot. Probe early (5s) and back off
+                # exponentially up to STALE_PUBLISHER_BACKOFF_MAX_S so
+                # we recover within a few seconds on
+                # SRS/MediaMTX/Wowza (5..15 s slot timeouts) and within
+                # ~90s on nginx-rtmp without drop_idle_publisher.
+                # The wait uses `_stop.wait` so a UI toggle-off /
+                # shutdown / settings change interrupts immediately
+                # rather than sitting through the full sleep.
                 if self._stale_publisher_seen:
+                    n = self._stale_publisher_consecutive
+                    wait_s = min(
+                        STALE_PUBLISHER_BACKOFF_MAX_S,
+                        STALE_PUBLISHER_BACKOFF_INITIAL_S * (2 ** n),
+                    )
+                    self._stale_publisher_consecutive = n + 1
                     self.stale_publisher_waits += 1
                     self.state = "waiting_for_rtmp_release"
                     logger.warning(
                         f"[relay{self.index}] RTMP server still publishing; "
-                        f"sleeping {int(STALE_PUBLISHER_BACKOFF_S)}s before "
-                        f"retry (wait #{self.stale_publisher_waits})"
+                        f"probing again in {int(wait_s)}s "
+                        f"(consecutive stale rejects: "
+                        f"{self._stale_publisher_consecutive}, "
+                        f"lifetime waits: {self.stale_publisher_waits})"
                     )
-                    if self._stop.wait(STALE_PUBLISHER_BACKOFF_S):
+                    if self._stop.wait(wait_s):
                         break
-                    # Reset the regular backoff so once the server
-                    # releases the slot we don't immediately apply the
-                    # short-attempt backoff on top of the long wait.
+                    # Reset the regular short-backoff so once the slot
+                    # opens the very next attempt isn't unnecessarily
+                    # delayed on top of the stale-publisher wait.
                     backoff = BACKOFF_START
                     self._stale_publisher_seen = False
                 self.state = "restarting"
@@ -327,6 +361,11 @@ class Relay:
             self._thread = None
 
     def status_dict(self) -> Dict[str, Any]:
+        next_wait_s = min(
+            STALE_PUBLISHER_BACKOFF_MAX_S,
+            STALE_PUBLISHER_BACKOFF_INITIAL_S
+            * (2 ** self._stale_publisher_consecutive),
+        )
         return {
             "index": self.index,
             "name": self.stream.get("name"),
@@ -339,6 +378,8 @@ class Relay:
             "ff_errors": self.ff_errors,
             "restart_count": self.restart_count,
             "stale_publisher_waits": self.stale_publisher_waits,
+            "stale_publisher_consecutive": self._stale_publisher_consecutive,
+            "stale_publisher_next_wait_s": int(next_wait_s),
             "started_at": self.started_at,
         }
 
@@ -472,7 +513,10 @@ def status() -> Dict[str, Any]:
         "total_count": len(cams),
         "total_restarts": total_restarts,
         "total_stale_publisher_waits": total_stale_waits,
-        "stale_publisher_backoff_s": int(STALE_PUBLISHER_BACKOFF_S),
+        "stale_publisher_backoff_initial_s": int(
+            STALE_PUBLISHER_BACKOFF_INITIAL_S
+        ),
+        "stale_publisher_backoff_max_s": int(STALE_PUBLISHER_BACKOFF_MAX_S),
     }
 
 
@@ -487,6 +531,11 @@ def summary() -> Dict[str, Any]:
         "total_count": st["total_count"],
         "total_restarts": st["total_restarts"],
         "total_stale_publisher_waits": st["total_stale_publisher_waits"],
-        "stale_publisher_backoff_s": st["stale_publisher_backoff_s"],
+        "stale_publisher_backoff_initial_s": st[
+            "stale_publisher_backoff_initial_s"
+        ],
+        "stale_publisher_backoff_max_s": st[
+            "stale_publisher_backoff_max_s"
+        ],
         "rtmp_base_url": st["rtmp_base_url"],
     }
