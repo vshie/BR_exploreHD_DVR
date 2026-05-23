@@ -118,6 +118,7 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--bd); }
     .pill.run { border-color: var(--ok); color: var(--ok); }
     .pill.bad { border-color: var(--err); color: var(--err); }
+    .pill.warn { border-color: var(--warn); color: var(--warn); }
     .live-layout { display: flex; flex-direction: column; gap: 6px; }
     /* Fill the remaining viewport below header + toolbar. Header is ~52px, the
        Live toolbar ~40px, main padding 8px top + 8px bottom, plus a few px of
@@ -480,8 +481,28 @@
               <td><code>{{ c.stream_key || '—' }}</code></td>
               <td class="muted">{{ c.rtsp_url }}</td>
               <td>
-                <span class="pill" :class="{ run: c.state==='running', bad: c.state==='error' || c.state==='skipped' }">
-                  {{ c.state }}
+                <span
+                  class="pill"
+                  :class="{
+                    run: c.state==='running',
+                    bad: c.state==='error' || c.state==='skipped',
+                    warn: c.state==='waiting_for_rtmp_release'
+                  }"
+                  :title="c.state==='waiting_for_rtmp_release' ? 'Upstream RTMP server still holds the previous publisher session for this stream key — waiting it out before retrying.' : ''"
+                >
+                  {{
+                    c.state==='waiting_for_rtmp_release'
+                      ? 'waiting for RTMP release'
+                      : c.state
+                  }}
+                </span>
+                <span
+                  v-if="(c.stale_publisher_waits || 0) > 0"
+                  class="muted"
+                  style="margin-left:6px; font-size:0.85rem"
+                  :title="'Number of times we had to wait for the upstream RTMP server to release the publisher slot for this stream key.'"
+                >
+                  ({{ c.stale_publisher_waits }} RTMP release wait{{ c.stale_publisher_waits === 1 ? '' : 's' }})
                 </span>
               </td>
               <td>{{ c.restart_count || 0 }}</td>
