@@ -6,7 +6,7 @@ don't carry useful audio and the receiving service is video-only.
 
 Equivalent shell command per cam:
 
-    ffmpeg -rtsp_transport udp -i <rtsp_url_from_mcm> \\
+    ffmpeg -rtsp_transport udp -rw_timeout 5000000 -i <rtsp_url_from_mcm> \\
            -c:v copy -an -f flv rtmp://35.85.229.226/live/bom_cam0N
 
 Design notes
@@ -16,19 +16,29 @@ Design notes
     watchdog thread; a RelayManager orchestrates start/stop for the whole
     fleet. We deliberately keep this independent of the recorder so a
     misbehaving cloud egress never disturbs disk recording.
-  - No stall detector is needed here: ffmpeg's RTMP write blocks until the
-    server ACKs, so a dropped uplink shows up as the subprocess exiting
-    cleanly with a non-zero status. The watchdog respawns it.
-  - The destination URL and the cam-index → stream-key mapping are HARDCODED
-    per the project requirement that there is no per-deployment knob for
-    the RTMP destination — only an enable/disable toggle. Add a new key
-    here if a 5th camera is ever introduced.
+  - `-rw_timeout 5000000` (5 s, in microseconds) makes ffmpeg exit
+    promptly when the RTSP source goes silent (Wi-Fi blip, MCM stall),
+    instead of hanging on the kernel's much longer TCP/UDP timeouts.
+  - Reconnect strategy: short sleep with 0..2 s of jitter after a
+    healthy run; exponential backoff (5 → 10 → 20 → 40 → 60 s, capped)
+    when ffmpeg keeps dying within HEALTHY_RUN_S. Jitter prevents all
+    four cams from reconnecting on the exact same tick after a common
+    disturbance and slamming the receiver.
+  - Separate (longer) backoff schedule kicks in when the upstream RTMP
+    server reports `Already publishing`; see STALE_PUBLISHER_BACKOFF_*
+    below.
+  - The destination URL and the cam-index → stream-key mapping are
+    HARDCODED per the project requirement that there is no
+    per-deployment knob for the RTMP destination — only an
+    enable/disable toggle. Add a new key here if a 5th camera is ever
+    introduced.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import random
 import signal
 import subprocess
 import threading
@@ -43,16 +53,40 @@ logger = logging.getLogger(__name__)
 RTMP_BASE_URL = "rtmp://35.85.229.226/live"
 RTMP_STREAM_KEYS: List[str] = ["bom_cam01", "bom_cam02", "bom_cam03", "bom_cam04"]
 
-# Watchdog cadence and respawn backoff.
+# Watchdog cadence and respawn backoff. The values below were chosen to
+# match the receiving RTMP service's published recommendations:
+#
+#   * Healthy run (>= HEALTHY_RUN_S) followed by an exit → retry quickly
+#     with `BACKOFF_START`. This is the "vessel Wi-Fi blipped, come back
+#     fast" case: one short sleep and we re-publish.
+#   * Short-lived run (< HEALTHY_RUN_S) → grow backoff exponentially up
+#     to `BACKOFF_MAX`, so a truly down network doesn't slam the server
+#     with hundreds of empty publishes per minute.
+#
+# Schedule on continuous failure: 5, 10, 20, 40, 60, 60, ... (capped).
+# A `RECONNECT_JITTER_S` of 0..2 s of uniform jitter is added on top of
+# every wait so all four cams don't reconnect on the same tick after a
+# common disturbance (Wi-Fi outage, MCM restart, etc.).
 WATCHDOG_INTERVAL_S = 2.0
-BACKOFF_START = 1.0
-BACKOFF_MAX = 10.0
+BACKOFF_START = 5.0
+BACKOFF_MAX = 60.0
+BACKOFF_GROWTH = 2.0
+RECONNECT_JITTER_S = 2.0
 
 # How long after spawn we consider the pipeline "established" enough that
 # an exit should reset the backoff. A pipeline that runs for >= this many
 # seconds is treated as healthy; anything shorter than that and we keep
 # growing the backoff.
 HEALTHY_RUN_S = 30.0
+
+# RTSP read/write timeout passed to ffmpeg so that a dead RTSP link (no
+# packets arriving from MCM because the upstream Wi-Fi/Ethernet went
+# down) makes ffmpeg exit within a few seconds instead of hanging on
+# the kernel's much longer TCP/UDP timeouts. Value is microseconds, per
+# ffmpeg's `-rw_timeout` AVOption convention. 5 s is short enough that
+# the watchdog notices outages quickly, long enough that an unloaded
+# but slow link doesn't false-trip.
+RTSP_RW_TIMEOUT_US = 5_000_000
 
 # Special-case backoff for the RTMP "Already publishing" reject path. When
 # our previous ffmpeg dies without cleanly tearing down its RTMP socket
@@ -151,6 +185,12 @@ class Relay:
             "-hide_banner",
             "-loglevel", "warning",
             "-rtsp_transport", "udp",
+            # Make ffmpeg exit within a few seconds instead of hanging
+            # on the kernel's default TCP/UDP timeouts when MCM/Wi-Fi
+            # goes silent. Without this, a dead uplink can keep the
+            # subprocess alive for tens of seconds, delaying the
+            # watchdog's reconnect cycle.
+            "-rw_timeout", str(RTSP_RW_TIMEOUT_US),
             "-i", url,
             "-c:v", "copy",
             "-an",
@@ -268,74 +308,125 @@ class Relay:
                     pass
 
     def _watch_loop(self):
+        # `backoff` is the *base* delay before the next respawn, ignoring
+        # jitter. It starts at BACKOFF_START, grows by BACKOFF_GROWTH on
+        # every short-lived run, caps at BACKOFF_MAX, and resets to
+        # BACKOFF_START whenever a run lives at least HEALTHY_RUN_S.
         backoff = BACKOFF_START
+        # `first_iter` lets the very first ffmpeg spawn happen
+        # immediately when the relay is first enabled — operators
+        # toggling Cloud ON expect to see streaming start right away,
+        # not after a 5..7 s wait. Subsequent respawns always go through
+        # the backoff+jitter path so a flapping link doesn't slam the
+        # receiver.
+        first_iter = True
         while not self._stop.is_set():
             with self._lock:
                 proc = self._proc
-            if proc is None or proc.poll() is not None:
-                if self._stop.is_set():
+            if proc is not None and proc.poll() is None:
+                # ffmpeg is alive — just tick.
+                time.sleep(WATCHDOG_INTERVAL_S)
+                continue
+            if self._stop.is_set():
+                break
+
+            # ffmpeg has died (or hasn't been started yet). Decide
+            # whether the next respawn deserves a quick or slow retry
+            # based on how long the *previous* run lived. Capture the
+            # last spawn's start time then immediately invalidate it,
+            # so a series of spawn failures (where _start_pipeline
+            # never reaches the point of setting _pipeline_start_mono)
+            # doesn't keep reading a stale long-ago healthy timestamp
+            # and falsely classifying every retry as "healthy".
+            had_recent_start = self._pipeline_start_mono > 0
+            ran_for = (
+                time.monotonic() - self._pipeline_start_mono
+                if had_recent_start
+                else 0.0
+            )
+            self._pipeline_start_mono = 0.0
+            ran_healthy = had_recent_start and ran_for >= HEALTHY_RUN_S
+            if not first_iter and ran_healthy:
+                # Long-lived run → this looks like a transient blip.
+                # Reset the backoff *before* using it so the first
+                # post-healthy sleep is BACKOFF_START (5 s), not the
+                # grown value left over from a prior failure streak.
+                backoff = BACKOFF_START
+                # A healthy run also clears any stale-publisher
+                # streak — the next stale reject we see is treated
+                # as the first one, so we probe early again.
+                self._stale_publisher_consecutive = 0
+
+            # If the just-died ffmpeg saw "Already publishing" on
+            # stderr, the upstream RTMP server is still holding our
+            # previous publisher slot. Use the dedicated stale-publisher
+            # backoff (5..90 s exponential) instead of the regular
+            # respawn cadence — the slot won't free up just by
+            # reconnecting, only by waiting out the server's keepalive
+            # timeout. The wait uses `_stop.wait` so a UI toggle-off /
+            # shutdown / settings change interrupts immediately rather
+            # than sitting through the full sleep.
+            if self._stale_publisher_seen:
+                n = self._stale_publisher_consecutive
+                wait_s = min(
+                    STALE_PUBLISHER_BACKOFF_MAX_S,
+                    STALE_PUBLISHER_BACKOFF_INITIAL_S * (2 ** n),
+                )
+                wait_s += random.uniform(0, RECONNECT_JITTER_S)
+                self._stale_publisher_consecutive = n + 1
+                self.stale_publisher_waits += 1
+                self.state = "waiting_for_rtmp_release"
+                logger.warning(
+                    f"[relay{self.index}] RTMP server still publishing; "
+                    f"probing again in {wait_s:.1f}s "
+                    f"(consecutive stale rejects: "
+                    f"{self._stale_publisher_consecutive}, "
+                    f"lifetime waits: {self.stale_publisher_waits})"
+                )
+                if self._stop.wait(wait_s):
                     break
-                ran_for = (
-                    time.monotonic() - self._pipeline_start_mono
-                    if self._pipeline_start_mono
-                    else 0.0
-                )
-                if ran_for >= HEALTHY_RUN_S:
-                    backoff = BACKOFF_START
-                    # A healthy run also clears any stale-publisher
-                    # streak — the next stale reject we see is treated
-                    # as the first one, so we probe early again.
-                    self._stale_publisher_consecutive = 0
-                # If the just-died ffmpeg saw "Already publishing" on
-                # stderr, the RTMP server is still holding our previous
-                # publisher slot. Probe early (5s) and back off
-                # exponentially up to STALE_PUBLISHER_BACKOFF_MAX_S so
-                # we recover within a few seconds on
-                # SRS/MediaMTX/Wowza (5..15 s slot timeouts) and within
-                # ~90s on nginx-rtmp without drop_idle_publisher.
-                # The wait uses `_stop.wait` so a UI toggle-off /
-                # shutdown / settings change interrupts immediately
-                # rather than sitting through the full sleep.
-                if self._stale_publisher_seen:
-                    n = self._stale_publisher_consecutive
-                    wait_s = min(
-                        STALE_PUBLISHER_BACKOFF_MAX_S,
-                        STALE_PUBLISHER_BACKOFF_INITIAL_S * (2 ** n),
-                    )
-                    self._stale_publisher_consecutive = n + 1
-                    self.stale_publisher_waits += 1
-                    self.state = "waiting_for_rtmp_release"
-                    logger.warning(
-                        f"[relay{self.index}] RTMP server still publishing; "
-                        f"probing again in {int(wait_s)}s "
-                        f"(consecutive stale rejects: "
-                        f"{self._stale_publisher_consecutive}, "
-                        f"lifetime waits: {self.stale_publisher_waits})"
-                    )
-                    if self._stop.wait(wait_s):
-                        break
-                    # Reset the regular short-backoff so once the slot
-                    # opens the very next attempt isn't unnecessarily
-                    # delayed on top of the stale-publisher wait.
-                    backoff = BACKOFF_START
-                    self._stale_publisher_seen = False
+                # Reset the regular short-backoff so once the slot
+                # opens the very next attempt isn't unnecessarily
+                # delayed on top of the stale-publisher wait.
+                backoff = BACKOFF_START
+                self._stale_publisher_seen = False
+            elif not first_iter:
+                # Regular respawn path. Sleep the *current* `backoff`
+                # plus 0..2 s of uniform jitter, then grow `backoff`
+                # for next time iff this run was short-lived. So a
+                # streak of short-lived runs sleeps 5, 10, 20, 40, 60
+                # (capped) on consecutive deaths — matching the
+                # receiver operator's recommended schedule. Jitter
+                # prevents all four cams from reconnecting on exactly
+                # the same tick after a common disturbance (Wi-Fi
+                # outage, MCM restart, container reboot).
+                wait_s = backoff + random.uniform(0, RECONNECT_JITTER_S)
                 self.state = "restarting"
-                self.restart_count += 1
                 logger.info(
-                    f"[relay{self.index}] starting ffmpeg "
-                    f"(attempt {self.restart_count})"
+                    f"[relay{self.index}] ffmpeg exited after "
+                    f"{ran_for:.1f}s; respawning in {wait_s:.1f}s "
+                    f"(backoff base {backoff:.0f}s, attempt "
+                    f"{self.restart_count + 1})"
                 )
-                ok = self._start_pipeline()
-                if not ok:
-                    if self.state != "skipped":
-                        self.state = "error"
-                    if self.state == "skipped":
-                        return
-                    if self._stop.wait(backoff):
-                        break
-                    backoff = min(BACKOFF_MAX, backoff * 1.5)
-                    continue
-            time.sleep(WATCHDOG_INTERVAL_S)
+                if self._stop.wait(wait_s):
+                    break
+                if not ran_healthy:
+                    backoff = min(BACKOFF_MAX, backoff * BACKOFF_GROWTH)
+
+            first_iter = False
+            self.state = "restarting"
+            self.restart_count += 1
+            logger.info(
+                f"[relay{self.index}] starting ffmpeg "
+                f"(attempt {self.restart_count})"
+            )
+            ok = self._start_pipeline()
+            if not ok:
+                if self.state == "skipped":
+                    return
+                self.state = "error"
+                # Loop continues; next iteration sees proc is None or
+                # exited and applies the grown backoff before retrying.
         self._stop_pipeline()
         self.state = "stopped"
 
@@ -380,6 +471,7 @@ class Relay:
             "stale_publisher_waits": self.stale_publisher_waits,
             "stale_publisher_consecutive": self._stale_publisher_consecutive,
             "stale_publisher_next_wait_s": int(next_wait_s),
+            "rtsp_rw_timeout_us": RTSP_RW_TIMEOUT_US,
             "started_at": self.started_at,
         }
 
@@ -517,6 +609,11 @@ def status() -> Dict[str, Any]:
             STALE_PUBLISHER_BACKOFF_INITIAL_S
         ),
         "stale_publisher_backoff_max_s": int(STALE_PUBLISHER_BACKOFF_MAX_S),
+        "backoff_start_s": int(BACKOFF_START),
+        "backoff_max_s": int(BACKOFF_MAX),
+        "reconnect_jitter_s": float(RECONNECT_JITTER_S),
+        "rtsp_rw_timeout_us": RTSP_RW_TIMEOUT_US,
+        "healthy_run_s": int(HEALTHY_RUN_S),
     }
 
 

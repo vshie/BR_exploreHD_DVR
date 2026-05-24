@@ -193,14 +193,23 @@ Per cam, the extension spawns:
 
 ```
 ffmpeg -rtsp_transport udp \
+       -rw_timeout 5000000 \
        -i <rtsp_url_from_mcm> \
        -c:v copy -an -f flv \
        rtmp://35.85.229.226/live/bom_cam0N
 ```
 
-`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
+`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). `-rw_timeout 5000000` is a 5 s I/O timeout (microseconds) on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on the kernel's much longer TCP/UDP timeouts. The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
 
-If a camera's RTSP source dies (MCM glitch, network hiccup) ffmpeg exits and a per-cam watchdog respawns it with a 1 s → 10 s exponential backoff. A pipeline that has been running for ≥ 30 s is considered "healthy" so a transient drop after that point resets the backoff to 1 s.
+### Reconnect strategy
+
+If ffmpeg exits (RTSP source disappeared, RTMP socket dropped, container restart), a per-cam watchdog respawns it on this schedule, picked to match the receiving service's recommended client behavior:
+
+- **Healthy run (≥ 30 s) before the exit** → respawn after **5 s** (the "Wi-Fi blip, come back fast" case).
+- **Short-lived run (< 30 s)** → exponential backoff **5 → 10 → 20 → 40 → 60 s** (capped). One short run after a long-healthy one still gets the quick 5 s; the schedule grows only on consecutive short-lived deaths.
+- Every wait has **0 – 2 s of uniform jitter** added on top so all four cams don't reconnect on the exact same tick after a common disturbance.
+
+A separate, longer schedule activates only when the upstream RTMP server replies `Server error: Already publishing` — i.e. it's still holding our previous publisher slot. In that case the relay backs off **5 → 10 → 20 → 40 → 80 → 90 s** (capped) and the per-cam state in the UI shows `waiting for RTMP release` instead of `error`. Both schedules reset the moment a pipeline runs healthily for ≥ 30 s.
 
 Programmatic access:
 
