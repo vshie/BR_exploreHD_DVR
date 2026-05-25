@@ -193,13 +193,13 @@ Per cam, the extension spawns:
 
 ```
 ffmpeg -rtsp_transport udp \
-       -rw_timeout 5000000 \
+       -stimeout 5000000 \
        -i <rtsp_url_from_mcm> \
        -c:v copy -an -f flv \
        rtmp://35.85.229.226/live/bom_cam0N
 ```
 
-`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). `-rw_timeout 5000000` is a 5 s I/O timeout (microseconds) on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on the kernel's much longer TCP/UDP timeouts. The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
+`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). `-stimeout 5000000` is a 5 s socket I/O timeout (microseconds) on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on the kernel's much longer TCP/UDP timeouts. (`-stimeout` is the ffmpeg 4.x option name; the bundled image uses Ubuntu 22.04 / ffmpeg 4.4. ffmpeg 5.x renamed it to `-timeout` on the RTSP demuxer but keeps `-stimeout` as a deprecated alias.) The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
 
 ### Reconnect strategy
 

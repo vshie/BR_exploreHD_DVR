@@ -6,7 +6,7 @@ don't carry useful audio and the receiving service is video-only.
 
 Equivalent shell command per cam:
 
-    ffmpeg -rtsp_transport udp -rw_timeout 5000000 -i <rtsp_url_from_mcm> \\
+    ffmpeg -rtsp_transport udp -stimeout 5000000 -i <rtsp_url_from_mcm> \\
            -c:v copy -an -f flv rtmp://35.85.229.226/live/bom_cam0N
 
 Design notes
@@ -16,9 +16,12 @@ Design notes
     watchdog thread; a RelayManager orchestrates start/stop for the whole
     fleet. We deliberately keep this independent of the recorder so a
     misbehaving cloud egress never disturbs disk recording.
-  - `-rw_timeout 5000000` (5 s, in microseconds) makes ffmpeg exit
+  - `-stimeout 5000000` (5 s, in microseconds) makes ffmpeg exit
     promptly when the RTSP source goes silent (Wi-Fi blip, MCM stall),
     instead of hanging on the kernel's much longer TCP/UDP timeouts.
+    See `RTSP_RW_TIMEOUT_FLAG` below for the ffmpeg-version-compat
+    notes — the bundled image ships ffmpeg 4.x where this option is
+    `-stimeout`, not `-rw_timeout`.
   - Reconnect strategy: short sleep with 0..2 s of jitter after a
     healthy run; exponential backoff (5 → 10 → 20 → 40 → 60 s, capped)
     when ffmpeg keeps dying within HEALTHY_RUN_S. Jitter prevents all
@@ -79,13 +82,33 @@ RECONNECT_JITTER_S = 2.0
 # growing the backoff.
 HEALTHY_RUN_S = 30.0
 
-# RTSP read/write timeout passed to ffmpeg so that a dead RTSP link (no
-# packets arriving from MCM because the upstream Wi-Fi/Ethernet went
-# down) makes ffmpeg exit within a few seconds instead of hanging on
-# the kernel's much longer TCP/UDP timeouts. Value is microseconds, per
-# ffmpeg's `-rw_timeout` AVOption convention. 5 s is short enough that
-# the watchdog notices outages quickly, long enough that an unloaded
-# but slow link doesn't false-trip.
+# RTSP socket I/O timeout passed to ffmpeg so that a dead RTSP link
+# (no packets arriving from MCM because the upstream Wi-Fi/Ethernet
+# went down) makes ffmpeg exit within a few seconds instead of hanging
+# on the kernel's much longer TCP/UDP timeouts. Value is microseconds.
+# 5 s is short enough that the watchdog notices outages quickly, long
+# enough that an unloaded but slow link doesn't false-trip.
+#
+# IMPORTANT: option-name compatibility across ffmpeg majors.
+#
+#   * ffmpeg 4.x — the version shipped by Ubuntu 22.04's `apt install
+#     ffmpeg` and therefore the one bundled in the BlueOS extension
+#     image — exposes the RTSP-demuxer socket I/O timeout as
+#     `-stimeout` (microseconds). It does NOT recognise `-rw_timeout`
+#     and aborts with `Option rw_timeout not found.` before it even
+#     opens the input, which is impossible to distinguish from a
+#     legitimate connect-timeout in our logs.
+#   * ffmpeg 5.x+ renamed `-stimeout` to `-timeout` on the RTSP
+#     demuxer (the old `-stimeout` form is kept as a deprecated alias
+#     for now) and added a generic `-rw_timeout` AVOption usable on
+#     any URL context.
+#
+# We standardise on `-stimeout` because (a) it is the only flag
+# accepted by the ffmpeg version we actually ship today, and (b) it is
+# still recognised (deprecated alias) by ffmpeg 5.x, so a future base
+# image bump won't silently break this. If/when we move to ffmpeg 6+
+# and `-stimeout` is removed entirely, swap to `-timeout` here.
+RTSP_RW_TIMEOUT_FLAG = "-stimeout"
 RTSP_RW_TIMEOUT_US = 5_000_000
 
 # Special-case backoff for the RTMP "Already publishing" reject path. When
@@ -150,6 +173,19 @@ class Relay:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        # Rolling buffer of the last few stderr lines, used as
+        # post-mortem evidence when ffmpeg dies inside the
+        # `_start_pipeline` 1 s probe. Without this, the dedicated
+        # stderr reader thread wins the race against the post-mortem
+        # `proc.stderr.read()`, the read returns empty, and the relay
+        # surfaces a useless "ffmpeg exited immediately" message — as
+        # happened on a real device when an option-name mismatch
+        # (`-rw_timeout` vs `-stimeout`) caused every spawn to die
+        # before opening the input. A short ring is enough: ffmpeg's
+        # fatal output is usually one or two lines.
+        self._stderr_recent: List[str] = []
+        self._stderr_recent_max: int = 8
+        self._stderr_recent_lock = threading.Lock()
 
         self.state = "idle"
         self.last_error = ""
@@ -185,12 +221,12 @@ class Relay:
             "-hide_banner",
             "-loglevel", "warning",
             "-rtsp_transport", "udp",
-            # Make ffmpeg exit within a few seconds instead of hanging
-            # on the kernel's default TCP/UDP timeouts when MCM/Wi-Fi
-            # goes silent. Without this, a dead uplink can keep the
-            # subprocess alive for tens of seconds, delaying the
-            # watchdog's reconnect cycle.
-            "-rw_timeout", str(RTSP_RW_TIMEOUT_US),
+            # RTSP socket I/O timeout. See RTSP_RW_TIMEOUT_FLAG above
+            # for why this is `-stimeout` (ffmpeg 4.x) and not
+            # `-rw_timeout` (5.x+). Without this, a dead uplink can
+            # keep the subprocess alive for tens of seconds, delaying
+            # the watchdog's reconnect cycle.
+            RTSP_RW_TIMEOUT_FLAG, str(RTSP_RW_TIMEOUT_US),
             "-i", url,
             "-c:v", "copy",
             "-an",
@@ -208,6 +244,17 @@ class Relay:
                 text = line.decode(errors="replace").strip()
                 if not text:
                     continue
+                # Always push into the rolling ring buffer first, so the
+                # post-mortem path in `_start_pipeline` can surface a
+                # useful last_error even when the line didn't match an
+                # explicit error/failed pattern. (ffmpeg's "Option X
+                # not found." aborts go through stderr at info level.)
+                with self._stderr_recent_lock:
+                    self._stderr_recent.append(text)
+                    if len(self._stderr_recent) > self._stderr_recent_max:
+                        del self._stderr_recent[
+                            : len(self._stderr_recent) - self._stderr_recent_max
+                        ]
                 low = text.lower()
                 # Detect the RTMP server holding our previous publisher
                 # session. We set the flag (don't sleep here — the
@@ -232,7 +279,11 @@ class Relay:
                     logger.warning(
                         f"[relay{self.index}] stale RTMP publisher: {text}"
                     )
-                elif "error" in low or "failed" in low:
+                elif "error" in low or "failed" in low or "not found" in low:
+                    # `not found` catches "Option X not found." which
+                    # ffmpeg prints at info level — that lone line is
+                    # the difference between knowing what killed us
+                    # and getting a useless generic exit message.
                     self.ff_errors += 1
                     self.last_error = text[:300]
                     logger.error(f"[relay{self.index}] ffmpeg: {text}")
@@ -256,6 +307,11 @@ class Relay:
         # long-backoff decision; carrying it across attempts would lock
         # us into the 90 s wait forever once we'd seen it once.
         self._stale_publisher_seen = False
+        # Clear the rolling stderr buffer so the post-mortem path
+        # only reports lines from THIS attempt's ffmpeg, not stale
+        # output from a prior failed spawn.
+        with self._stderr_recent_lock:
+            self._stderr_recent.clear()
         cmd = self._build_cmd()
         logger.info(f"[relay{self.index}] {' '.join(cmd)}")
         try:
@@ -276,15 +332,24 @@ class Relay:
         self._stderr_thread.start()
         time.sleep(1.0)
         if self._proc.poll() is not None:
-            err = b""
-            if self._proc.stderr:
-                try:
-                    err = self._proc.stderr.read() or b""
-                except Exception:
-                    err = b""
-            msg = err.decode(errors="replace").strip() or "ffmpeg exited immediately"
+            # Don't try to read stderr here — the dedicated reader
+            # thread (started above) is already draining it, and
+            # racing for the same FD just yields an empty buffer (the
+            # original cause of every cam reporting "ffmpeg exited
+            # immediately" with no diagnosis on v1.0.35). Give the
+            # reader a moment to finish, then snapshot the ring
+            # buffer it built up.
+            if self._stderr_thread:
+                self._stderr_thread.join(timeout=1.0)
+            with self._stderr_recent_lock:
+                tail = list(self._stderr_recent)
+            msg = (
+                "; ".join(tail)
+                if tail
+                else "ffmpeg exited immediately (no stderr captured)"
+            )
             logger.error(f"[relay{self.index}] died on start: {msg}")
-            self.last_error = msg[:300]
+            self.last_error = msg[:500]
             self._proc = None
             return False
         self.state = "running"
