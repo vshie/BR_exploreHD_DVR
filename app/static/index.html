@@ -437,7 +437,7 @@
       <div class="card" style="margin-bottom:12px">
         <h3>Cloud RTMP relay</h3>
         <p class="muted" style="margin-top:4px">
-          Forwards each MCM RTSP camera to <code>{{ cloud.server?.rtmp_base_url || 'rtmp://35.85.229.226/live' }}</code>
+          Forwards each MCM RTSP camera to <code>{{ cloud.server?.rtmp_base_url || 'rtmp://35.83.28.160/live' }}</code>
           using one <code>ffmpeg -c:v copy -an -f flv</code> subprocess per cam.
           Runs alongside the disk recorder and the MCM WebRTC live view; doesn't affect either.
           The destination is hardcoded — only the on/off toggle is operator-facing,

@@ -8,7 +8,7 @@ This extension **does not configure MCM**. You must define streams in BlueOS (Vi
 
 - **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
 - **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Cloud RTMP relay** (on by default, toggle in the **Cloud** tab): for each MCM RTSP stream, an `ffmpeg -c:v copy -an -f flv` subprocess pushes the H.264 elementary stream to `rtmp://35.85.229.226/live/bom_cam0N`. Runs alongside disk recording and the MCM WebRTC live view; never re-encodes.
+- **Cloud RTMP relay** (on by default, toggle in the **Cloud** tab): for each MCM RTSP stream, an `ffmpeg -c:v copy -an -f flv` subprocess pushes the H.264 elementary stream to `rtmp://35.83.28.160/live/bom_cam0N`. Runs alongside disk recording and the MCM WebRTC live view; never re-encodes.
 - **External SSD auto-cleanup**: on the 256 GB NVMe (or whichever volume mounts at `/mnt/usb`), the oldest completed session directory (and its `.zip`) is deleted whenever free space drops below **10 GB**, oldest-first. The active session is never touched. Internal SD has its own separate 1 GB hard-stop in the recorder.
 - **Web UI** (default port **4444**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete), Cloud (RTMP relay on/off + per-cam state + SSD cleanup state). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 - **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
@@ -196,7 +196,7 @@ ffmpeg -rtsp_transport udp \
        -stimeout 5000000 \
        -i <rtsp_url_from_mcm> \
        -c:v copy -an -f flv \
-       rtmp://35.85.229.226/live/bom_cam0N
+       rtmp://35.83.28.160/live/bom_cam0N
 ```
 
 `-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). `-stimeout 5000000` is a 5 s socket I/O timeout (microseconds) on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on the kernel's much longer TCP/UDP timeouts. (`-stimeout` is the ffmpeg 4.x option name; the bundled image uses Ubuntu 22.04 / ffmpeg 4.4. ffmpeg 5.x renamed it to `-timeout` on the RTSP demuxer but keeps `-stimeout` as a deprecated alias.) The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.

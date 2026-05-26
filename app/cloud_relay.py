@@ -7,7 +7,7 @@ don't carry useful audio and the receiving service is video-only.
 Equivalent shell command per cam:
 
     ffmpeg -rtsp_transport udp -stimeout 5000000 -i <rtsp_url_from_mcm> \\
-           -c:v copy -an -f flv rtmp://35.85.229.226/live/bom_cam0N
+           -c:v copy -an -f flv rtmp://35.83.28.160/live/bom_cam0N
 
 Design notes
 ------------
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Hardcoded cloud destination. The RTMP server URL never varies between
 # installs, and the per-cam stream keys map cam index 0..3 onto the
 # bom_cam01..bom_cam04 buckets the receiving service is provisioned for.
-RTMP_BASE_URL = "rtmp://35.85.229.226/live"
+RTMP_BASE_URL = "rtmp://35.83.28.160/live"
 RTMP_STREAM_KEYS: List[str] = ["bom_cam01", "bom_cam02", "bom_cam03", "bom_cam04"]
 
 # Watchdog cadence and respawn backoff. The values below were chosen to

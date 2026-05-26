@@ -40,7 +40,7 @@ _DEFAULTS: Dict[str, Any] = {
     "auto_download_interval_minutes": 5,
     # Cloud RTMP relay: when enabled (default ON), the extension spawns one
     # ffmpeg subprocess per MCM RTSP camera that copies the H.264 stream to
-    # rtmp://35.85.229.226/live/bom_cam0N (see app/cloud_relay.py). The
+    # rtmp://35.83.28.160/live/bom_cam0N (see app/cloud_relay.py). The
     # destination URL is hardcoded; this toggle is the only knob.
     "cloud_relay_enabled": True,
 }
