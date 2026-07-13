@@ -6,12 +6,18 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MCM_BASE = os.environ.get("MCM_BASE", "http://127.0.0.1:6020").rstrip("/")
+# Host-network consumers (recorder / cloud relay) always pull RTSP locally.
+# MCM often advertises a LAN IP that was current when the stream was saved
+# (e.g. an old Wi-Fi lease) and never updates it — that address may not be
+# on any interface anymore. Override with DVR_RTSP_HOST if needed.
+DVR_RTSP_HOST = (os.environ.get("DVR_RTSP_HOST") or "127.0.0.1").strip() or "127.0.0.1"
 
 
 def _first_rtsp_url(endpoints: List[Any]) -> Optional[str]:
@@ -19,6 +25,24 @@ def _first_rtsp_url(endpoints: List[Any]) -> Optional[str]:
         if isinstance(ep, str) and ep.lower().startswith("rtsp://"):
             return ep
     return None
+
+
+def rewrite_rtsp_host(rtsp_url: str, host: str = DVR_RTSP_HOST) -> str:
+    """Replace the RTSP URL hostname with a local ingest host (default loopback)."""
+    try:
+        parsed = urlparse(rtsp_url)
+        if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+            return rtsp_url
+        if parsed.hostname == host:
+            return rtsp_url
+        port = parsed.port
+        netloc = f"{host}:{port}" if port else host
+        rewritten = urlunparse(parsed._replace(netloc=netloc))
+        logger.info("Rewrote MCM RTSP %s -> %s", rtsp_url, rewritten)
+        return rewritten
+    except Exception as e:
+        logger.warning("Failed to rewrite RTSP URL %r: %s", rtsp_url, e)
+        return rtsp_url
 
 
 def _is_h264_stream(stream_info: Dict[str, Any]) -> bool:
@@ -44,6 +68,7 @@ def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> O
         if not _is_h264_stream(si):
             logger.debug(f"Skipping non-H264 stream {name!r}")
             return None
+        rtsp = rewrite_rtsp_host(rtsp)
         return {
             "stream_id": str(sid),
             "name": name,

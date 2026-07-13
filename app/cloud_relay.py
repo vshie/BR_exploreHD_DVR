@@ -12,10 +12,8 @@ Equivalent shell command per cam:
 Design notes
 ------------
 
-  - Modeled on app/recorder.py: a per-cam Relay object owns a Popen and a
-    watchdog thread; a RelayManager orchestrates start/stop for the whole
-    fleet. We deliberately keep this independent of the recorder so a
-    misbehaving cloud egress never disturbs disk recording.
+  - Per-cam Relay object owns a Popen and a watchdog thread; a RelayManager
+    orchestrates start/stop for the whole fleet.
   - `-stimeout 5000000` (5 s, in microseconds) makes ffmpeg exit
     promptly when the RTSP source goes silent (Wi-Fi blip, MCM stall),
     instead of hanging on the kernel's much longer TCP/UDP timeouts.

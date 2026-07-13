@@ -5,17 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
     python3 \
     python3-pip \
-    gstreamer1.0-tools \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
     ffmpeg \
-    exfat-fuse \
-    ntfs-3g \
-    util-linux \
-    zip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir flask requests
@@ -31,7 +21,7 @@ ENV FLASK_APP=main.py
 
 EXPOSE 4444
 
-LABEL version="1.0.37"
+LABEL version="1.0.40"
 
 ARG IMAGE_NAME
 LABEL permissions='\
@@ -41,8 +31,7 @@ LABEL permissions='\
   },\
   "HostConfig": {\
     "Binds": [\
-      "/usr/blueos/extensions/br_explorehd_dvr:/app/recordings",\
-      "/dev:/dev"\
+      "/usr/blueos/extensions/br_explorehd_dvr:/app/recordings"\
     ],\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "PortBindings": {\
@@ -52,8 +41,7 @@ LABEL permissions='\
         }\
       ]\
     },\
-    "NetworkMode": "host",\
-    "Privileged": true\
+    "NetworkMode": "host"\
   }\
 }'
 
@@ -70,7 +58,7 @@ ARG MAINTAINER
 ARG MAINTAINER_EMAIL
 LABEL company='\
 {\
-        "about": "BR_exploreHD_DVR — multi-camera TS recorder for MCM RTSP",\
+        "about": "BR_exploreHD_DVR — cloud RTMP relay + Live view for MCM RTSP",\
         "name": "Blue Robotics",\
         "email": "support@bluerobotics.com"\
     }'

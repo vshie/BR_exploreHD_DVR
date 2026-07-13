@@ -9,10 +9,7 @@ services:
       - "4444:4444"
     volumes:
       - /usr/blueos/extensions/br_explorehd_dvr:/app/recordings
-      - /dev:/dev
-    privileged: true
     restart: unless-stopped
     environment:
       - BLUEOS=true
       - MCM_BASE=http://127.0.0.1:6020
-      - SEGMENT_SECONDS=300

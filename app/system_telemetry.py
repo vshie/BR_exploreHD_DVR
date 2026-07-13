@@ -1,5 +1,7 @@
 """
-System telemetry for BR_exploreHD_DVR: Pi CPU temperature, voltage, clock, time sync, disk space.
+System telemetry for BR_exploreHD_DVR: Pi CPU temperature, voltage, clock, time sync.
+
+Cloud-only build — no disk/USB reporting.
 """
 
 import ctypes
@@ -110,20 +112,11 @@ def get_cpu_load_avg():
     return None
 
 
-def get_disk_free_mb(path="/app/recordings"):
-    try:
-        stat = os.statvfs(path)
-        return round((stat.f_bavail * stat.f_frsize) / (1024 * 1024), 1)
-    except Exception as e:
-        logger.debug(f"Disk free check failed: {e}")
-    return None
-
-
 def get_system_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_all_telemetry(recording_ok=None, usb_disk_free_mb=None):
+def get_all_telemetry():
     return {
         "cpu_temp_c": get_cpu_temperature(),
         "cpu_voltage_v": get_cpu_voltage(),
@@ -131,7 +124,4 @@ def get_all_telemetry(recording_ok=None, usb_disk_free_mb=None):
         "cpu_load_avg": get_cpu_load_avg(),
         "time_synced": is_time_synced(),
         "system_time": get_system_time(),
-        "disk_free_mb": get_disk_free_mb(),
-        "usb_disk_free_mb": usb_disk_free_mb,
-        "recording_ok": recording_ok,
     }

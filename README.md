@@ -1,83 +1,17 @@
 # BR_exploreHD_DVR
 
-BlueOS extension for a **Raspberry Pi 5** used as a **multi-camera DVR** (e.g. four [exploreHD](https://bluerobotics.com/store/sensors-cameras/cameras/deepwater-exploration-explorehd-usb-camera/) USB cameras). Video is recorded from **MAVLink Camera Manager (MCM)** **H.264 RTSP** endpoints into **power-loss-friendly MPEG-TS** segments (default **5 minutes**).
+BlueOS extension for a **Raspberry Pi 5** used as a **multi-camera cloud uplink** (e.g. four [exploreHD](https://bluerobotics.com/store/sensors-cameras/cameras/deepwater-exploration-explorehd-usb-camera/) USB cameras). Reads **MAVLink Camera Manager (MCM)** **H.264 RTSP** endpoints and pushes each one to a hardcoded RTMP cloud endpoint via `ffmpeg -c:v copy` (no re-encode). Also serves an in-browser **Live** view via MCM's WebRTC page.
 
-This extension **does not configure MCM**. You must define streams in BlueOS (Video Streams / MCM UI, port **6020**). If **no** H264 RTSP streams are present after boot, the UI shows an error and **Retry boot**. If **fewer than four** streams exist, recording runs for **all** streams returned by MCM and a warning is shown.
+**Cloud-only build.** Disk recording, USB storage, and downloads have been removed; the extension is a thin RTMP relay + Live viewer.
+
+This extension **does not configure MCM**. You must define streams in BlueOS (Video Streams / MCM UI, port **6020**). If **no** H264 RTSP streams are present after boot, the UI shows an error and **Retry**. If **fewer than four** streams exist, the relay runs for **all** streams returned by MCM and a warning is shown.
 
 ## Features
 
-- **Auto-start after boot**: waits for CPU load to settle, zips prior session folders that lack a session zip, mounts USB storage when present, then starts one GStreamer pipeline per MCM stream.
-- **USB storage**: records to `/mnt/usb/BR_exploreHD_DVR/...` when a removable drive is mounted and has **≥ 5 GB** free; otherwise uses `/app/recordings` on the SD card.
-- **Cloud RTMP relay** (on by default, toggle in the **Cloud** tab): for each MCM RTSP stream, an `ffmpeg -c:v copy -an -f flv` subprocess pushes the H.264 elementary stream to `rtmp://35.83.28.160/live/bom_cam0N`. Runs alongside disk recording and the MCM WebRTC live view; never re-encodes.
-- **External SSD auto-cleanup**: on the 256 GB NVMe (or whichever volume mounts at `/mnt/usb`), the oldest completed session directory (and its `.zip`) is deleted whenever free space drops below **10 GB**, oldest-first. The active session is never touched. Internal SD has its own separate 1 GB hard-stop in the recorder.
-- **Web UI** (default port **4444**, next to MCM): Status (per-camera), Live (embedded MCM WebRTC dev page on port 6020), Recordings (multi-select days, bulk zip download / delete), Cloud (RTMP relay on/off + per-cam state + SSD cleanup state). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
-- **Segmented `.ts`**: `splitmuxsink` + `mpegtsmux`; truncated segments remain playable (TS is self-synchronizing).
-
-## Hardware setup (Raspberry Pi 5)
-
-Do this once, before installing the extension.
-
-### 1. Prepare the NVMe drive (recommended recording target)
-
-The extension auto-detects an attached NVMe (or USB SSD) and prefers it over the SD card whenever it has ≥ 5 GB free. The drive must have a partition table and a filesystem; a brand-new disk ships raw and will not mount until you initialize it.
-
-> **WARNING**: these commands erase the target disk. Verify the device path with `lsblk` first — `/dev/nvme0n1` is the M.2 slot on the Pi 5; do **not** run them against `/dev/mmcblk0` (your boot SD) or any drive that holds data you want to keep.
-
-From a Pi shell (BlueOS host, **not** inside the container):
-
-```bash
-sudo wipefs -a /dev/nvme0n1
-sudo parted -s /dev/nvme0n1 mklabel gpt mkpart primary ext4 0% 100%
-sudo mkfs.ext4 -L BR_DVR /dev/nvme0n1p1
-```
-
-ext4 is preferred over exFAT/vfat for this workload: many small `.ts` segments with periodic `fsync`/finalize. exFAT and vfat are also supported (the image includes `exfat-fuse`), but vfat caps individual files at 4 GB.
-
-The 30 s storage probe will mount the new partition at `/mnt/usb` automatically; no extension restart required. Verify with:
-
-```bash
-curl -s http://127.0.0.1:4444/status | python3 -m json.tool | grep -A6 '"usb"'
-```
-
-You should see `"mounted": true` and the device path. If auto-detection misses an unusual enclosure, set `EXTERNAL_STORAGE_DEVICE=/dev/nvme0n1p1` (or the matching `sdX1`) on the extension to force it.
-
-#### Reference: NVMe vs SD card throughput on a Pi 5
-
-Numbers from a Pi 5 with a Patriot M.2 P300 256 GB NVMe (PCIe link `Speed 5GT/s, Width x1` — the Pi 5's default Gen2 x1) compared to its boot SD card, both `dd`'d through ext4 from inside the extension container:
-
-| Test | SD card (`/dev/mmcblk0p2`) | NVMe (`/dev/nvme0n1p1`) | NVMe / SD |
-|------|----------------------------|--------------------------|-----------|
-| Sequential write, 4 GiB, 1 MiB blocks, `fdatasync` | 73.5 MB/s | 396 MB/s | 5.4× |
-| Sequential read, 4 GiB, 1 MiB blocks (cache-primed) | 180 MB/s | 800 MB/s | 4.4× |
-| 64 KiB blocks, 1 GiB, `oflag=dsync` (fsync each block) | **8.5 MB/s** | **108 MB/s** | **12.7×** |
-| Sequential write, 4 GiB, 4 MiB blocks, no sync | 97.9 MB/s | 504 MB/s | 5.1× |
-
-The row that actually matters for this workload is the `oflag=dsync` one — that's the closest analogue to what `splitmuxsink` does on segment boundaries (write some payload, sync, finalize). Four exploreHD cameras at ~24 Mbps aggregate (~3 MB/s on disk) gives:
-
-- **SD card**: ~24× headroom on bulk writes but only ~2.8× on the worst-case sync-bound path. Any competing latency source (WiFi, container churn, segment finalize on a sibling cam) erodes that and starts tripping the recorder's stall watchdog.
-- **NVMe**: ~130× headroom on bulk, ~36× on the sync-bound path. Effectively unlimited margin.
-
-If you observe segment stalls on SD-only systems, this gap is the underlying reason; moving recording to the NVMe is the durable fix. If you want even more NVMe headroom, adding `dtparam=pciex1_gen=3` to `/boot/firmware/config.txt` lifts the link from Gen2 x1 (~500 MB/s ceiling) to Gen3 x1 (~1000 MB/s); not necessary for four 1080p30 H.264 cameras.
-
-`dd` invocation used (run inside the container at the target mount):
-
-```bash
-dd if=/dev/zero of=stest.bin bs=1M  count=4096 conv=fdatasync          # bulk write
-dd if=stest.bin of=/dev/null bs=1M                                      # read back
-dd if=/dev/zero of=stest.bin bs=64K count=16K conv=fdatasync oflag=dsync # sync-per-block
-dd if=/dev/zero of=stest.bin bs=4M  count=1024                          # bulk no-sync
-```
-
-### 2. Camera power (4× exploreHD)
-
-Each exploreHD draws roughly 1.5 A at peak. The Pi 5's combined USB rail cannot run four of them on bus power — symptoms are random USB resets, MCM streams dropping in/out, and `dmesg` `xhci`/`port reset` errors. With **four** exploreHD cameras connected:
-
-- Pick **two** of the four cameras and **disconnect the 5 V (red) wire** from their USB‑A connectors so they are no longer powered from the Pi's USB bus.
-- Splice those two 5 V leads to a separate, regulated **5 V supply** sized for ≥ 4 A combined (the cameras' grounds remain on the USB connector to share reference with the Pi). A common low-voltage drop is enough to cause intermittent stalls, so size the supply and wiring conservatively.
-- Leave the data lines (D+/D−) and ground on the USB‑A connector untouched.
-- The remaining two cameras stay fully USB-powered from the Pi.
-
-This split keeps the Pi's USB controller within its current budget while preserving USB enumeration and per-camera v4l2 paths through MCM. Three or fewer cameras can run entirely on Pi USB power without modification.
+- **Fast boot**: waits only for MCM to publish streams, then spawns one `ffmpeg -c:v copy -an -f flv` per RTSP source. No CPU-calm gate, no disk zip, no USB mount.
+- **Cloud RTMP relay** (on by default, toggle in the **Cloud** tab): forwards each MCM RTSP stream to `rtmp://35.83.28.160/live/bom_cam0N`. Never re-encodes.
+- **Live WebRTC view**: embeds MCM's WebRTC page for local monitoring (Quad + single).
+- **Web UI** on port **4444**, next to MCM (which uses **6020**). Port **5777** is used by BlueOS `mavlink-server`; this extension avoids it by default.
 
 ## BlueOS install
 
@@ -101,8 +35,7 @@ Paste this into the **Custom settings / Permissions** JSON editor:
   },
   "HostConfig": {
     "Binds": [
-      "/usr/blueos/extensions/br_explorehd_dvr:/app/recordings",
-      "/dev:/dev"
+      "/usr/blueos/extensions/br_explorehd_dvr:/app/recordings"
     ],
     "ExtraHosts": [
       "host.docker.internal:host-gateway"
@@ -114,38 +47,21 @@ Paste this into the **Custom settings / Permissions** JSON editor:
         }
       ]
     },
-    "NetworkMode": "host",
-    "Privileged": true
+    "NetworkMode": "host"
   }
 }
 ```
 
-Click **Create**. BlueOS will pull the image from Docker Hub and start the container. The extension appears in the sidebar once it's up (usually 10–30 s after the pull finishes). Web UI: **http://\<vehicle\>:4444/**.
+Click **Create**. BlueOS will pull the image from Docker Hub and start the container. Web UI: **http://\<vehicle\>:4444/**.
 
 What each piece does:
-- `Binds` — persists recordings to `/usr/blueos/extensions/br_explorehd_dvr` on the host (so they survive extension reinstalls) and exposes `/dev` so USB storage can be mounted from inside the container.
+- `Binds` — persists the settings file (`.br_explorehd_dvr_settings.json`) to `/usr/blueos/extensions/br_explorehd_dvr` on the host so the cloud-relay toggle survives extension reinstalls.
 - `NetworkMode: host` — required so the extension can reach MCM at `127.0.0.1:6020` and RTSP at `127.0.0.1:8554`.
-- `Privileged: true` — required for mounting removable storage (`exfat-fuse`, `mount`, `util-linux`).
 - `ExtraHosts: host.docker.internal:host-gateway` — lets the frontend iframe MCM's WebRTC UI via a stable hostname.
-
-### Option B — Manual install from a `.tar` (air-gapped / offline)
-
-Use this when the vehicle has no internet connection to pull from Docker Hub. Copy the tar built by this repo to the Pi, then:
-
-```bash
-docker load -i br_explorehd_dvr_linux_arm64_v1.0.23.tar
-# Image tag: vshie/br_explorehd_dvr:1.0.23
-```
-
-Then register the extension in BlueOS using the same fields as Option A, but change:
-- **Docker image**: `vshie/br_explorehd_dvr`
-- **Docker tag**: `1.0.23`
-
-(These match the image tag produced by `docker load`; Option A's `vshie/blueos-br_explorehd_dvr:main` is the Docker Hub published image and differs by name.)
 
 ## MCM prerequisites
 
-1. Open **http://&lt;vehicle&gt;:6020/** and create one **H.264** stream per camera (RTSP endpoint will appear in MCM’s stream list).
+1. Open **http://&lt;vehicle&gt;:6020/** and create one **H.264** stream per camera (RTSP endpoint will appear in MCM's stream list).
 2. Ensure the extension can `GET http://127.0.0.1:6020/streams` (default `MCM_BASE`).
 
 ## Environment variables
@@ -153,41 +69,22 @@ Then register the extension in BlueOS using the same fields as Option A, but cha
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCM_BASE` | `http://127.0.0.1:6020` | MCM REST base URL |
-| `SEGMENT_SECONDS` | `300` | TS segment duration |
+| `DVR_RTSP_HOST` | `127.0.0.1` | Hostname substituted into MCM RTSP URLs for local ingest. MCM often advertises a stale LAN IP; loopback is correct under `NetworkMode: host`. |
 | `PORT` | `4444` | Flask listen port (override if needed) |
-| `BOOT_MIN_SLEEP_S` | `20` | Minimum sleep before loadavg gate |
-| `BOOT_LOADAVG_MAX` | `2.0` | 1m loadavg threshold |
+| `MCM_POLL_INTERVAL_S` | `1` | MCM `/streams` poll interval during boot |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
-| `EXTERNAL_STORAGE_DEVICE` | _(unset)_ | Optional explicit partition to mount at `/mnt/usb` (e.g. `/dev/nvme0n1p1`) if auto-detection does not pick your drive |
-| `DVR_RTSP_PROTOCOLS` | `udp+tcp` | rtspsrc transport preference: `udp+tcp` (UDP with TCP fallback; default since 1.0.20), `tcp` (RTSP-over-TCP only — useful on lossy links), or `udp` (UDP only, no fallback). UDP avoids TCP head-of-line blocking when the MCM producer briefly glitches. |
 
-## Recording layout
+## API
 
-```
-/app/recordings/YYYYMMDD/<session_uuid>/cam_<n>_<sanitized_name>/YYYYMMDD_HHMMSS_cam<n>.ts
-```
-
-The day directory and segment filenames are written in the **operator's browser-local time** (the UI reports its TZ to the extension, and the offset is persisted so auto-record-on-boot still produces correctly-stamped files before any client has connected). While a segment is actively being written it shows as `seg_00007.ts` under the splitmuxsink template; once `splitmuxsink` rolls to the next segment the closed file is renamed to `YYYYMMDD_HHMMSS_cam<n>.ts` within ~5 s. The `_cam<n>` suffix matters when four cams roll on the same 5-minute boundary and finalize within the same wall-clock second — without it, two cams' segments would collide on filename when the auto-download zip merges cam directories. The active segment is renamed when the recorder stops or the pipeline is torn down (stall, disk-full, manual stop). Recordings produced by 1.0.29 and earlier (`YYYYMMDD_HHMMSS.ts`, no cam suffix) are still recognized by the auto-download cursor for backward compatibility.
-
-When external storage is mounted at `/mnt/usb` with enough free space, recording uses `/mnt/usb/BR_exploreHD_DVR/` instead of `/app/recordings`. That includes **USB flash**, **USB‑bus M.2/NVMe enclosures** (often `/dev/sd*`), and **native NVMe** (`/dev/nvme*n*p*`) when it is not the OS disk. **exFAT** (or FAT32) is supported; the image includes `exfat-fuse`, and the extension tries generic `mount` then explicit `-t exfat` / `-t vfat`.
-
-## API (short)
-
-- `GET /status` — boot stage, errors, per-camera recorder status, telemetry, USB.
-- `GET /streams` — normalized stream list used for recording.
-- `POST /stop` / `POST /start` — stop or resume all recorders.
-- `POST /cam/<index>/restart` — restart one pipeline.
-- `POST /boot/retry` — re-run boot (e.g. after fixing MCM).
-- `GET /recordings` — days + sessions + segment download URLs.
-- `GET /download_day/<YYYYMMDD>` — zip one calendar day (`sd/` and `usb/` prefixes inside zip if both exist).
-- `GET /download_session/<YYYYMMDD>/<sessionId>` — zip one session. Serves the pre-built `<sessionId>.zip` directly when present; otherwise stream-zips the session's `.ts` segments.
-- `POST /download_days` — JSON `{"dates":["YYYYMMDD",...]}` → zip.
-- `POST /recordings/delete` — JSON `{"dates":[...]}` (skips the calendar day of the active session).
-- `POST /tz` — JSON `{"tz_offset_minutes": <signed int east of UTC>, "tz_name": "<IANA tz>"}` to inform the extension of the operator's browser-local timezone. The Web UI sends this on load and on visibility changes; only needed externally if you drive the API without the bundled UI.
+- `GET /status` — boot stage, streams count, telemetry, cloud summary.
+- `GET /streams` — normalized MCM stream list.
+- `POST /live/ensure_streams` — idempotent kick to start MCM pipelines for WebRTC.
+- `GET /settings` / `POST /settings` — read / update `cloud_relay_enabled`.
+- `GET /cloud/status` — per-cam RTMP relay state, restart counts, errors.
+- `POST /cloud/toggle` — body `{"enabled": true|false}` — flip the persisted toggle and start/stop the relay.
+- `POST /boot/retry` — re-run MCM discovery + relay start (e.g. after fixing MCM).
 
 ## Cloud RTMP relay
-
-While the recorder writes `.ts` segments to disk and MCM serves the four cameras over WebRTC for the in-browser **Live** view, the extension can **simultaneously** push each H.264 stream to a hardcoded RTMP endpoint. The relay is **enabled by default** — flip it off from the **Cloud** tab if you don't want it. The toggle persists in the recordings bind mount (`/usr/blueos/extensions/br_explorehd_dvr/.br_explorehd_dvr_settings.json`) so it survives container/image rebuilds.
 
 Per cam, the extension spawns:
 
@@ -199,39 +96,21 @@ ffmpeg -rtsp_transport udp \
        rtmp://35.83.28.160/live/bom_cam0N
 ```
 
-`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio (cameras don't carry useful audio for this pipeline). `-stimeout 5000000` is a 5 s socket I/O timeout (microseconds) on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on the kernel's much longer TCP/UDP timeouts. (`-stimeout` is the ffmpeg 4.x option name; the bundled image uses Ubuntu 22.04 / ffmpeg 4.4. ffmpeg 5.x renamed it to `-timeout` on the RTSP demuxer but keeps `-stimeout` as a deprecated alias.) The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob.
+`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio. `-stimeout 5000000` is a 5 s socket I/O timeout on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on kernel timeouts. The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob. The toggle persists in `.br_explorehd_dvr_settings.json` under the bind mount so it survives container/image rebuilds.
 
 ### Reconnect strategy
 
-If ffmpeg exits (RTSP source disappeared, RTMP socket dropped, container restart), a per-cam watchdog respawns it on this schedule, picked to match the receiving service's recommended client behavior:
+If ffmpeg exits (RTSP source disappeared, RTMP socket dropped, container restart), a per-cam watchdog respawns it:
 
 - **Healthy run (≥ 30 s) before the exit** → respawn after **5 s** (the "Wi-Fi blip, come back fast" case).
-- **Short-lived run (< 30 s)** → exponential backoff **5 → 10 → 20 → 40 → 60 s** (capped). One short run after a long-healthy one still gets the quick 5 s; the schedule grows only on consecutive short-lived deaths.
+- **Short-lived run (< 30 s)** → exponential backoff **5 → 10 → 20 → 40 → 60 s** (capped).
 - Every wait has **0 – 2 s of uniform jitter** added on top so all four cams don't reconnect on the exact same tick after a common disturbance.
 
-A separate, longer schedule activates only when the upstream RTMP server replies `Server error: Already publishing` — i.e. it's still holding our previous publisher slot. In that case the relay backs off **5 → 10 → 20 → 40 → 80 → 90 s** (capped) and the per-cam state in the UI shows `waiting for RTMP release` instead of `error`. Both schedules reset the moment a pipeline runs healthily for ≥ 30 s.
-
-Programmatic access:
-
-- `GET /cloud/status` — full payload: relay enabled/running flags, per-cam state (state, restart_count, last_error, stream_key, rtmp_url), and the `disk_cleanup` block.
-- `POST /cloud/toggle` body `{ "enabled": true|false }` — flip the persisted toggle and start/stop the relay.
-- `POST /settings` accepts `{ "cloud_relay_enabled": true|false }` alongside the other settings keys.
-
-## External SSD auto-cleanup
-
-The recorder targets `/mnt/usb/BR_exploreHD_DVR/...` whenever an external SSD is mounted with ≥ 5 GB free (typically a 256 GB NVMe — see the hardware section above). To keep recording from ever filling that volume, a background sweeper runs every **30 s** and:
-
-1. Reads free space on the SSD.
-2. If `free < 10 GB`, walks the recordings tree, finds the **oldest session directory** (sorted by the oldest mtime among its files, with the active session always excluded), and deletes it together with its sibling `<session_id>.zip` if one exists.
-3. Re-checks free space and loops; stops as soon as the SSD is back above the 10 GB floor.
-
-That floor lets the recorder fill the disk to ~96% before cleanup begins; at the four-cam ~3 MB/s aggregate, 10 GB of headroom is several hours of recording. The internal SD card is **never** touched by this sweeper — `/app/recordings` is gated separately by the recorder's existing 1 GB hard-stop in `recorder.MIN_FREE_DISK_MB`, which remains the final safety net if cleanup ever fails to keep up.
-
-The Cloud tab in the UI shows free-of-total, the threshold, and the last delete (which session, how much space it freed).
+A separate, longer schedule activates only when the upstream RTMP server replies `Server error: Already publishing` — i.e. it's still holding our previous publisher slot. In that case the relay backs off **5 → 10 → 20 → 40 → 80 → 90 s** (capped) and the per-cam state in the UI shows `waiting for RTMP release`. Both schedules reset the moment a pipeline runs healthily for ≥ 30 s.
 
 ## Live view
 
-The **Live** tab iframes **`http://<hostname>:6020/webrtc`** (MCM WebRTC development UI). Pick the matching stream in that UI if your MCM build does not support deep-linking by stream ID.
+The **Live** tab uses MCM's WebRTC page (`http://<hostname>:6020/webrtc`) via `mcm_webrtc_live.js`. Both quad and single-camera layouts are available.
 
 ## License
 

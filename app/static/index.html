@@ -10,16 +10,6 @@
     :root { --bg: #0d1117; --card: #161b22; --bd: #30363d; --tx: #e6edf3; --muted: #8b949e; --acc: #58a6ff; --err: #f85149; --ok: #3fb950; --warn: #d29922; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--tx); }
-    /* The page is dark, but the header is white so the brand logos read
-       cleanly. Scope all the light-on-dark overrides under `header` so the
-       rest of the UI keeps its dark palette.
-
-       Logo sizing uses fixed pixel heights instead of height:100%. Reason:
-       img height:100% inside a flex/grid container creates a circular
-       intrinsic-size loop with the img's natural 1024x155 dimensions, and
-       at wider viewports browsers resolve that loop by using the natural
-       size — which blows the header out to ~155px tall. Pixel heights are
-       deterministic and let the header be driven naturally by content. */
     header {
       padding: 0 16px;
       background: #ffffff;
@@ -39,10 +29,6 @@
       justify-self: center;
     }
     .header-logos img { display: block; height: 48px; width: auto; }
-    /* The Blue Robotics wordmark uses white text for "Robotics", which would
-       disappear on the white header. Frame just that logo in a small black
-       pill so it reads correctly. The BOM mark is dark-navy on white and
-       needs no backing. */
     .header-logos img.br-logo {
       height: 48px;
       padding: 4px 10px;
@@ -61,10 +47,6 @@
       cursor: pointer;
     }
     header nav button.active { border-color: var(--acc); color: var(--acc); }
-    /* The BlueOS extension panel iframes us at ~720-780px wide, which is too
-       narrow for the 3-column inline layout (the BR pill is wide). Use a
-       2-row grid here: logos centered on top, title-left + nav-right on the
-       second row. Much more compact than full mobile stacking. */
     @media (max-width: 1100px) {
       header {
         grid-template-columns: auto auto;
@@ -86,8 +68,6 @@
       .header-logos img,
       .header-logos img.br-logo { height: 36px; }
     }
-    /* True mobile / very narrow: title also drops to its own line. The user
-       confirmed this 3-row stack is fine at phone widths. */
     @media (max-width: 540px) {
       header {
         grid-template-columns: 1fr;
@@ -120,10 +100,6 @@
     .pill.bad { border-color: var(--err); color: var(--err); }
     .pill.warn { border-color: var(--warn); color: var(--warn); }
     .live-layout { display: flex; flex-direction: column; gap: 6px; }
-    /* Fill the remaining viewport below header + toolbar. Header is ~52px, the
-       Live toolbar ~40px, main padding 8px top + 8px bottom, plus a few px of
-       gap -> ~120px reserved for chrome. Tuned so the quad opens centered with
-       no page scroll on a typical 900+px viewport. */
     .live-stage {
       flex: 1 1 auto;
       height: calc(100vh - 120px);
@@ -208,9 +184,6 @@
       box-shadow: inset 0 0 0 1px var(--ok);
       background: #13251c;
     }
-    .expand { cursor: pointer; user-select: none; color: var(--acc); }
-    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
-    .modal { background: var(--card); border: 1px solid var(--bd); border-radius: 12px; padding: 20px; max-width: 480px; width: 92%; }
 
     @media (max-width: 900px) {
       main { padding: 10px; }
@@ -239,123 +212,24 @@
     </div>
     <nav>
       <button :class="{active: tab==='live'}" @click="tab='live'; loadStreams()">Live</button>
-      <button :class="{active: tab==='rec'}" @click="tab='rec'; loadRec()">Recordings</button>
-      <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
       <button :class="{active: tab==='cloud'}" @click="tab='cloud'; loadCloud()">Cloud</button>
+      <button :class="{active: tab==='status'}" @click="tab='status'">Status</button>
     </nav>
   </header>
   <main :class="{ 'live-open': tab === 'live' }">
     <div v-if="status.boot_error" class="banner err">
-      <strong>Recording unavailable</strong> — {{ status.boot_error }}
+      <strong>Streams unavailable</strong> — {{ status.boot_error }}
       <div class="row">
-        <button class="btn primary" @click="retryBoot">Retry boot</button>
+        <button class="btn primary" @click="retryBoot">Retry</button>
         <a class="btn" :href="mcmRoot" target="_blank" rel="noopener">Open MCM (6020)</a>
       </div>
     </div>
     <div v-else-if="status.streams_warning" class="banner warn">
-      Only {{ status.streams_count }} H264 RTSP stream(s) from MCM (you may expect up to four). Recording all available streams.
+      Only {{ status.streams_count }} H264 RTSP stream(s) from MCM (up to four expected).
     </div>
-    <div v-else-if="status.recording" class="banner ok">
-      Recording active ({{ status.streams_count }} stream<span v-if="status.streams_count!==1">s</span>).
-    </div>
-    <div v-else-if="status.boot_stage === 'standby'" class="banner">
-      <strong>Standby</strong> — auto-record on boot is off. Press <strong>Start / resume</strong> when you want to record (setting is saved on the recordings drive).
-    </div>
-    <div v-else-if="status.boot_stage && status.boot_stage !== 'recording'" class="banner">
+    <div v-else-if="status.boot_stage && status.boot_stage !== 'ready'" class="banner">
       Boot: {{ status.boot_stage }}…
     </div>
-
-    <section v-show="tab==='status'">
-      <div class="row" style="margin-bottom:12px">
-        <button class="btn" @click="stopRec" :disabled="!status.cams?.length">Stop all</button>
-        <button class="btn primary" @click="startRec" :disabled="!status.cams?.length && status.boot_error">Start / resume</button>
-        <button
-          type="button"
-          class="btn"
-          :class="{ latched: status.auto_record_on_boot !== false }"
-          :disabled="settingsSaving"
-          @click="toggleAutoRecordOnBoot"
-          :title="'Saved to ' + (status.storage?.recording_base || '') + '/.br_explorehd_dvr_settings.json'"
-        >
-          Auto-record on boot: {{ (status.auto_record_on_boot === false) ? 'OFF' : 'ON' }}
-        </button>
-        <span class="muted">Session: {{ status.session_id || '—' }}</span>
-      </div>
-      <div class="row" style="margin-bottom:12px; align-items:center">
-        <button
-          type="button"
-          class="btn"
-          :class="{ latched: status.auto_download_enabled === true }"
-          :disabled="settingsSaving"
-          @click="toggleAutoDownload"
-          title="First time you enable this, Chrome will ask permission to download multiple files. Click Allow once — after that the downloads happen silently in the background. Each tick downloads a zip of newly-finalized segments (or a status .txt if nothing new has closed)."
-        >
-          Auto-download: {{ status.auto_download_enabled ? 'ON' : 'OFF' }}
-        </button>
-        <label class="muted" style="display:flex; align-items:center; gap:6px">
-          every
-          <input
-            type="number"
-            min="1"
-            max="1440"
-            v-model.number="autoDl.interval_minutes"
-            @change="saveAutoDownloadInterval"
-            :disabled="settingsSaving"
-            style="width:64px; background:var(--card); color:var(--tx); border:1px solid var(--bd); border-radius:4px; padding:2px 6px"
-          />
-          min
-        </label>
-        <span class="muted" v-if="status.auto_download_enabled">{{ autoDl.nextLabel || 'scheduling…' }}</span>
-        <span class="muted" v-else>recordings auto-zip per interval; each zip embeds a status .txt with Pi temp / disk free / load.</span>
-      </div>
-      <div class="grid">
-        <div class="card" v-for="cam in (status.cams||[])" :key="cam.index">
-          <h3>{{ cam.name }}</h3>
-          <span class="pill" :class="{run: cam.state==='running', bad: cam.state==='failed' || cam.state==='disk_stopped'}">{{ cam.state }}</span>
-          <div class="muted" style="margin-top:8px">{{ cam.rtsp_url }}</div>
-          <div class="muted">Segment: {{ cam.current_segment || '—' }} ({{ cam.current_segment_mb }} MB)</div>
-          <div class="muted">Session total: {{ cam.session_total_mb }} MB · restarts: {{ cam.restart_count }}</div>
-          <div class="muted">gst errors: {{ cam.gst_errors }}</div>
-          <div v-if="cam.last_error" class="muted" style="color:var(--err)">{{ cam.last_error }}</div>
-          <div class="row">
-            <button class="btn" @click="restartCam(cam.index)">Restart this cam</button>
-          </div>
-        </div>
-      </div>
-      <div class="card" style="margin-top:12px">
-        <h3>System</h3>
-        <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · SD free {{ status.telemetry?.disk_free_mb }} MB</div>
-        <div class="muted">USB {{ status.storage?.usb?.mounted ? (status.storage.usb.free_mb + ' MB on ' + status.storage.usb.device) : 'not mounted' }} (usable if ≥ {{ status.storage?.usb?.min_free_gb || 5 }} GB free)</div>
-        <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
-        <div class="muted">
-          Cloud relay:
-          <span v-if="status.cloud?.enabled">
-            <span class="pill" :class="{ run: status.cloud?.running }">{{ status.cloud?.running ? 'ON' : 'starting…' }}</span>
-            {{ status.cloud?.streaming_count || 0 }}/{{ status.cloud?.total_count || 0 }} streaming
-            · {{ status.cloud?.total_restarts || 0 }} restart{{ (status.cloud?.total_restarts || 0) === 1 ? '' : 's' }}
-            <span class="muted" style="font-size:0.9rem">→ {{ status.cloud?.rtmp_base_url }}</span>
-          </span>
-          <span v-else>
-            <span class="pill">OFF</span>
-            <a href="#" @click.prevent="tab='cloud'; loadCloud()">Enable</a>
-          </span>
-        </div>
-        <div class="muted" v-if="status.disk_cleanup">
-          SSD cleanup:
-          <span v-if="status.disk_cleanup?.ssd_mounted">
-            {{ formatGB(status.disk_cleanup.free_mb) }} free of {{ formatGB(status.disk_cleanup.total_mb) }}
-            (auto-delete oldest session below {{ formatGB(status.disk_cleanup.threshold_mb) }})
-            <span v-if="(status.disk_cleanup.deleted_total || 0) > 0">
-              · {{ status.disk_cleanup.deleted_total }} session{{ status.disk_cleanup.deleted_total === 1 ? '' : 's' }} deleted total
-            </span>
-          </span>
-          <span v-else class="muted">SSD not mounted</span>
-        </div>
-      </div>
-      <div class="card" style="margin-top:12px; padding:0; overflow:hidden">
-        <img src="/static/brdvr-banner.png" alt="BR_exploreHD_DVR" style="display:block; width:100%; height:auto" />
-      </div>
-    </section>
 
     <section v-show="tab==='live'" class="live-layout">
       <div class="row live-toolbar" style="margin-bottom:4px">
@@ -378,56 +252,9 @@
           </template>
         </div>
       </div>
-      <div v-else class="banner err">No streams yet — open Status until boot finishes, or configure MCM.</div>
+      <div v-else class="banner err">No streams yet — waiting for MCM to publish H264 RTSP endpoints.</div>
       <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
       <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
-    </section>
-
-    <section v-show="tab==='rec'">
-      <div class="row" style="margin-bottom:12px">
-        <button class="btn" @click="selectAllDays">Select all</button>
-        <button class="btn" @click="clearDays">Clear</button>
-        <button class="btn primary" :disabled="!selectedDates.length" @click="downloadSelected">Download selected (.zip)</button>
-        <button class="btn danger" :disabled="!selectedDates.length" @click="openDeleteModal">Delete selected…</button>
-        <span class="muted">{{ selectionSummary }}</span>
-      </div>
-      <table>
-        <thead><tr><th style="width:36px"></th><th>Date</th><th>Size</th><th>Files</th><th>Storages</th><th></th></tr></thead>
-        <tbody>
-          <tr v-for="(d, idx) in days" :key="d.date">
-            <td>
-              <input type="checkbox" :checked="selectedSet.has(d.date)"
-                @click.prevent="onDayCheck($event, d.date, idx)" />
-            </td>
-            <td><strong>{{ d.date }}</strong> <span v-if="d.active_session_here" class="pill">active day</span></td>
-            <td>{{ fmtBytes(d.total_bytes) }}</td>
-            <td>{{ d.file_count }}</td>
-            <td class="muted">{{ (d.storages||[]).join(', ') }}</td>
-            <td>
-              <span class="expand" @click="toggleExpand(d.date)">{{ expanded[d.date] ? '▼' : '▶' }}</span>
-              <button class="btn" style="margin-left:8px" @click="downloadOneDay(d.date)">Day zip</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-for="d in days" :key="'x'+d.date">
-        <div v-if="expanded[d.date]" style="margin:8px 0 16px 24px" class="card">
-          <div v-for="s in d.sessions" :key="s.id" style="margin-bottom:10px">
-            <div class="row" style="align-items:center; gap:8px">
-              <div class="muted" style="flex:1">Session {{ s.id }} ({{ s.storage }}) — {{ fmtBytes(s.bytes) }}</div>
-              <button class="btn" @click="downloadOneSession(d.date, s)">Session zip</button>
-            </div>
-            <div v-for="c in s.cams" :key="c.name" style="margin-left:8px">
-              <div>{{ c.name }}</div>
-              <ul style="margin:4px 0; padding-left:18px">
-                <li v-for="seg in c.segments" :key="seg.name">
-                  <a :href="seg.download_url">{{ seg.name }}</a> ({{ fmtBytes(seg.size_bytes) }})
-                </li>
-              </ul>
-            </div>
-          </div>
-        </div>
-      </div>
     </section>
 
     <section v-show="tab==='cloud'">
@@ -439,7 +266,6 @@
         <p class="muted" style="margin-top:4px">
           Forwards each MCM RTSP camera to <code>{{ cloud.server?.rtmp_base_url || 'rtmp://35.83.28.160/live' }}</code>
           using one <code>ffmpeg -c:v copy -an -f flv</code> subprocess per cam.
-          Runs alongside the disk recorder and the MCM WebRTC live view; doesn't affect either.
           The destination is hardcoded — only the on/off toggle is operator-facing,
           and the toggle persists across reboots in <code>.br_explorehd_dvr_settings.json</code>.
         </p>
@@ -459,7 +285,7 @@
         </div>
       </div>
 
-      <div class="card" style="margin-bottom:12px">
+      <div class="card">
         <h3>Per-camera status</h3>
         <div v-if="!(cloud.server?.cams && cloud.server.cams.length)" class="muted">
           No streams yet — waiting for MCM to publish at least one H264 RTSP endpoint.
@@ -511,98 +337,32 @@
           </tbody>
         </table>
       </div>
-
-      <div class="card">
-        <h3>External SSD auto-cleanup</h3>
-        <p class="muted" style="margin-top:4px">
-          Deletes the oldest session directory on the external NVMe SSD whenever
-          free space drops below
-          <code>{{ formatGB(cloud.cleanup?.threshold_mb || 10240) }}</code>.
-          Active session is never touched. Internal SD card is never touched here —
-          its low-disk behaviour is handled by the recorder's separate 1 GB hard-stop.
-        </p>
-        <div v-if="cloud.cleanup?.ssd_mounted" class="row" style="gap:18px; flex-wrap:wrap; margin-top:8px">
-          <div>
-            <div class="muted">Free space</div>
-            <div style="font-size:1.4rem">
-              {{ formatGB(cloud.cleanup?.free_mb) }}
-              <span class="muted" style="font-size:0.9rem">of {{ formatGB(cloud.cleanup?.total_mb) }}</span>
-            </div>
-          </div>
-          <div>
-            <div class="muted">Threshold</div>
-            <div style="font-size:1.4rem">{{ formatGB(cloud.cleanup?.threshold_mb) }}</div>
-          </div>
-          <div>
-            <div class="muted">Sessions deleted</div>
-            <div style="font-size:1.4rem">{{ cloud.cleanup?.deleted_total || 0 }}</div>
-          </div>
-        </div>
-        <div v-else class="muted" style="margin-top:8px">External SSD not currently mounted.</div>
-        <div class="muted" v-if="cloud.cleanup?.last_deleted_session" style="margin-top:8px">
-          Last delete: <code>{{ cloud.cleanup.last_deleted_session }}</code>
-          (freed ~{{ formatGB(cloud.cleanup.last_freed_mb) }})
-          — {{ cloudTimeLabel(cloud.cleanup.last_sweep_epoch) }}
-        </div>
-        <div class="muted" v-if="cloud.cleanup?.last_error" style="color:var(--err); margin-top:4px">
-          Last error: {{ cloud.cleanup.last_error }}
-        </div>
-      </div>
     </section>
 
-    <div v-if="deleteModal" class="modal-bg" @click.self="deleteModal=false">
-      <div class="modal">
-        <h3 style="margin-top:0">Delete {{ selectedDates.length }} day(s)?</h3>
-        <p class="muted">Removes recordings under those calendar dates on SD and USB. The active session, if any, is preserved.</p>
-        <ul><li v-for="d in selectedDates" :key="d">{{ d }}</li></ul>
-        <div class="row" style="margin-top:16px">
-          <button class="btn danger" @click="confirmDelete">Delete</button>
-          <button class="btn" @click="deleteModal=false">Cancel</button>
+    <section v-show="tab==='status'">
+      <div class="card">
+        <h3>System</h3>
+        <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · clock {{ status.telemetry?.cpu_clock_mhz }} MHz</div>
+        <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
+        <div class="muted">Boot stage: {{ status.boot_stage || '—' }} · streams: {{ status.streams_count || 0 }}</div>
+        <div class="muted">
+          Cloud relay:
+          <span v-if="status.cloud?.enabled">
+            <span class="pill" :class="{ run: status.cloud?.running }">{{ status.cloud?.running ? 'ON' : 'starting…' }}</span>
+            {{ status.cloud?.streaming_count || 0 }}/{{ status.cloud?.total_count || 0 }} streaming
+            · {{ status.cloud?.total_restarts || 0 }} restart{{ (status.cloud?.total_restarts || 0) === 1 ? '' : 's' }}
+            <span class="muted" style="font-size:0.9rem">→ {{ status.cloud?.rtmp_base_url }}</span>
+          </span>
+          <span v-else>
+            <span class="pill">OFF</span>
+            <a href="#" @click.prevent="tab='cloud'; loadCloud()">Enable</a>
+          </span>
         </div>
       </div>
-    </div>
-
-    <div v-if="downloadModal.open" class="modal-bg" @click.self="closeDownloadModalIfIdle">
-      <div class="modal">
-        <h3 style="margin-top:0">
-          <span v-if="downloadModal.phase==='scanning'">Preparing download…</span>
-          <span v-else-if="downloadModal.phase==='starting'">Starting download…</span>
-          <span v-else-if="downloadModal.phase==='streaming'">Your download is in progress</span>
-          <span v-else-if="downloadModal.phase==='error'">Download failed</span>
-          <span v-else>Download</span>
-        </h3>
-        <p v-if="downloadModal.session" class="muted" style="margin-top:4px">
-          Session {{ downloadModal.session }} ({{ downloadModal.dates[0] }})
-        </p>
-        <p v-else-if="downloadModal.dates?.length" class="muted" style="margin-top:4px">
-          {{ downloadModal.dates.length }} day(s): {{ downloadModal.dates.join(', ') }}
-        </p>
-        <div v-if="downloadModal.phase==='scanning'" class="muted" style="margin:12px 0">
-          Scanning recordings on SD and USB…
-        </div>
-        <div v-else-if="downloadModal.phase==='error'" class="banner err" style="margin:12px 0">
-          {{ downloadModal.error || 'Unknown error' }}
-        </div>
-        <div v-else style="margin:12px 0">
-          <div><strong>{{ downloadModal.file_count }}</strong> files · <strong>{{ fmtBytes(downloadModal.total_bytes) }}</strong> raw</div>
-          <div class="muted" style="margin-top:4px">
-            Archive size ≈ {{ fmtBytes(downloadModal.estimated_zip_bytes || downloadModal.total_bytes) }}
-            <span v-if="downloadModal.file_count > 1">(no compression — ZIP_STORED, CPU-free)</span>
-          </div>
-          <div class="muted" style="margin-top:10px">
-            Elapsed: {{ downloadModal.elapsedLabel }}
-          </div>
-          <div v-if="downloadModal.phase==='streaming'" class="muted" style="margin-top:8px">
-            Your browser's download tray should show bytes arriving now. You can close this window; the download will continue.
-          </div>
-        </div>
-        <div class="row" style="margin-top:12px">
-          <button v-if="downloadModal.phase==='streaming'" class="btn" @click="closeDownloadModal">Close</button>
-          <button v-else-if="downloadModal.phase==='error'" class="btn" @click="closeDownloadModal">Dismiss</button>
-          <button v-else class="btn" disabled>Preparing…</button>
-        </div>
+      <div class="card" style="margin-top:12px; padding:0; overflow:hidden">
+        <img src="/static/brdvr-banner.png" alt="BR_exploreHD_DVR" style="display:block; width:100%; height:auto" />
       </div>
-    </div>
+    </section>
   </main>
 </div>
 <script src="/static/mcm_webrtc_live.js"></script>
@@ -627,21 +387,10 @@ createApp({
       _liveStarting: false,
       _liveSwitchGen: 0,
       _liveSwitchPromise: null,
-      settingsSaving: false,
-      // Auto-download (per-tab timer; localStorage cursor).
-      // Server is stateless wrt this — each open browser drives its own tick
-      // and tracks the highest segment epoch it has already downloaded.
-      autoDl: {
-        interval_minutes: 5,
-        lastEpoch: 0,
-        nextDueAt: 0,        // performance.now() ms when the next tick fires
-        nextLabel: '',       // human countdown rendered in the toolbar
-        running: false,      // a tick is in flight (preflight + click)
-      },
       // Cloud RTMP relay UI state. `form` is what the operator is editing
       // (just the on/off toggle now); `server` is the most recent
       // /cloud/status snapshot we rendered. The destination URL is hardcoded
-      // server-side, so there's nothing else to type into a form.
+      // server-side.
       cloud: {
         form: { enabled: true },
         server: {
@@ -654,70 +403,24 @@ createApp({
           total_count: 0,
           total_restarts: 0,
         },
-        cleanup: {
-          ssd_mounted: false,
-          free_mb: null,
-          total_mb: null,
-          threshold_mb: 10240,
-          last_sweep_epoch: 0,
-          last_deleted_session: null,
-          last_freed_mb: 0,
-          deleted_total: 0,
-          last_error: '',
-        },
         saving: false,
         loaded: false,
         loadError: '',
         saveError: '',
         poll: null,
       },
-      days: [],
-      expanded: {},
-      selectedDates: [],
-      selectedSet: new Set(),
-      lastDayIdx: null,
-      deleteModal: false,
-      // Download modal: 'scanning' while preflight runs, 'starting' while we
-      // poke the browser to begin the download, 'streaming' once it's underway,
-      // 'error' if preflight fails. An elapsed timer keeps the UI honest for
-      // multi-GB selections where even the scan takes a few hundred ms.
-      downloadModal: {
-        open: false,
-        phase: 'scanning',
-        dates: [],
-        session: '',
-        file_count: 0,
-        total_bytes: 0,
-        estimated_zip_bytes: 0,
-        startedAt: 0,
-        elapsedLabel: '0s',
-        error: '',
-      },
-      _downloadTimer: null,
     };
   },
   computed: {
     /**
-     * Prefer /streams from server; else status.cams if mount raced boot.
-     * Server uses MCM_BASE=http://127.0.0.1:6020 inside Docker — the browser must not load that host;
-     * rewrite loopback to the page hostname so the iframe hits the vehicle (same host as BlueOS).
+     * Prefer /streams from server; otherwise use the boot snapshot the server
+     * echoes on /status. Server uses MCM_BASE=http://127.0.0.1:6020 inside
+     * the container — the browser must not load that host; rewrite loopback
+     * to the page hostname so the iframe hits the vehicle.
      */
     liveStreams() {
       const def = 'http://' + window.location.hostname + ':6020';
-      let raw = [];
-      if (this.streams.length) {
-        raw = this.streams;
-      } else {
-        const cams = this.status.cams || [];
-        if (!cams.length) return [];
-        raw = cams.map((c) => ({
-          stream_id: c.stream_id,
-          name: c.name,
-          rtsp_url: c.rtsp_url,
-          webrtc_page: def + '/webrtc',
-          mcm_root: def,
-        }));
-      }
+      const raw = this.streams || [];
       return raw.map((s) => ({
         ...s,
         webrtc_page: this.mcmUrlForBrowser(s.webrtc_page || (def + '/webrtc')),
@@ -727,13 +430,6 @@ createApp({
     mcmRoot() {
       const s = this.liveStreams[0];
       return (s && s.mcm_root) ? s.mcm_root : ('http://' + window.location.hostname + ':6020');
-    },
-    selectionSummary() {
-      let bytes = 0, files = 0;
-      for (const d of this.days) {
-        if (this.selectedSet.has(d.date)) { bytes += d.total_bytes; files += d.file_count; }
-      }
-      return this.selectedDates.length ? `${this.selectedDates.length} day(s) · ${this.fmtBytes(bytes)} · ${files} files` : 'No days selected';
     },
   },
   watch: {
@@ -749,82 +445,19 @@ createApp({
     livePick() {
       if (this.tab === 'live' && this.liveViewMode === 'single') this.switchLiveStream();
     },
-    // Pick up server-side toggles (e.g. another browser flipped the setting,
-    // or settings_store clamped our interval) and (re)schedule accordingly.
-    'status.auto_download_enabled'(n) {
-      this.restartAutoDownloadTimer();
-    },
-    'status.auto_download_interval_minutes'(n) {
-      if (typeof n === 'number' && n >= 1 && n <= 1440) {
-        // Don't clobber a value the user is mid-typing into the input element;
-        // only sync our local copy when the user isn't actively editing.
-        if (document.activeElement?.tagName !== 'INPUT') {
-          this.autoDl.interval_minutes = n;
-        }
-        this.restartAutoDownloadTimer();
-      }
-    },
   },
   mounted() {
-    // Tell the backend our local TZ so segment timestamps and the calendar-day
-    // session directory match what the operator sees on this clock. We send on
-    // mount, on visibility change (laptop sleep can cross a TZ boundary), and
-    // when the user clicks Start/resume.
-    this.reportBrowserTz();
-    document.addEventListener('visibilitychange', this._onVisibility);
-    // Restore persistent auto-download cursor BEFORE the first tick so the
-    // timer starts from where the previous session left off.
-    try {
-      var raw = localStorage.getItem('brdvr.autoDl.lastEpoch');
-      if (raw) {
-        var n = parseFloat(raw);
-        if (!Number.isNaN(n) && n >= 0) this.autoDl.lastEpoch = n;
-      }
-    } catch (e) { /* localStorage may be disabled; non-fatal */ }
-    this._autoDlTimer = null;
-    this._autoDlCountdown = null;
-    this.tick().then(() => this.restartAutoDownloadTimer());
+    this.tick();
     this.poll = setInterval(this.tick, 2000);
     this.loadStreams();
-    // Default tab is 'live', so bring up the player right away. The tab watcher
-    // only fires on transitions, not on the initial value, so we kick it here.
     this.scheduleLiveStart();
   },
   unmounted() {
     clearInterval(this.poll);
-    if (this._autoDlTimer) clearTimeout(this._autoDlTimer);
-    if (this._autoDlCountdown) clearInterval(this._autoDlCountdown);
     if (this.cloud?.poll) clearInterval(this.cloud.poll);
-    document.removeEventListener('visibilitychange', this._onVisibility);
     this.teardownLive();
   },
   methods: {
-    // JS getTimezoneOffset returns minutes WEST of UTC (UTC-10 -> +600); we
-    // store EAST of UTC on the server (UTC-10 -> -600) so the sign matches
-    // what people read on `UTC±N` labels. Try to also pass the IANA name when
-    // available — purely informational, the offset is what drives naming.
-    async reportBrowserTz() {
-      try {
-        const offset = -new Date().getTimezoneOffset();
-        let name = null;
-        try {
-          if (Intl && Intl.DateTimeFormat) {
-            name = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
-          }
-        } catch (_) { /* not all engines expose it; offset is enough */ }
-        await fetch('/tz', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tz_offset_minutes: offset, tz_name: name }),
-        });
-      } catch (e) {
-        // Non-fatal: backend will just keep using its previous TZ guess (or
-        // device local time on a fresh install).
-      }
-    },
-    _onVisibility() {
-      if (!document.hidden) this.reportBrowserTz();
-    },
     requestFullscreenOn(el) {
       if (!el) return;
       if (el.requestFullscreen) el.requestFullscreen();
@@ -848,13 +481,6 @@ createApp({
         return 'http://' + window.location.hostname + ':6020';
       }
     },
-    fmtBytes(n) {
-      if (!n) return '0 B';
-      const u = ['B','KB','MB','GB','TB'];
-      let i = 0; let v = n;
-      while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
-      return (v<10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
-    },
     async tick() {
       try {
         const r = await fetch('/status');
@@ -869,8 +495,6 @@ createApp({
         this.streams = await r.json();
         if (this.livePick >= this.streams.length) this.livePick = 0;
         if (this.tab === 'live') {
-          // Proactively ensure MCM has live producers so the first play doesn't hit
-          // the "Stream not found in MCM WebRTC list" race after a fresh boot.
           this._ensureMcmStreamsRunning().finally(() => {
             this.$nextTick(() => this.ensureLive());
           });
@@ -898,7 +522,6 @@ createApp({
         if (!r.ok) return false;
         var data = await r.json();
         if (data && Array.isArray(data.streams) && data.streams.length) {
-          // Refresh our button list from the (now-live) MCM snapshot so names/IDs match producers.
           this.streams = data.streams;
         }
         return !!(data && data.success);
@@ -917,12 +540,9 @@ createApp({
       this.liveErr = '';
       try {
         if (this.liveViewMode === 'single') {
-          // Tear down any quad sessions first.
           this._teardownQuad();
-
           var v = this.$refs.liveVideo;
           if (!v) return;
-
           if (!this._live) {
             var self = this;
             this._live = window.McmWebRtcLive.create(v, {
@@ -933,7 +553,6 @@ createApp({
           }
           await this.switchLiveStream();
         } else {
-          // Quad: tear down single session and create up to four independent sessions.
           this._teardownSingle();
           await this._ensureQuad();
         }
@@ -944,24 +563,20 @@ createApp({
       }
     },
     async switchLiveStream() {
-      // Latest-wins + serialized. Multiple rapid calls are chained so only one
-      // playStream() is ever in flight on the shared RTCPeerConnection, and
-      // any switch whose gen has been superseded becomes a no-op.
       if (!this._live || !this.liveStreams.length) return;
       var self = this;
       var myGen = ++self._liveSwitchGen;
       var prev = self._liveSwitchPromise || Promise.resolve();
       var next = prev.then(async function () {
-        if (myGen !== self._liveSwitchGen) return;   // superseded -> skip
+        if (myGen !== self._liveSwitchGen) return;
         if (!self._live || !self.liveStreams.length) return;
         var s = self.liveStreams[self.livePick] || self.liveStreams[0];
         self.liveErr = '';
         try {
           await self._live.playStream(s.stream_id, s.name, s.rtsp_url);
         } catch (e) {
-          if (myGen !== self._liveSwitchGen) return; // superseded during await -> suppress
+          if (myGen !== self._liveSwitchGen) return;
           if (self._isStreamNotFoundErr(e)) {
-            // MCM's WebRTC producer list was empty — pipelines not running yet.
             self.liveStatus = 'Starting camera pipelines on MCM…';
             var kicked = await self._ensureMcmStreamsRunning();
             if (myGen !== self._liveSwitchGen) return;
@@ -985,16 +600,13 @@ createApp({
     },
     async _ensureQuad() {
       var self = this;
-      // Reset per-slot status/error so old failures don't linger.
       this._liveQuadStatus = ['', '', '', ''];
       this._liveQuadErr = ['', '', '', ''];
-
       var tasks = [];
       for (let i = 0; i < 4; i++) {
         const s = this.liveStreams[i];
         const videoEl = this._quadVideos[i];
         if (!s || !videoEl) {
-          // Ensure we don't keep a stale session alive for an empty/missing slot.
           if (this._liveQuad[i]) {
             try { this._liveQuad[i].close(); } catch (e) {}
           }
@@ -1019,7 +631,6 @@ createApp({
         );
       }
       await Promise.all(tasks);
-      // If any slot reported a missing producer, kick MCM once and retry those slots.
       var missing = [];
       for (var mi = 0; mi < 4; mi++) {
         if (self._liveQuadErr[mi] && self._isStreamNotFoundErr({ message: self._liveQuadErr[mi] })) {
@@ -1073,14 +684,6 @@ createApp({
       this.liveErr = '';
     },
     onLivePick(i) {
-      // Single source of truth: set state, let the reactive watchers drive the work.
-      //   - In quad mode: set livePick FIRST, then liveViewMode='single'. The
-      //     liveViewMode watcher calls ensureLive, which teardownQuad + create
-      //     _live + connect + switchLiveStream(). The livePick watcher's
-      //     switchLiveStream fires too but early-returns (no _live yet).
-      //   - In single mode: only livePick changes; its watcher calls the
-      //     serialized switchLiveStream. We do NOT also call ensureLive here,
-      //     because that would race a second playStream() on the same peer.
       if (this.liveViewMode !== 'single') {
         if (this.livePick !== i) this.livePick = i;
         this.liveViewMode = 'single';
@@ -1095,415 +698,18 @@ createApp({
         this.requestFullscreenOn(this.$refs.liveStage);
       }
     },
-    async loadRec() {
-      try {
-        const r = await fetch('/recordings');
-        const j = await r.json();
-        this.days = j.days || [];
-      } catch (e) { this.days = []; }
-    },
-    toggleExpand(date) { this.expanded[date] = !this.expanded[date]; },
-    onDayCheck(ev, date, idx) {
-      const checked = !this.selectedSet.has(date);
-      if (ev.shiftKey && this.lastDayIdx !== null) {
-        const [a,b] = [this.lastDayIdx, idx].sort((x,y)=>x-y);
-        for (let i = a; i <= b; i++) {
-          const dd = this.days[i].date;
-          if (checked) this.selectedSet.add(dd); else this.selectedSet.delete(dd);
-        }
-      } else {
-        if (checked) this.selectedSet.add(date); else this.selectedSet.delete(date);
-      }
-      this.lastDayIdx = idx;
-      this.selectedDates = this.days.filter(d => this.selectedSet.has(d.date)).map(d => d.date);
-    },
-    selectAllDays() {
-      this.selectedSet = new Set(this.days.map(d => d.date));
-      this.selectedDates = [...this.selectedSet];
-    },
-    clearDays() {
-      this.selectedSet.clear();
-      this.selectedDates = [];
-      this.lastDayIdx = null;
-    },
-    _fmtElapsed(ms) {
-      var s = Math.floor(ms / 1000);
-      if (s < 60) return s + 's';
-      var m = Math.floor(s / 60);
-      var rem = s % 60;
-      return m + 'm ' + String(rem).padStart(2, '0') + 's';
-    },
-    _startDownloadTimer() {
-      var self = this;
-      if (self._downloadTimer) clearInterval(self._downloadTimer);
-      self.downloadModal.startedAt = performance.now();
-      self.downloadModal.elapsedLabel = '0s';
-      self._downloadTimer = setInterval(function () {
-        self.downloadModal.elapsedLabel = self._fmtElapsed(performance.now() - self.downloadModal.startedAt);
-      }, 500);
-    },
-    _stopDownloadTimer() {
-      if (this._downloadTimer) {
-        clearInterval(this._downloadTimer);
-        this._downloadTimer = null;
-      }
-    },
-    closeDownloadModal() {
-      this._stopDownloadTimer();
-      this.downloadModal.open = false;
-    },
-    closeDownloadModalIfIdle() {
-      // Don't allow backdrop-click to dismiss while we're still preparing — it
-      // looks like nothing happened if the modal vanishes before the browser
-      // download tray shows up.
-      if (this.downloadModal.phase === 'streaming' || this.downloadModal.phase === 'error') {
-        this.closeDownloadModal();
-      }
-    },
-    async _beginDownload(dates, zipUrl) {
-      this.downloadModal = Object.assign({}, this.downloadModal, {
-        open: true,
-        phase: 'scanning',
-        dates: dates.slice(),
-        session: '',
-        file_count: 0,
-        total_bytes: 0,
-        estimated_zip_bytes: 0,
-        error: '',
-      });
-      this._startDownloadTimer();
-      try {
-        const r = await fetch('/recordings/download_info', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dates: dates }),
-        });
-        const j = await r.json();
-        if (!r.ok || !j.success) {
-          this.downloadModal.phase = 'error';
-          this.downloadModal.error = (j && j.message) || ('HTTP ' + r.status);
-          return;
-        }
-        this.downloadModal.file_count = j.file_count;
-        this.downloadModal.total_bytes = j.total_bytes;
-        this.downloadModal.estimated_zip_bytes = j.estimated_zip_bytes;
-        if (!j.file_count) {
-          this.downloadModal.phase = 'error';
-          this.downloadModal.error = 'No recordings found for those dates.';
-          return;
-        }
-        this.downloadModal.phase = 'starting';
-        // Let Vue flush the "starting" state, then navigate via a hidden <a>.
-        // The browser takes over: streaming download, progress in the tray,
-        // resumable if the server supports it. We don't buffer anything in JS.
-        await this.$nextTick();
-        const a = document.createElement('a');
-        a.href = zipUrl;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        // Give the browser a moment to actually kick off the request before we
-        // flip to 'streaming'. This is cosmetic; the request is already in flight.
-        setTimeout(() => {
-          if (this.downloadModal.open && this.downloadModal.phase === 'starting') {
-            this.downloadModal.phase = 'streaming';
-          }
-        }, 600);
-      } catch (e) {
-        this.downloadModal.phase = 'error';
-        this.downloadModal.error = (e && e.message) ? e.message : String(e);
-      }
-    },
-    downloadOneDay(date) {
-      this._beginDownload([date], '/download_day/' + encodeURIComponent(date));
-    },
-    /**
-     * Per-session download. We already know the session's file_count/bytes
-     * from /recordings, so we skip the preflight POST and go straight to
-     * 'starting' — the user gets visible feedback immediately. The backend
-     * short-circuits to the pre-built <sessionId>.zip when one exists, so
-     * for completed sessions this is essentially a direct file send.
-     */
-    async downloadOneSession(date, sess) {
-      this.downloadModal = Object.assign({}, this.downloadModal, {
-        open: true,
-        phase: 'starting',
-        dates: [date],
-        session: sess.id,
-        file_count: sess.file_count || 0,
-        total_bytes: sess.bytes || 0,
-        estimated_zip_bytes: sess.bytes || 0,
-        error: '',
-      });
-      this._startDownloadTimer();
-      const zipUrl = '/download_session/' + encodeURIComponent(date) + '/' + encodeURIComponent(sess.id);
-      await this.$nextTick();
-      const a = document.createElement('a');
-      a.href = zipUrl;
-      a.style.display = 'none';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => {
-        if (this.downloadModal.open && this.downloadModal.phase === 'starting') {
-          this.downloadModal.phase = 'streaming';
-        }
-      }, 600);
-    },
-    downloadSelected() {
-      if (!this.selectedDates.length) return;
-      const qs = this.selectedDates.map(function (d) { return 'd=' + encodeURIComponent(d); }).join('&');
-      this._beginDownload(this.selectedDates.slice(), '/download_days?' + qs);
-    },
-    openDeleteModal() { this.deleteModal = true; },
-    async confirmDelete() {
-      const r = await fetch('/recordings/delete', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ dates: this.selectedDates }),
-      });
-      const j = await r.json();
-      this.deleteModal = false;
-      this.clearDays();
-      await this.loadRec();
-      var msgs = [];
-      if (j.partial?.length) {
-        msgs.push('Kept the active session on: ' + j.partial.map(function (p) { return p.date; }).join(', '));
-      }
-      // "not found" and "only active session present" are not worth surfacing as errors.
-      var realSkips = (j.skipped || []).filter(function (s) {
-        return s.reason && s.reason !== 'not found' && s.reason !== 'only active session present';
-      });
-      if (realSkips.length) msgs.push('Some days skipped: ' + JSON.stringify(realSkips));
-      if (msgs.length) alert(msgs.join('\n'));
-    },
-    async toggleAutoRecordOnBoot() {
-      var cur = this.status.auto_record_on_boot !== false;
-      this.settingsSaving = true;
-      try {
-        const r = await fetch('/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_record_on_boot: !cur }),
-        });
-        const j = await r.json();
-        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
-        await this.tick();
-      } catch (e) {
-        alert((e && e.message) ? e.message : String(e));
-      } finally {
-        this.settingsSaving = false;
-      }
-    },
-    /**
-     * Click handler for the "Auto-download: ON/OFF" button.
-     *
-     * CRITICAL: when turning ON, the warm-up download MUST fire BEFORE any
-     * `await`. Once the function awaits, the JS task ends and Chrome no
-     * longer treats subsequent code as inside the user-gesture stack frame —
-     * meaning the very first programmatic download would be silently blocked.
-     * Firing _autoDlClickHidden() synchronously here guarantees Chrome counts
-     * this as a real user-gesture download (the first one is always allowed),
-     * which gives the operator immediate feedback (a status .txt download)
-     * and primes the origin so the next periodic tick triggers Chrome's
-     * "Allow multiple downloads from this site?" prompt instead of being
-     * dropped on the floor.
-     */
-    toggleAutoDownload() {
-      var turningOn = !this.status.auto_download_enabled;
-      if (turningOn) {
-        this._autoDlClickHidden('/auto_download_zip?warmup=1');
-      }
-      this._persistAutoDownload(turningOn);
-    },
-    async _persistAutoDownload(enabled) {
-      this.settingsSaving = true;
-      try {
-        const r = await fetch('/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_download_enabled: !!enabled }),
-        });
-        const j = await r.json();
-        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
-        await this.tick();
-        this.restartAutoDownloadTimer();
-      } catch (e) {
-        alert((e && e.message) ? e.message : String(e));
-      } finally {
-        this.settingsSaving = false;
-      }
-    },
-    async saveAutoDownloadInterval() {
-      var n = parseInt(this.autoDl.interval_minutes, 10);
-      if (!Number.isFinite(n) || n < 1) n = 1;
-      if (n > 1440) n = 1440;
-      this.autoDl.interval_minutes = n;
-      this.settingsSaving = true;
-      try {
-        const r = await fetch('/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_download_interval_minutes: n }),
-        });
-        const j = await r.json();
-        if (!r.ok || !j.success) throw new Error((j && j.message) || 'Save failed');
-        await this.tick();
-        this.restartAutoDownloadTimer();
-      } catch (e) {
-        alert((e && e.message) ? e.message : String(e));
-      } finally {
-        this.settingsSaving = false;
-      }
-    },
-    /** Cancel any pending tick and (re)start it if auto-download is on. */
-    restartAutoDownloadTimer() {
-      if (this._autoDlTimer) {
-        clearTimeout(this._autoDlTimer);
-        this._autoDlTimer = null;
-      }
-      if (this._autoDlCountdown) {
-        clearInterval(this._autoDlCountdown);
-        this._autoDlCountdown = null;
-      }
-      this.autoDl.nextLabel = '';
-      if (!this.status.auto_download_enabled) return;
-      var minutes = this.autoDl.interval_minutes;
-      if (typeof minutes !== 'number' || !(minutes >= 1)) {
-        minutes = this.status.auto_download_interval_minutes || 5;
-      }
-      var ms = Math.max(1, Math.floor(minutes)) * 60 * 1000;
-      this.autoDl.nextDueAt = performance.now() + ms;
-      this._autoDlTimer = setTimeout(() => this._onAutoDlTick(), ms);
-      var self = this;
-      this._autoDlCountdown = setInterval(function () {
-        var remain = Math.max(0, self.autoDl.nextDueAt - performance.now());
-        var s = Math.ceil(remain / 1000);
-        var m = Math.floor(s / 60);
-        var rem = s % 60;
-        self.autoDl.nextLabel = 'Next download in ' + m + 'm ' + String(rem).padStart(2, '0') + 's';
-      }, 1000);
-    },
-    async _onAutoDlTick() {
-      this._autoDlTimer = null;
-      try {
-        await this.runAutoDownloadTick();
-      } catch (e) {
-        console.warn('auto-download tick failed:', e);
-      } finally {
-        // Reschedule regardless of success/failure so a transient error
-        // doesn't silently kill the recurring schedule.
-        if (this.status.auto_download_enabled) {
-          this.restartAutoDownloadTimer();
-        }
-      }
-    },
-    /**
-     * Periodic tick: ask the server what the latest closed segment is, advance
-     * the localStorage cursor, then trigger the actual download via a hidden
-     * `<a>` click so the bytes never pass through JS memory.
-     *
-     * Chrome can't expose response headers from a hidden-`<a>` download to JS,
-     * so we use the small JSON `/auto_download_zip/info` companion endpoint to
-     * learn `latest_epoch` reliably and update the cursor. Cursor advances
-     * even when no new segments were waiting (server returns a status .txt)
-     * so the cursor stays meaningful and we never re-download nothing.
-     */
-    async runAutoDownloadTick() {
-      if (this.autoDl.running) return;
-      this.autoDl.running = true;
-      try {
-        var since = this.autoDl.lastEpoch || 0;
-        var url = '/auto_download_zip?since=' + encodeURIComponent(since);
-        var r;
-        try {
-          r = await fetch('/auto_download_zip/info?since=' + encodeURIComponent(since));
-        } catch (e) {
-          // Network blip — skip this tick; the next one will retry.
-          console.warn('auto-download info fetch failed:', e);
-          return;
-        }
-        var info = null;
-        if (r.ok) {
-          try { info = await r.json(); } catch (_) { info = null; }
-        }
-        // Trigger the download (zip if has_new, otherwise status .txt).
-        // No user gesture here — relies on the multi-download permission
-        // having been granted via the warm-up flow.
-        this._autoDlClickHidden(url);
-        if (info && typeof info.latest_epoch === 'number') {
-          // Advance the cursor to the highest segment epoch we just shipped.
-          // If has_new is false, latest_epoch == since, so this is a no-op.
-          this.autoDl.lastEpoch = info.latest_epoch;
-          try {
-            localStorage.setItem('brdvr.autoDl.lastEpoch', String(info.latest_epoch));
-          } catch (_) { /* non-fatal */ }
-        }
-      } finally {
-        this.autoDl.running = false;
-      }
-    },
-    /**
-     * Trigger a download by synthesizing a hidden `<a>` element and clicking
-     * it. Browser handles the actual byte streaming (resumable, progress in
-     * the native download tray, never buffered in JS memory). Same idiom
-     * already used by `_beginDownload` for the manual day/session flow.
-     */
-    _autoDlClickHidden(url) {
-      var a = document.createElement('a');
-      a.href = url;
-      a.style.display = 'none';
-      // No `download` attribute: we rely on the server's Content-Disposition
-      // so the suggested filename includes the timestamp the file was built
-      // with (matching the timestamp the server burns into the header line
-      // of the status .txt and the segment names inside the zip).
-      document.body.appendChild(a);
-      try {
-        a.click();
-      } finally {
-        document.body.removeChild(a);
-      }
-    },
-    async stopRec() { await fetch('/stop', { method: 'POST' }); this.tick(); },
-    async startRec() {
-      // Send our TZ first so the new session directory and any segment
-      // rolls happen in the operator's local time on the very first tick.
-      await this.reportBrowserTz();
-      await fetch('/start', { method: 'POST' });
-      this.tick();
-      this.loadStreams();
-    },
-    async restartCam(i) { await fetch('/cam/' + i + '/restart', { method: 'POST' }); },
     async retryBoot() {
       await fetch('/boot/retry', { method: 'POST' });
       this.tab = 'status';
     },
-    // ---- Cloud RTMP relay & SSD cleanup -----------------------------------
-    /** Format an MB number as "X GB" (or "—" when null/undefined). The Cloud
-     *  tab shows free space and thresholds in GB across the board; the
-     *  fmtBytes helper would render those as "9.5 GiB" which is misleading
-     *  here because the underlying values are decimal-MB from statvfs. */
-    formatGB(mb) {
-      if (mb == null || isNaN(mb)) return '—';
-      const gb = mb / 1024;
-      if (gb < 1) return Math.round(mb) + ' MB';
-      return (gb < 10 ? gb.toFixed(1) : Math.round(gb)) + ' GB';
-    },
-    /** Snapshot the /cloud/status payload into our local state. */
+    // ---- Cloud RTMP relay -------------------------------------------------
     _applyCloudPayload(payload) {
       if (!payload || typeof payload !== 'object') return;
       if (payload.cloud) {
         this.cloud.server = Object.assign(this.cloud.server, payload.cloud);
-        // The toggle in the UI mirrors the persisted setting; only the
-        // toggle button writes back to the server, so we keep `form.enabled`
-        // in sync with the latest payload.
         if (typeof payload.cloud.enabled === 'boolean') {
           this.cloud.form.enabled = payload.cloud.enabled;
         }
-      }
-      if (payload.disk_cleanup) {
-        this.cloud.cleanup = Object.assign(this.cloud.cleanup, payload.disk_cleanup);
       }
       this.cloud.loaded = true;
     },
@@ -1521,9 +727,6 @@ createApp({
     startCloudPolling() {
       if (this.cloud.poll) return;
       this.loadCloud();
-      // 2 s on the Cloud tab so per-cam state and SSD free space feel live
-      // without hammering the recorder host. The periodic /status poll
-      // already keeps the Status-tab summary fresh elsewhere.
       this.cloud.poll = setInterval(() => this.loadCloud(), 2000);
     },
     stopCloudPolling() {
@@ -1554,27 +757,6 @@ createApp({
         this.cloud.saving = false;
       }
       await this.loadCloud();
-    },
-    cloudTimeLabel(epoch) {
-      if (!epoch) return '—';
-      try {
-        const d = new Date(epoch * 1000);
-        return d.toLocaleTimeString();
-      } catch (_) {
-        return String(epoch);
-      }
-    },
-    /** Format a seconds-remaining number as "1h 5m", "23m 14s", or "47s". */
-    formatEta(secs) {
-      if (secs == null) return '—';
-      const s = Math.max(0, Math.round(secs));
-      if (s < 60) return s + 's';
-      const m = Math.floor(s / 60);
-      const sr = s % 60;
-      if (m < 60) return m + 'm ' + sr + 's';
-      const h = Math.floor(m / 60);
-      const mr = m % 60;
-      return h + 'h ' + mr + 'm';
     },
   },
 }).mount('#app');
