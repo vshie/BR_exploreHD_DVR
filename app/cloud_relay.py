@@ -6,7 +6,7 @@ don't carry useful audio and the receiving service is video-only.
 
 Equivalent shell command per cam:
 
-    ffmpeg -rtsp_transport udp -stimeout 5000000 -i <rtsp_url_from_mcm> \\
+    ffmpeg -rtsp_transport tcp -stimeout 5000000 -i <rtsp_url_from_mcm> \\
            -c:v copy -an -f flv rtmp://35.83.28.160/live/bom_cam0N
 
 Design notes
@@ -14,9 +14,19 @@ Design notes
 
   - Per-cam Relay object owns a Popen and a watchdog thread; a RelayManager
     orchestrates start/stop for the whole fleet.
+  - RTSP transport is **TCP** (RTP-over-RTSP-interleaved), not UDP.
+    Every cloud-relay ffmpeg reads MCM's RTSP over loopback
+    (`rtsp://127.0.0.1:8554/...`) at the same time as the browser's
+    WebRTC Live view is reading the same streams — up to eight
+    concurrent RTSP consumers on 127.0.0.1. On loopback, TCP costs
+    effectively nothing (no physical medium, no HOL blocking of a
+    real link, memcpy-only) while UDP can drop RTP packets at the
+    kernel receive buffer under that concurrency before anything
+    ever leaves the vessel. TCP eliminates that class of on-box
+    loss for the price of a slightly larger per-packet framing.
   - `-stimeout 5000000` (5 s, in microseconds) makes ffmpeg exit
     promptly when the RTSP source goes silent (Wi-Fi blip, MCM stall),
-    instead of hanging on the kernel's much longer TCP/UDP timeouts.
+    instead of hanging on the kernel's much longer TCP timeouts.
     See `RTSP_RW_TIMEOUT_FLAG` below for the ffmpeg-version-compat
     notes — the bundled image ships ffmpeg 4.x where this option is
     `-stimeout`, not `-rw_timeout`.
@@ -81,9 +91,9 @@ RECONNECT_JITTER_S = 2.0
 HEALTHY_RUN_S = 30.0
 
 # RTSP socket I/O timeout passed to ffmpeg so that a dead RTSP link
-# (no packets arriving from MCM because the upstream Wi-Fi/Ethernet
-# went down) makes ffmpeg exit within a few seconds instead of hanging
-# on the kernel's much longer TCP/UDP timeouts. Value is microseconds.
+# (MCM stopped publishing, camera unplugged) makes ffmpeg exit within a
+# few seconds instead of hanging on the kernel's much longer TCP
+# timeout. Value is microseconds.
 # 5 s is short enough that the watchdog notices outages quickly, long
 # enough that an unloaded but slow link doesn't false-trip.
 #
@@ -218,7 +228,13 @@ class Relay:
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "warning",
-            "-rtsp_transport", "udp",
+            # TCP for the local RTSP hop. See module docstring for why:
+            # with 4 cloud-relay ffmpegs + up to 4 WebRTC readers all
+            # reading MCM over 127.0.0.1, UDP can drop RTP packets at
+            # the kernel socket buffer before they even leave the box.
+            # Loopback TCP has essentially zero cost and eliminates
+            # that class of on-box loss.
+            "-rtsp_transport", "tcp",
             # RTSP socket I/O timeout. See RTSP_RW_TIMEOUT_FLAG above
             # for why this is `-stimeout` (ffmpeg 4.x) and not
             # `-rw_timeout` (5.x+). Without this, a dead uplink can

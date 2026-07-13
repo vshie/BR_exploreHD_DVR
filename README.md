@@ -89,7 +89,7 @@ What each piece does:
 Per cam, the extension spawns:
 
 ```
-ffmpeg -rtsp_transport udp \
+ffmpeg -rtsp_transport tcp \
        -stimeout 5000000 \
        -i <rtsp_url_from_mcm> \
        -c:v copy -an -f flv \
@@ -97,6 +97,8 @@ ffmpeg -rtsp_transport udp \
 ```
 
 `-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio. `-stimeout 5000000` is a 5 s socket I/O timeout on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on kernel timeouts. The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob. The toggle persists in `.br_explorehd_dvr_settings.json` under the bind mount so it survives container/image rebuilds.
+
+**RTSP transport is TCP** (RTP-over-RTSP-interleaved). Every cloud-relay ffmpeg reads MCM's RTSP over loopback (`rtsp://127.0.0.1:8554/...`) at the same time as the browser's WebRTC Live view is reading the same streams — up to eight concurrent RTSP consumers on `127.0.0.1`. On loopback, TCP costs effectively nothing (no physical medium, no HOL blocking of a real link, memcpy-only cost) while UDP can drop RTP packets at the kernel receive buffer under that concurrency before anything ever leaves the vessel. TCP eliminates that class of on-box loss for the price of a slightly larger per-packet framing.
 
 ### Reconnect strategy
 
