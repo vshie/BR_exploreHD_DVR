@@ -38,11 +38,17 @@ Design notes
   - Separate (longer) backoff schedule kicks in when the upstream RTMP
     server reports `Already publishing`; see STALE_PUBLISHER_BACKOFF_*
     below.
-  - The destination URL and the cam-index → stream-key mapping are
-    HARDCODED per the project requirement that there is no
-    per-deployment knob for the RTMP destination — only an
-    enable/disable toggle. Add a new key here if a 5th camera is ever
-    introduced.
+  - The destination RTMP server URL is HARDCODED per the project
+    requirement that there is no per-deployment knob for the RTMP
+    destination — only an enable/disable toggle.
+  - The per-cam stream KEY is derived from the stream's NAME as
+    configured in BlueOS/MCM: the number embedded in the name selects
+    the `bom_camNN` bucket (e.g. a stream named "... 5" publishes to
+    `bom_cam05`). This lets two vessels whose cameras are numbered 1-4
+    and 5-8 respectively publish to distinct, non-colliding keys on the
+    shared receiver — without any per-deployment configuration. Streams
+    whose name has no number fall back to the legacy positional map
+    (list index 0..3 → `bom_cam01..bom_cam04`).
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import signal
 import subprocess
 import threading
@@ -59,10 +66,24 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Hardcoded cloud destination. The RTMP server URL never varies between
-# installs, and the per-cam stream keys map cam index 0..3 onto the
-# bom_cam01..bom_cam04 buckets the receiving service is provisioned for.
+# installs.
 RTMP_BASE_URL = "rtmp://35.83.28.160/live"
+
+# The per-cam stream KEY is `<prefix><NN>` where NN is the number parsed
+# from the stream's BlueOS/MCM name, zero-padded to RTMP_STREAM_KEY_PAD
+# digits. A stream named "... 5" → `bom_cam05`; two vessels numbered 1-4
+# and 5-8 therefore publish to disjoint key sets on the shared receiver.
+RTMP_STREAM_KEY_PREFIX = "bom_cam"
+RTMP_STREAM_KEY_PAD = 2
+
+# Legacy positional fallback, used ONLY for streams whose name has no
+# parseable number: list index 0..3 → bom_cam01..bom_cam04.
 RTMP_STREAM_KEYS: List[str] = ["bom_cam01", "bom_cam02", "bom_cam03", "bom_cam04"]
+
+# Matches a run of digits anywhere in the stream name. We take the LAST
+# match (see `_stream_number_from_name`) so names like "exploreHD 5",
+# "cam5", "1080p Front 5" all resolve to camera number 5.
+_STREAM_NUMBER_RE = re.compile(r"\d+")
 
 # Watchdog cadence and respawn backoff. The values below were chosen to
 # match the receiving RTMP service's published recommendations:
@@ -154,15 +175,54 @@ _STALE_PUBLISHER_PATTERNS: List[str] = [
 ]
 
 
+def _stream_number_from_name(name: Optional[str]) -> Optional[int]:
+    """Extract the camera number from a BlueOS/MCM stream name.
+
+    Returns the LAST run of digits in the name as an int (so "exploreHD 5",
+    "cam5", and "1080p Front 5" all yield 5), or None if the name contains
+    no digits. Taking the last run avoids being fooled by resolution/codec
+    tokens that may precede the operator's camera number.
+    """
+    if not name:
+        return None
+    matches = _STREAM_NUMBER_RE.findall(str(name))
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _stream_key_for_number(n: int) -> str:
+    return f"{RTMP_STREAM_KEY_PREFIX}{n:0{RTMP_STREAM_KEY_PAD}d}"
+
+
 def _stream_key_for_index(cam_index: int) -> Optional[str]:
     if 0 <= cam_index < len(RTMP_STREAM_KEYS):
         return RTMP_STREAM_KEYS[cam_index]
     return None
 
 
-def _rtmp_url_for_index(cam_index: int) -> Optional[str]:
-    key = _stream_key_for_index(cam_index)
-    if key is None:
+def _stream_key_for_stream(cam_index: int, stream: Dict[str, Any]) -> Optional[str]:
+    """Pick the RTMP stream key for a cam.
+
+    Preference order:
+      1. The number parsed from the stream's BlueOS-configured NAME, e.g.
+         a stream named "... 5" → bom_cam05. This is the primary path and
+         is what lets a vessel with cameras named 5-8 publish to
+         bom_cam05..bom_cam08.
+      2. Legacy positional fallback (list index 0..3 → bom_cam01..bom_cam04),
+         used only when the name has no number.
+    """
+    n = _stream_number_from_name((stream or {}).get("name"))
+    if n is not None and n > 0:
+        return _stream_key_for_number(n)
+    return _stream_key_for_index(cam_index)
+
+
+def _rtmp_url_for_key(key: Optional[str]) -> Optional[str]:
+    if not key:
         return None
     return f"{RTMP_BASE_URL}/{key}"
 
@@ -173,8 +233,8 @@ class Relay:
     def __init__(self, index: int, stream: Dict[str, Any]):
         self.index = index
         self.stream = stream
-        self.stream_key = _stream_key_for_index(index) or ""
-        self.rtmp_url = _rtmp_url_for_index(index) or ""
+        self.stream_key = _stream_key_for_stream(index, stream) or ""
+        self.rtmp_url = _rtmp_url_for_key(self.stream_key) or ""
 
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
@@ -562,6 +622,30 @@ class RelayManager:
         self.relays: List[Relay] = []
         for i, s in enumerate(streams):
             self.relays.append(Relay(i, s))
+        # Surface name→key collisions loudly: two MCM streams whose names
+        # resolve to the same number (or two number-less streams sharing a
+        # positional fallback key) would both publish to the same bom_camNN
+        # bucket and fight over the RTMP publisher slot ("Already
+        # publishing" forever). This is an operator misconfiguration in
+        # BlueOS, so we log it rather than silently remap.
+        seen: Dict[str, int] = {}
+        for r in self.relays:
+            if not r.stream_key:
+                continue
+            if r.stream_key in seen:
+                logger.error(
+                    "Cloud relay: stream key %r is claimed by both cam %d "
+                    "(%r) and cam %d (%r) — both will publish to the same "
+                    "RTMP bucket and collide. Rename the streams in BlueOS "
+                    "so each maps to a distinct number.",
+                    r.stream_key,
+                    seen[r.stream_key],
+                    self.relays[seen[r.stream_key]].stream.get("name"),
+                    r.index,
+                    r.stream.get("name"),
+                )
+            else:
+                seen[r.stream_key] = r.index
 
     def start_all(self):
         if not self.relays:
@@ -677,7 +761,11 @@ def status() -> Dict[str, Any]:
         "enabled": enabled,
         "running": running,
         "rtmp_base_url": RTMP_BASE_URL,
-        "stream_keys": list(RTMP_STREAM_KEYS),
+        # Actual per-cam keys in use (name-derived), falling back to the
+        # legacy positional list when no relay manager is running yet.
+        "stream_keys": (
+            [c.get("stream_key") for c in cams] if cams else list(RTMP_STREAM_KEYS)
+        ),
         "cams": cams,
         "streaming_count": streaming,
         "waiting_for_rtmp_release_count": waiting,

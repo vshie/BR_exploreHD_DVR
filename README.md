@@ -96,7 +96,15 @@ ffmpeg -rtsp_transport tcp \
        rtmp://35.83.28.160/live/bom_cam0N
 ```
 
-`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio. `-stimeout 5000000` is a 5 s socket I/O timeout on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on kernel timeouts. The destination URL and the `bom_cam01..bom_cam04` stream-key mapping are intentionally hardcoded; on/off is the only operator-facing knob. The toggle persists in `.br_explorehd_dvr_settings.json` under the bind mount so it survives container/image rebuilds.
+`-c:v copy` means **no re-encoding** — the relay is essentially free CPU-wise and just remuxes the existing H.264 elementary stream into FLV/RTMP. `-an` drops audio. `-stimeout 5000000` is a 5 s socket I/O timeout on the RTSP input, so a dead uplink causes ffmpeg to exit promptly instead of hanging on kernel timeouts. The destination RTMP server URL is intentionally hardcoded; on/off is the only operator-facing knob. The toggle persists in `.br_explorehd_dvr_settings.json` under the bind mount so it survives container/image rebuilds.
+
+### Stream-key mapping (name-driven)
+
+The per-camera RTMP **stream key** is derived from the **stream name you configure in BlueOS/MCM**: the number in the name selects the `bom_camNN` bucket (zero-padded to two digits). So a stream named `... 5` publishes to `bom_cam05`. This means a vessel whose cameras are named/numbered **5–8** publishes to `bom_cam05..bom_cam08`, while a vessel numbered **1–4** publishes to `bom_cam01..bom_cam04` — no per-deployment configuration, and no key collisions on a shared receiver.
+
+- The **last** run of digits in the name is used (`exploreHD 5`, `cam5`, `1080p Front 5` all → `05`).
+- A stream whose name has **no number** falls back to its list position (`0..3 → bom_cam01..bom_cam04`).
+- If two streams resolve to the **same** number, both would fight over one RTMP publisher slot; the extension logs an error naming the offending streams so you can rename them in BlueOS.
 
 **RTSP transport is TCP** (RTP-over-RTSP-interleaved). Every cloud-relay ffmpeg reads MCM's RTSP over loopback (`rtsp://127.0.0.1:8554/...`) at the same time as the browser's WebRTC Live view is reading the same streams — up to eight concurrent RTSP consumers on `127.0.0.1`. On loopback, TCP costs effectively nothing (no physical medium, no HOL blocking of a real link, memcpy-only cost) while UDP can drop RTP packets at the kernel receive buffer under that concurrency before anything ever leaves the vessel. TCP eliminates that class of on-box loss for the price of a slightly larger per-packet framing.
 
