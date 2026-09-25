@@ -1,6 +1,25 @@
 # BR_exploreHD_DVR
 
-BlueOS extension for a **Raspberry Pi 5** used as a **multi-camera cloud uplink** (e.g. four [exploreHD](https://bluerobotics.com/store/sensors-cameras/cameras/deepwater-exploration-explorehd-usb-camera/) USB cameras). Reads **MAVLink Camera Manager (MCM)** **H.264 RTSP** endpoints and pushes each one to a hardcoded RTMP cloud endpoint via `ffmpeg -c:v copy` (no re-encode). Also serves an in-browser **Live** view via MCM's WebRTC page.
+BlueOS extension for a **Raspberry Pi 5** used as a **multi-camera cloud uplink**.
+
+## Branch: `qoocam` (this testing line)
+
+On **`qoocam`**, the extension **does not use MCM / BlueOS Video Streams**. It pulls H.264 directly from the QooCam 8K Enterprise RTSP URL and `ffmpeg -c:v copy` relays to the hardcoded RTMP endpoint.
+
+| Setting | Default |
+|---------|---------|
+| Source | Discovered on BlueOS eth0 DHCP (`192.168.2.101–200`) by MAC `70:65:a3:11:36:b0` / RTSP `Server: QooCam`. Optional override: `QOOCAM_RTSP_URL`, `QOOCAM_MAC`. |
+| Stream name | `QooCam 9` → RTMP key `bom_cam09` (`QOOCAM_STREAM_NAME`) |
+| Version | `1.1.0-qoocam` |
+| Docker tag after push | `qoocam` |
+
+Keep the camera on **Live** with Ethernet; no MCM stream entry is required. In-browser Live WebRTC still expects MCM and will not preview the QooCam — use VLC or the Cloud tab for uplink status.
+
+---
+
+## Branch: `main` (exploreHD / MCM)
+
+On **`main`**, the extension reads **MAVLink Camera Manager (MCM)** **H.264 RTSP** endpoints and pushes each one to a hardcoded RTMP cloud endpoint via `ffmpeg -c:v copy` (no re-encode). Also serves an in-browser **Live** view via MCM's WebRTC page.
 
 **Cloud-only build.** Disk recording, USB storage, and downloads have been removed; the extension is a thin RTMP relay + Live viewer.
 

@@ -1,6 +1,6 @@
 """
-BR_exploreHD_DVR — BlueOS extension: relay MCM H264 RTSP streams to a hardcoded
-RTMP endpoint. Cloud-only build (no disk recording).
+BR_exploreHD_DVR (qoocam branch) — relay direct QooCam H264 RTSP to a hardcoded
+RTMP endpoint. No MCM / BlueOS Video Streams. Cloud-only build.
 """
 
 from __future__ import annotations
@@ -8,15 +8,14 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request, send_file
 
 import cloud_relay
 from boot_manager import run_boot_sequence
-from mcm_client import DEFAULT_MCM_BASE, fetch_streams_raw, kick_streams, list_h264_rtsp_streams
 from settings_store import load_settings, save_settings
+from stream_sources import list_direct_h264_rtsp_streams
 from system_telemetry import get_all_telemetry
 
 logging.basicConfig(level=logging.INFO)
@@ -25,9 +24,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.42"
+VERSION = "1.1.0-qoocam"
 
-MCM_BASE = os.environ.get("MCM_BASE", DEFAULT_MCM_BASE).rstrip("/")
 
 _boot_lock = threading.Lock()
 _state_lock = threading.Lock()
@@ -44,23 +42,22 @@ def _set_boot_stage(stage: str) -> None:
 
 
 def _current_streams_snapshot() -> List[Dict[str, Any]]:
-    """Provider callback for cloud_relay: hand back the latest MCM stream list
-    so a toggle-on after boot doesn't need to re-run the boot sequence."""
+    """Provider callback for cloud_relay: latest direct-source stream list."""
     with _state_lock:
         return list(streams_snapshot)
 
 
 def _start_cloud_from_boot_streams(streams: List[Dict[str, Any]]) -> None:
-    """Cloud fast-path: start RTMP as soon as MCM lists streams."""
+    """Start RTMP as soon as direct RTSP sources are reachable."""
     global streams_snapshot
     with _state_lock:
         streams_snapshot = list(streams)
     try:
         cloud_relay.configure(_current_streams_snapshot)
         cloud_relay.start_if_enabled()
-        logger.info("Cloud relay started on MCM fast-path (%d stream(s))", len(streams))
+        logger.info("Cloud relay started on direct RTSP (%d stream(s))", len(streams))
     except Exception:
-        logger.exception("Cloud relay failed to start on MCM fast-path")
+        logger.exception("Cloud relay failed to start on direct RTSP")
 
 
 def _boot_worker():
@@ -68,7 +65,7 @@ def _boot_worker():
     with _boot_lock:
         try:
             streams, err, stage = run_boot_sequence(
-                MCM_BASE,
+                "",
                 on_stage=_set_boot_stage,
                 on_streams=_start_cloud_from_boot_streams,
             )
@@ -79,9 +76,6 @@ def _boot_worker():
             if err:
                 logger.error(err)
                 return
-            # Idempotent: on_streams already started the relay. This covers the
-            # case where the relay was disabled at boot and gets toggled on
-            # later — same provider is already configured.
             try:
                 cloud_relay.configure(_current_streams_snapshot)
                 cloud_relay.start_if_enabled()
@@ -113,11 +107,11 @@ def register_service():
     return jsonify(
         {
             "name": "BR_exploreHD_DVR",
-            "description": "Cloud RTMP relay + Live view for exploreHD / MCM RTSP streams",
+            "description": "Cloud RTMP relay for direct QooCam H264 RTSP (no MCM)",
             "icon": "mdi-cloud-upload",
             "company": "Blue Robotics",
             "version": VERSION,
-            "webpage": "https://github.com/bluerobotics",
+            "webpage": "https://github.com/vshie/BR_exploreHD_DVR",
             "api": "",
         }
     )
@@ -130,7 +124,6 @@ def route_status():
         err = boot_error
         stage = boot_stage
     telem = get_all_telemetry()
-    warn_streams = len(snap) > 0 and len(snap) < 4
     try:
         cloud_summary = cloud_relay.summary()
     except Exception:
@@ -149,7 +142,8 @@ def route_status():
             "boot_stage": stage,
             "boot_error": err,
             "streams_count": len(snap),
-            "streams_warning": warn_streams,
+            "streams_warning": False,
+            "ingest": "direct-qoocam",
             "telemetry": telem,
             "cloud": cloud_summary,
         }
@@ -160,12 +154,12 @@ def route_status():
 
 @app.route("/streams", methods=["GET"])
 def route_streams():
-    """Live MCM list for the Live tab (matches WebRTC); fallback to boot snapshot if MCM is down."""
+    """Configured direct RTSP sources; fall back to boot snapshot if probe fails."""
     streams: List[Dict[str, Any]] = []
     try:
-        streams = list_h264_rtsp_streams(base=MCM_BASE)
+        streams = list_direct_h264_rtsp_streams(require_reachable=False)
     except Exception as e:
-        logger.warning("/streams: live MCM fetch failed: %s", e)
+        logger.warning("/streams: direct list failed: %s", e)
     if not streams:
         with _state_lock:
             streams = list(streams_snapshot)
@@ -177,65 +171,44 @@ def route_streams():
                 "name": s["name"],
                 "stream_id": s["stream_id"],
                 "rtsp_url": s["rtsp_url"],
-                "webrtc_page": s.get("webrtc_page"),
-                "mcm_root": s.get("mcm_root"),
+                "webrtc_page": None,
+                "mcm_root": None,
+                "running": s.get("running", False),
+                "source": s.get("source", "direct"),
             }
         )
     return jsonify(out)
 
 
-def _mcm_all_running() -> Tuple[Optional[bool], List[Dict[str, Any]]]:
-    """Return (all_running, raw_streams). all_running=None if MCM unreachable."""
-    try:
-        raw = fetch_streams_raw(base=MCM_BASE, timeout=2.5)
-    except Exception as e:
-        logger.info("/live/ensure_streams: MCM /streams fetch failed: %s", e)
-        return None, []
-    if not raw:
-        return False, []
-    return all(bool(s.get("running")) for s in raw), raw
-
-
 @app.route("/live/ensure_streams", methods=["POST"])
 def route_live_ensure_streams():
-    """Ensure MCM has running pipelines so WebRTC `availableStreams` is non-empty.
-
-    Idempotent: if every MCM stream already reports `running: true`, this is a
-    no-op (which is also what we want so a Live-tab click doesn't disturb
-    the RTSP feed the cloud relay is reading). Otherwise it calls MCM
-    `POST /restart_streams?use_persistent=true` and polls briefly.
-    """
-    all_running, _raw = _mcm_all_running()
-    if all_running is None:
-        return jsonify({"success": False, "kicked": False, "message": "MCM unreachable"}), 503
-    kicked = False
-    if not all_running:
-        kicked = kick_streams(base=MCM_BASE)
-        deadline = time.monotonic() + 6.0
-        while time.monotonic() < deadline:
-            time.sleep(0.4)
-            latest_all, _latest_raw = _mcm_all_running()
-            if latest_all:
-                all_running = True
-                break
-    try:
-        streams = list_h264_rtsp_streams(base=MCM_BASE)
-    except Exception as e:
-        logger.warning("/live/ensure_streams: list failed after kick: %s", e)
-        streams = []
+    """No MCM on this branch — report direct source reachability only."""
+    streams = list_direct_h264_rtsp_streams(require_reachable=False)
+    any_up = any(bool(s.get("running")) for s in streams)
     out = [
         {
             "index": i,
             "name": s["name"],
             "stream_id": s["stream_id"],
             "rtsp_url": s["rtsp_url"],
-            "webrtc_page": s.get("webrtc_page"),
-            "mcm_root": s.get("mcm_root"),
+            "webrtc_page": None,
+            "mcm_root": None,
             "running": s.get("running", False),
+            "source": "direct",
         }
         for i, s in enumerate(streams)
     ]
-    return jsonify({"success": bool(all_running), "kicked": kicked, "streams": out})
+    return jsonify(
+        {
+            "success": any_up,
+            "kicked": False,
+            "message": (
+                "Direct QooCam RTSP (no MCM WebRTC). Cloud relay uses ffmpeg copy; "
+                "preview in VLC with the rtsp_url."
+            ),
+            "streams": out,
+        }
+    )
 
 
 @app.route("/settings", methods=["GET"])
@@ -280,11 +253,7 @@ def route_cloud_status():
 
 @app.route("/cloud/toggle", methods=["POST"])
 def route_cloud_toggle():
-    """Flip the persisted cloud-relay toggle and start/stop the relay.
-
-    Body: `{"enabled": bool}`. Accepts `cloud_relay_enabled` for parity with
-    the unified `/settings` POST.
-    """
+    """Flip the persisted cloud-relay toggle and start/stop the relay."""
     data = request.get_json(silent=True) or {}
     if "enabled" in data:
         new = bool(data["enabled"])
@@ -321,5 +290,4 @@ def route_boot_retry():
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
-    # Default 4444: free next to MCM (6020/6021/6030/6040); 5777 is mavlink-server on BlueOS.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "4444")))

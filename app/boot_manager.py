@@ -1,9 +1,8 @@
 """
-Boot: wait for MCM to publish H264 RTSP streams so the cloud relay can start.
+Boot: wait for direct H.264 RTSP sources (QooCam) so the cloud relay can start.
 
-Cloud-only build — no disk recorder, no zip, no USB, no CPU calm gate. The
-only thing gating "ready" is MCM answering `/streams` with at least one
-H264 RTSP endpoint.
+qoocam branch — no MCM. Ready when at least one configured RTSP TCP endpoint
+answers (camera powered and Live publishing).
 """
 
 from __future__ import annotations
@@ -12,28 +11,28 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from mcm_client import wait_for_streams
+from stream_sources import wait_for_direct_streams
 
 logger = logging.getLogger(__name__)
 
-MCM_POLL_S = float(os.environ.get("MCM_POLL_INTERVAL_S", "1"))
-MCM_MAX_WAIT_S = float(os.environ.get("MCM_MAX_WAIT_S", "60"))
+SOURCE_POLL_S = float(os.environ.get("QOOCAM_POLL_INTERVAL_S", "2"))
+SOURCE_MAX_WAIT_S = float(os.environ.get("QOOCAM_MAX_WAIT_S", "60"))
 
 StageCallback = Optional[Callable[[str], None]]
 StreamsCallback = Optional[Callable[[List[Dict[str, Any]]], None]]
 
 
 def run_boot_sequence(
-    mcm_base: str,
+    _unused_mcm_base: str = "",
     on_stage: StageCallback = None,
     on_streams: StreamsCallback = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], str]:
     """Return (streams, boot_error, boot_stage).
 
     Stages:
-      mcm_wait   — polling MCM /streams
-      mcm_error  — MCM never returned any H264 RTSP streams
-      ready      — streams available; caller has started cloud relay
+      source_wait — polling configured RTSP hosts
+      source_error — no RTSP endpoint answered in time
+      ready — streams available; caller has started cloud relay
     """
     def _stage(name: str) -> str:
         if on_stage:
@@ -43,20 +42,26 @@ def run_boot_sequence(
                 logger.exception("on_stage(%s) failed", name)
         return name
 
-    boot_stage = _stage("mcm_wait")
-    streams = wait_for_streams(base=mcm_base, poll_interval_s=MCM_POLL_S, max_wait_s=MCM_MAX_WAIT_S)
+    boot_stage = _stage("source_wait")
+    streams = wait_for_direct_streams(
+        poll_interval_s=SOURCE_POLL_S,
+        max_wait_s=SOURCE_MAX_WAIT_S,
+    )
     if not streams:
         return (
             [],
             (
-                "No H264 RTSP streams from MAVLink Camera Manager. "
-                "Configure streams in BlueOS (Video Streams / MCM, port 6020)."
+                "No reachable QooCam RTSP on the BlueOS ethernet DHCP pool "
+                "(192.168.2.101–200:8554). Confirm Live is running, or set "
+                "QOOCAM_RTSP_URL / QOOCAM_MAC."
             ),
-            _stage("mcm_error"),
+            _stage("source_error"),
         )
 
-    if len(streams) < 4:
-        logger.warning("Only %d H264 RTSP stream(s) from MCM (expected up to 4)", len(streams))
+    logger.info(
+        "Direct RTSP ready: %s",
+        ", ".join(f"{s['name']}={s['rtsp_url']}" for s in streams),
+    )
 
     if on_streams:
         try:

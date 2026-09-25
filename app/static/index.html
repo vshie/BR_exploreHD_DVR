@@ -221,7 +221,8 @@
       <strong>Streams unavailable</strong> — {{ status.boot_error }}
       <div class="row">
         <button class="btn primary" @click="retryBoot">Retry</button>
-        <a class="btn" :href="mcmRoot" target="_blank" rel="noopener">Open MCM (6020)</a>
+        <span class="muted" v-if="status.ingest==='direct-qoocam'">Ingest: direct QooCam RTSP (no MCM)</span>
+        <a class="btn" v-else :href="mcmRoot" target="_blank" rel="noopener">Open MCM (6020)</a>
       </div>
     </div>
     <div v-else-if="status.streams_warning" class="banner warn">
@@ -252,7 +253,7 @@
           </template>
         </div>
       </div>
-      <div v-else class="banner err">No streams yet — waiting for MCM to publish H264 RTSP endpoints.</div>
+      <div v-else class="banner err">No streams yet — waiting for direct QooCam RTSP (or MCM on main).</div>
       <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
       <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
     </section>
@@ -288,7 +289,7 @@
       <div class="card">
         <h3>Per-camera status</h3>
         <div v-if="!(cloud.server?.cams && cloud.server.cams.length)" class="muted">
-          No streams yet — waiting for MCM to publish at least one H264 RTSP endpoint.
+          No streams yet — waiting for a reachable RTSP source.
         </div>
         <table v-else>
           <thead>

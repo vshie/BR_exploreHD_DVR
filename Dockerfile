@@ -19,9 +19,14 @@ COPY app/ .
 ENV PYTHONUNBUFFERED=1
 ENV FLASK_APP=main.py
 
+# qoocam branch: camera found by MAC on the BlueOS eth0 DHCP pool, so a new
+# lease doesn't break ingest. Set QOOCAM_RTSP_URL to bypass discovery.
+ENV QOOCAM_MAC=70:65:a3:11:36:b0
+ENV QOOCAM_STREAM_NAME="QooCam 9"
+
 EXPOSE 4444
 
-LABEL version="1.0.41"
+LABEL version="1.1.0-qoocam"
 
 ARG IMAGE_NAME
 LABEL permissions='\
@@ -58,7 +63,7 @@ ARG MAINTAINER
 ARG MAINTAINER_EMAIL
 LABEL company='\
 {\
-        "about": "BR_exploreHD_DVR — cloud RTMP relay + Live view for MCM RTSP",\
+        "about": "BR_exploreHD_DVR — cloud RTMP relay for direct QooCam RTSP (qoocam branch)",\
         "name": "Blue Robotics",\
         "email": "support@bluerobotics.com"\
     }'
