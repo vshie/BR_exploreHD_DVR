@@ -2,7 +2,7 @@
 
 The Enterprise camera's auto-live mode starts an 8K/60 Mbps RTSP preview.
 That exceeds both the requested uplink budget and common browser H.264 decode
-limits.  Recreate the RTSP preview at 3840x1920, H.264, 30 fps and 20 Mbps.
+limits.  Recreate the RTSP preview at 3840x1920, H.264, 30 fps and 15 Mbps.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TARGET_WIDTH = 3840
 TARGET_HEIGHT = 1920
 TARGET_FPS = 30
-TARGET_BITRATE_MBPS = 20
+TARGET_BITRATE_MBPS = 15
 TARGET_RESOLUTION = f"{TARGET_HEIGHT}*{TARGET_WIDTH}"
 
 
@@ -55,7 +55,7 @@ def _rtsp_open(host: str, timeout: float = 2.0) -> bool:
 
 
 def configure_rtsp_preview(host: str, wait_s: float = 30.0) -> None:
-    """Restart the camera's RTSP preview at 4K/20 Mbps.
+    """Restart the camera's RTSP preview at 4K/15 Mbps.
 
     ``camera.stopCapture`` does not apply to Live Pro RTSP mode.  The private
     OSC pair used by Kandao's own application is
@@ -95,7 +95,7 @@ def configure_rtsp_preview(host: str, wait_s: float = 30.0) -> None:
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         if _rtsp_open(host):
-            logger.info("QooCam 4K/20 Mbps RTSP preview is listening")
+            logger.info("QooCam 4K/15 Mbps RTSP preview is listening")
             return
         time.sleep(1.0)
     raise RuntimeError("QooCam RTSP did not return after encoder configuration")

@@ -16,9 +16,9 @@ On **`qoocam`**, the extension **does not use MCM / BlueOS Video Streams**. It p
 Keep the camera on **Live** with Ethernet; no MCM stream entry is required.
 The extension runs a local MediaMTX bridge (HLS/fMP4 on TCP 8888). It remuxes
 the camera's original 3840×1920 H.264 stream to both the browser and cloud
-relay without transcoding, so the camera only ever has one RTSP client. The
-browser draws it as two independently draggable WebGL 360° views (Up and
-Down).
+relay without transcoding, so the camera only ever has one RTSP client. On
+boot the extension sets that preview to 15 Mbps. The browser shows the full
+stitched frame in one view.
 
 ---
 
@@ -145,8 +145,7 @@ A separate, longer schedule activates only when the upstream RTMP server replies
 ## Live view
 
 - **`qoocam`**: MediaMTX remuxes the camera's H.264 RTSP into HLS/fMP4 without
-  transcoding. The Live tab shows that stitched frame as two fixed crops,
-  labelled Up and Down.
+  transcoding. The Live tab shows the full 3840×1920 stitched frame.
 - **`main`**: uses MCM WebRTC signalling via `mcm_webrtc_live.js`; quad and
   single-camera layouts are available.
 
