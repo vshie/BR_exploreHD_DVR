@@ -10,8 +10,10 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
-from stream_sources import wait_for_direct_streams
+from qoocam_control import configure_rtsp_preview
+from stream_sources import list_direct_h264_rtsp_streams, wait_for_direct_streams
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,27 @@ def run_boot_sequence(
                 "(192.168.2.101–200:8554). Confirm Live is running, or set "
                 "QOOCAM_RTSP_URL / QOOCAM_MAC."
             ),
+            _stage("source_error"),
+        )
+
+    host = urlparse(streams[0]["rtsp_url"]).hostname
+    if not host:
+        return [], "Discovered QooCam RTSP URL has no host", _stage("source_error")
+    try:
+        configure_rtsp_preview(host)
+    except Exception as e:
+        logger.exception("Could not configure QooCam live encoder")
+        return (
+            [],
+            f"QooCam encoder configuration failed: {e}",
+            _stage("source_error"),
+        )
+
+    streams = list_direct_h264_rtsp_streams(require_reachable=True)
+    if not streams:
+        return (
+            [],
+            "QooCam RTSP disappeared after encoder configuration",
             _stage("source_error"),
         )
 

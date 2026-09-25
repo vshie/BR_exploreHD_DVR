@@ -1,6 +1,6 @@
 /**
  * Dependency-free WebGL equirectangular video viewer.
- * Multiple instances can share one HTMLVideoElement, so Forward and Aft views
+ * Multiple instances can share one HTMLVideoElement, so Up and Down views
  * use a single WebRTC connection and a single browser video decoder.
  */
 (function (global) {

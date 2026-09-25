@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.1.1-qoocam"
+VERSION = "1.1.2-qoocam"
 
 
 _boot_lock = threading.Lock()
