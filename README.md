@@ -8,9 +8,9 @@ On **`qoocam`**, the extension **does not use MCM / BlueOS Video Streams**. It p
 
 | Setting | Default |
 |---------|---------|
-| Source | Discovered on BlueOS eth0 DHCP (`192.168.2.101–200`) by MAC `70:65:a3:11:36:b0` / RTSP `Server: QooCam`. Optional override: `QOOCAM_RTSP_URL`, `QOOCAM_MAC`. |
+| Source | Fixed QooCam RTSP `rtsp://192.168.84.169:8554/` (`QOOCAM_RTSP_URL`) |
 | Stream name | `QooCam 9` → RTMP key `bom_cam09` (`QOOCAM_STREAM_NAME`) |
-| Version | `1.1.1-qoocam` |
+| Version | `1.1.3-qoocam` |
 | Docker tag after push | `qoocam` |
 
 Keep the camera on **Live** with Ethernet; no MCM stream entry is required.

@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from qoocam_control import configure_rtsp_preview
-from stream_sources import list_direct_h264_rtsp_streams, wait_for_direct_streams
+from stream_sources import (
+    list_direct_h264_rtsp_streams,
+    qoocam_rtsp_url,
+    wait_for_direct_streams,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +57,9 @@ def run_boot_sequence(
         return (
             [],
             (
-                "No reachable QooCam RTSP on the BlueOS ethernet DHCP pool "
-                "(192.168.2.101–200:8554). Confirm Live is running, or set "
-                "QOOCAM_RTSP_URL / QOOCAM_MAC."
+                f"No reachable QooCam RTSP at {qoocam_rtsp_url()}. Confirm "
+                "the camera is powered and Live is running, or set "
+                "QOOCAM_RTSP_URL."
             ),
             _stage("source_error"),
         )
