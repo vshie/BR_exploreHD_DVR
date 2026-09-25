@@ -182,7 +182,8 @@
     }
     .qoocam-view-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
       gap: 6px;
       height: calc(100vh - 145px);
       min-height: 360px;
@@ -245,11 +246,11 @@
       .live-stage { height: auto; min-height: 0; }
       .live-stage video { max-height: 70vh; }
       .qoocam-view-grid {
-        grid-template-columns: 1fr;
+        grid-template-rows: none;
         height: auto;
         min-height: 0;
       }
-      .qoocam-view { aspect-ratio: 16 / 9; }
+      .qoocam-view { aspect-ratio: 4 / 1; }
     }
   </style>
 </head>
