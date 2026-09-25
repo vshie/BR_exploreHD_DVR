@@ -442,7 +442,7 @@
 <script src="/static/mcm_webrtc_live.js"></script>
 <script src="/static/whep_reader.js"></script>
 <script src="/static/hls.min.js"></script>
-<script src="/static/view360.js?v=119"></script>
+<script src="/static/view360.js?v=120"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -681,11 +681,12 @@ createApp({
         var self = this;
         if (window.Hls && window.Hls.isSupported()) {
           var hls = new window.Hls({
-            lowLatencyMode: true,
+            lowLatencyMode: false,
             liveSyncDurationCount: 2,
-            liveMaxLatencyDurationCount: 5,
+            liveMaxLatencyDurationCount: 8,
           });
           this._qoocamWhep = hls;
+          this._armQooCamStallWatch(video);
           hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
             self.liveStatus = 'HLS preview connected';
             var play = video.play();
@@ -723,6 +724,32 @@ createApp({
         this._qoocamStarting = false;
       }
     },
+    _armQooCamStallWatch(video) {
+      var self = this;
+      this._clearQooCamStallWatch();
+      this._qoocamStallTime = -1;
+      this._qoocamStallAt = Date.now();
+      this._qoocamStallTimer = setInterval(function () {
+        if (!self._qoocamWhep || self.tab !== 'live' || !video) return;
+        var t = video.currentTime || 0;
+        if (video.readyState < 2) return;
+        if (Math.abs(t - self._qoocamStallTime) > 0.05) {
+          self._qoocamStallTime = t;
+          self._qoocamStallAt = Date.now();
+          return;
+        }
+        if (Date.now() - self._qoocamStallAt < 2500) return;
+        self._qoocamStallAt = Date.now();
+        self.liveStatus = 'Preview stalled, reloading…';
+        self.reconnectQooCamPreview();
+      }, 1000);
+    },
+    _clearQooCamStallWatch() {
+      if (this._qoocamStallTimer) {
+        clearInterval(this._qoocamStallTimer);
+        this._qoocamStallTimer = null;
+      }
+    },
     _setupQooCamViewers() {
       var video = this.$refs.qoocamVideo;
       var front = this.$refs.qoocamForward;
@@ -758,6 +785,7 @@ createApp({
       this.$nextTick(() => this.ensureQooCamPreview());
     },
     _teardownQooCamPreview() {
+      this._clearQooCamStallWatch();
       if (this._qoocamReconnectTimer) {
         clearTimeout(this._qoocamReconnectTimer);
         this._qoocamReconnectTimer = null;

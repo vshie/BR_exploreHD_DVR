@@ -56,7 +56,8 @@ hlsAddress: :{HLS_HTTP_PORT}
 hlsEncryption: false
 hlsAllowOrigins: ["*"]
 hlsAlwaysRemux: true
-hlsVariant: lowLatency
+hlsVariant: fmp4
+hlsSegmentDuration: 1s
 srt: false
 moq: false
 
