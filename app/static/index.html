@@ -287,7 +287,7 @@
       <template v-if="status.ingest==='direct-qoocam'">
         <div class="row live-toolbar" style="margin-bottom:4px">
           <strong>QooCam 360°</strong>
-          <span class="muted">Drag to look · wheel to zoom · double-click a view for fullscreen</span>
+          <span class="muted">Top and bottom of the stitched frame</span>
           <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
         </div>
         <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
@@ -441,7 +441,8 @@
 </div>
 <script src="/static/mcm_webrtc_live.js"></script>
 <script src="/static/whep_reader.js"></script>
-<script src="/static/view360.js"></script>
+<script src="/static/hls.min.js"></script>
+<script src="/static/view360.js?v=119"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -655,7 +656,7 @@ createApp({
     },
     async ensureQooCamPreview() {
       if (this._qoocamWhep || this._qoocamStarting || this.tab !== 'live') return;
-      if (!window.QooCamWhep || !window.QooCam360) {
+      if (!window.QooCam360) {
         this.liveErr = 'QooCam preview helpers failed to load.';
         return;
       }
@@ -669,33 +670,51 @@ createApp({
         var statusPayload = await statusResponse.json();
         var preview = statusPayload.preview || {};
         if (!preview.running) {
-          throw new Error(preview.last_error || 'Local WebRTC bridge is not running');
+          throw new Error(preview.last_error || 'Local HLS bridge is not running');
         }
         if (window.location.protocol === 'https:') {
-          throw new Error('Local WHEP is HTTP; open this BlueOS extension over HTTP for preview.');
+          throw new Error('Local HLS is HTTP; open this BlueOS extension over HTTP for preview.');
         }
         var host = window.location.hostname;
         if (host.indexOf(':') !== -1 && host[0] !== '[') host = '[' + host + ']';
-        var whepUrl = 'http://' + host + ':' + preview.http_port + preview.whep_path;
+        var hlsUrl = 'http://' + host + ':' + preview.http_port + preview.hls_path;
         var self = this;
-        this._qoocamWhep = window.QooCamWhep.create(whepUrl, {
-          onStatus: function (msg) { self.liveStatus = String(msg); },
-          onError: function (err) {
-            self.liveErr = String(err);
-            self._scheduleQooCamReconnect();
-          },
-          onTrack: function (ev) {
-            var stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
-            video.srcObject = stream;
+        if (window.Hls && window.Hls.isSupported()) {
+          var hls = new window.Hls({
+            lowLatencyMode: true,
+            liveSyncDurationCount: 2,
+            liveMaxLatencyDurationCount: 5,
+          });
+          this._qoocamWhep = hls;
+          hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+            self.liveStatus = 'HLS preview connected';
             var play = video.play();
             if (play && play.catch) play.catch(function () {});
             self.$nextTick(function () { self._setupQooCamViewers(); });
-          },
-        });
-        await this._qoocamWhep.connect();
+          });
+          hls.on(window.Hls.Events.ERROR, function (_event, data) {
+            if (!data || !data.fatal) return;
+            self.liveErr = 'HLS preview: ' + (data.details || data.type || 'fatal error');
+            self._scheduleQooCamReconnect();
+          });
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(video);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          this._qoocamWhep = { destroy: function () {} };
+          video.src = hlsUrl;
+          video.addEventListener('loadedmetadata', function loaded() {
+            video.removeEventListener('loadedmetadata', loaded);
+            self.liveStatus = 'HLS preview connected';
+            var play = video.play();
+            if (play && play.catch) play.catch(function () {});
+            self.$nextTick(function () { self._setupQooCamViewers(); });
+          });
+        } else {
+          throw new Error('This browser does not support HLS preview playback.');
+        }
       } catch (e) {
         if (this._qoocamWhep) {
-          try { this._qoocamWhep.close(); } catch (ignored) {}
+          try { this._qoocamWhep.destroy(); } catch (ignored) {}
           this._qoocamWhep = null;
         }
         this.liveErr = (e && e.message) ? e.message : String(e);
@@ -712,8 +731,8 @@ createApp({
       this._destroyQooCamViewers();
       try {
         this._qoocamViews = [
-          window.QooCam360.create(front, video, { yaw: 0, pitch: 0, fov: 80 }),
-          window.QooCam360.create(aft, video, { yaw: Math.PI, pitch: 0, fov: 80 }),
+          window.QooCam360.create(front, video, { half: 'top' }),
+          window.QooCam360.create(aft, video, { half: 'bottom' }),
         ];
         this.liveErr = '';
       } catch (e) {
@@ -745,13 +764,15 @@ createApp({
       }
       this._destroyQooCamViewers();
       if (this._qoocamWhep) {
-        try { this._qoocamWhep.close(); } catch (e) {}
+        try { this._qoocamWhep.destroy(); } catch (e) {}
         this._qoocamWhep = null;
       }
       var video = this.$refs.qoocamVideo;
       if (video) {
         try { video.pause(); } catch (e) {}
         video.srcObject = null;
+        video.removeAttribute('src');
+        try { video.load(); } catch (e) {}
       }
       this._qoocamStarting = false;
     },

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.1.3-qoocam"
+VERSION = "1.1.4-qoocam"
 
 
 _boot_lock = threading.Lock()
@@ -43,13 +43,20 @@ def _set_boot_stage(stage: str) -> None:
 
 
 def _current_streams_snapshot() -> List[Dict[str, Any]]:
-    """Provider callback for cloud_relay: latest direct-source stream list."""
+    """Cloud relay reads MediaMTX's loopback copy, not the camera.
+
+    A second RTSP client on the QooCam makes the camera drop both sessions.
+    """
     with _state_lock:
-        return list(streams_snapshot)
+        streams = [dict(s) for s in streams_snapshot]
+    local_url = local_preview.local_rtsp_url()
+    for stream in streams:
+        stream["rtsp_url"] = local_url
+    return streams
 
 
 def _start_cloud_from_boot_streams(streams: List[Dict[str, Any]]) -> None:
-    """Start local WebRTC preview and RTMP as soon as RTSP is reachable."""
+    """Start local HLS preview and RTMP as soon as RTSP is reachable."""
     global streams_snapshot
     with _state_lock:
         streams_snapshot = list(streams)
@@ -57,7 +64,7 @@ def _start_cloud_from_boot_streams(streams: List[Dict[str, Any]]) -> None:
         if streams:
             local_preview.start(streams[0]["rtsp_url"])
     except Exception:
-        logger.exception("Local WebRTC preview failed to start")
+        logger.exception("Local HLS preview failed to start")
     try:
         cloud_relay.configure(_current_streams_snapshot)
         cloud_relay.start_if_enabled()
@@ -188,7 +195,7 @@ def route_streams():
 
 @app.route("/preview/status", methods=["GET"])
 def route_preview_status():
-    """Local MediaMTX/WHEP bridge details consumed by the Live tab."""
+    """Local MediaMTX/HLS bridge details consumed by the Live tab."""
     try:
         local_preview.ensure_running()
         return jsonify({"preview": local_preview.status()})

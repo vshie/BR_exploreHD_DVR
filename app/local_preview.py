@@ -1,7 +1,8 @@
-"""Local RTSP-to-WebRTC bridge for direct QooCam preview.
+"""Local RTSP/HLS bridge for direct QooCam preview.
 
-MediaMTX pulls the same in-camera RTSP source as the cloud relay and exposes
-it through WHEP.  It remuxes H.264; there is no video transcode.
+MediaMTX is the only client of the camera. It remuxes the original compressed
+H.264 to RTSP for the cloud relay and fragmented MP4/HLS for the browser.
+Nothing is decoded or re-encoded on the Pi.
 """
 
 from __future__ import annotations
@@ -18,15 +19,21 @@ logger = logging.getLogger(__name__)
 
 MEDIAMTX_BIN = os.environ.get("MEDIAMTX_BIN", "/usr/local/bin/mediamtx")
 MEDIAMTX_CONFIG = "/tmp/mediamtx-qoocam.yml"
-WEBRTC_HTTP_PORT = int(os.environ.get("QOOCAM_WEBRTC_HTTP_PORT", "8889"))
-WEBRTC_ICE_PORT = int(os.environ.get("QOOCAM_WEBRTC_ICE_PORT", "8189"))
-WEBRTC_PATH = "qoocam"
+HLS_HTTP_PORT = int(os.environ.get("QOOCAM_HLS_HTTP_PORT", "8888"))
+LOCAL_RTSP_PORT = int(os.environ.get("QOOCAM_LOCAL_RTSP_PORT", "8554"))
+SOURCE_PATH = "qoocam"
+LOCAL_RTSP_URL = f"rtsp://127.0.0.1:{LOCAL_RTSP_PORT}/{SOURCE_PATH}"
 
 _lock = threading.RLock()
 _proc: Optional[subprocess.Popen] = None
 _rtsp_url = ""
 _last_error = ""
-_recent_log: Deque[str] = deque(maxlen=20)
+_recent_log: Deque[str] = deque(maxlen=40)
+
+
+def local_rtsp_url() -> str:
+    """Loopback copy of the camera stream. Cloud ffmpeg must use this."""
+    return LOCAL_RTSP_URL
 
 
 def _render_config(rtsp_url: str) -> str:
@@ -39,29 +46,43 @@ api: false
 metrics: false
 pprof: false
 playback: false
-rtsp: false
-rtmp: false
-hls: false
-srt: false
 
-webrtc: true
-webrtcAddress: :{WEBRTC_HTTP_PORT}
-webrtcEncryption: false
-webrtcAllowOrigins: ["*"]
-webrtcLocalUDPAddress: :{WEBRTC_ICE_PORT}
-webrtcLocalTCPAddress: :{WEBRTC_ICE_PORT}
-webrtcIPsFromInterfaces: true
+rtsp: true
+rtspAddress: 127.0.0.1:{LOCAL_RTSP_PORT}
+rtspTransports: [tcp]
+rtmp: false
+hls: true
+hlsAddress: :{HLS_HTTP_PORT}
+hlsEncryption: false
+hlsAllowOrigins: ["*"]
+hlsAlwaysRemux: true
+hlsVariant: lowLatency
+srt: false
+moq: false
+
+readTimeout: 30s
+writeTimeout: 30s
+
+webrtc: false
 
 paths:
-  {WEBRTC_PATH}:
+  {SOURCE_PATH}:
     source: {source}
     sourceOnDemand: false
     rtspTransport: tcp
 """
 
 
-def _log_reader(proc: subprocess.Popen) -> None:
+def _note(line: str) -> None:
     global _last_error
+    with _lock:
+        _recent_log.append(line)
+        low = line.lower()
+        if " war " not in low and ("error" in low or "failed" in low):
+            _last_error = line[:500]
+
+
+def _log_reader(proc: subprocess.Popen, prefix: str) -> None:
     if not proc.stdout:
         return
     try:
@@ -71,14 +92,10 @@ def _log_reader(proc: subprocess.Popen) -> None:
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
-            with _lock:
-                _recent_log.append(line)
-                low = line.lower()
-                if "error" in low or "failed" in low:
-                    _last_error = line[:500]
-            logger.info("[mediamtx] %s", line)
+            _note(f"[{prefix}] {line}")
+            logger.info("[%s] %s", prefix, line)
     except Exception as exc:
-        logger.debug("MediaMTX log reader stopped: %s", exc)
+        logger.debug("%s log reader stopped: %s", prefix, exc)
 
 
 def start(rtsp_url: str) -> bool:
@@ -107,18 +124,17 @@ def start(rtsp_url: str) -> bool:
             return False
         threading.Thread(
             target=_log_reader,
-            args=(_proc,),
+            args=(_proc, "mediamtx"),
             daemon=True,
             name="mediamtx-log",
         ).start()
         logger.info(
-            "Local preview bridge: %s -> WHEP path %s (HTTP %d, ICE %d)",
+            "Local preview bridge: %s -> HLS /%s (HTTP %d)",
             rtsp_url,
-            WEBRTC_PATH,
-            WEBRTC_HTTP_PORT,
-            WEBRTC_ICE_PORT,
+            SOURCE_PATH,
+            HLS_HTTP_PORT,
         )
-        return True
+    return True
 
 
 def stop() -> None:
@@ -155,9 +171,10 @@ def status() -> Dict[str, Any]:
             "running": running,
             "exit_code": exit_code,
             "rtsp_url": _rtsp_url,
-            "whep_path": f"/{WEBRTC_PATH}/whep",
-            "http_port": WEBRTC_HTTP_PORT,
-            "ice_port": WEBRTC_ICE_PORT,
+            "local_rtsp_url": LOCAL_RTSP_URL,
+            "hls_path": f"/{SOURCE_PATH}/index.m3u8",
+            "http_port": HLS_HTTP_PORT,
+            "transcoding": False,
             "last_error": _last_error,
             "recent_log": list(_recent_log)[-8:],
         }

@@ -25,18 +25,16 @@ ENV FLASK_APP=main.py
 ENV QOOCAM_RTSP_URL=rtsp://192.168.84.169:8554/
 ENV QOOCAM_STREAM_NAME="QooCam 9"
 
-EXPOSE 4444 8889 8189/tcp 8189/udp
+EXPOSE 4444 8888
 
-LABEL version="1.1.3-qoocam"
+LABEL version="1.1.4-qoocam"
 
 ARG IMAGE_NAME
 LABEL permissions='\
 {\
   "ExposedPorts": {\
     "4444/tcp": {},\
-    "8889/tcp": {},\
-    "8189/tcp": {},\
-    "8189/udp": {}\
+    "8888/tcp": {}\
   },\
   "HostConfig": {\
     "Binds": [\
