@@ -10,10 +10,13 @@ On **`qoocam`**, the extension **does not use MCM / BlueOS Video Streams**. It p
 |---------|---------|
 | Source | Discovered on BlueOS eth0 DHCP (`192.168.2.101–200`) by MAC `70:65:a3:11:36:b0` / RTSP `Server: QooCam`. Optional override: `QOOCAM_RTSP_URL`, `QOOCAM_MAC`. |
 | Stream name | `QooCam 9` → RTMP key `bom_cam09` (`QOOCAM_STREAM_NAME`) |
-| Version | `1.1.0-qoocam` |
+| Version | `1.1.1-qoocam` |
 | Docker tag after push | `qoocam` |
 
-Keep the camera on **Live** with Ethernet; no MCM stream entry is required. In-browser Live WebRTC still expects MCM and will not preview the QooCam — use VLC or the Cloud tab for uplink status.
+Keep the camera on **Live** with Ethernet; no MCM stream entry is required.
+The extension runs a local MediaMTX bridge (WHEP on TCP 8889, ICE on
+TCP/UDP 8189) and displays the stitched stream as two independently draggable
+WebGL 360° views. Both views share one WebRTC connection and browser decoder.
 
 ---
 
@@ -139,7 +142,12 @@ A separate, longer schedule activates only when the upstream RTMP server replies
 
 ## Live view
 
-The **Live** tab uses MCM's WebRTC page (`http://<hostname>:6020/webrtc`) via `mcm_webrtc_live.js`. Both quad and single-camera layouts are available.
+- **`qoocam`**: MediaMTX remuxes the camera's H.264 RTSP into WebRTC without
+  transcoding. The Live tab maps that single stitched equirectangular stream
+  onto two WebGL viewports, initially facing forward and aft. Drag to look,
+  use the wheel to zoom, and double-click either viewport for fullscreen.
+- **`main`**: uses MCM WebRTC signalling via `mcm_webrtc_live.js`; quad and
+  single-camera layouts are available.
 
 ## License
 

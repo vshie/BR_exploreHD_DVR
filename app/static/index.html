@@ -171,6 +171,51 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .qoocam-source-video {
+      position: fixed;
+      width: 2px;
+      height: 2px;
+      left: -20px;
+      top: -20px;
+      opacity: 0.01;
+      pointer-events: none;
+    }
+    .qoocam-view-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      height: calc(100vh - 145px);
+      min-height: 360px;
+    }
+    .qoocam-view {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: #000;
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+    }
+    .qoocam-view canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+      touch-action: none;
+    }
+    .qoocam-view canvas:active { cursor: grabbing; }
+    .qoocam-view-label {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 2;
+      padding: 3px 9px;
+      border-radius: 999px;
+      color: var(--tx);
+      background: rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.2);
+      pointer-events: none;
+    }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
     th { color: var(--muted); font-weight: 500; }
@@ -199,6 +244,12 @@
       .live-quad-cell { aspect-ratio: 16 / 9; }
       .live-stage { height: auto; min-height: 0; }
       .live-stage video { max-height: 70vh; }
+      .qoocam-view-grid {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: 0;
+      }
+      .qoocam-view { aspect-ratio: 16 / 9; }
     }
   </style>
 </head>
@@ -233,6 +284,27 @@
     </div>
 
     <section v-show="tab==='live'" class="live-layout">
+      <template v-if="status.ingest==='direct-qoocam'">
+        <div class="row live-toolbar" style="margin-bottom:4px">
+          <strong>QooCam 360°</strong>
+          <span class="muted">Drag to look · wheel to zoom · double-click a view for fullscreen</span>
+          <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
+        </div>
+        <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
+        <div class="qoocam-view-grid">
+          <div class="qoocam-view">
+            <span class="qoocam-view-label">Forward</span>
+            <canvas ref="qoocamForward"></canvas>
+          </div>
+          <div class="qoocam-view">
+            <span class="qoocam-view-label">Aft</span>
+            <canvas ref="qoocamAft"></canvas>
+          </div>
+        </div>
+        <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
+        <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
+      </template>
+      <template v-else>
       <div class="row live-toolbar" style="margin-bottom:4px">
         <button class="btn" type="button" :class="{ primary: liveViewMode==='quad' }" :disabled="!liveStreams.length" @click="setLiveQuad">Quad</button>
         <button class="btn" :class="{primary: (liveViewMode==='single' && livePick===i)}" v-for="(s,i) in liveStreams" :key="s.stream_id" @click="onLivePick(i)">
@@ -256,6 +328,7 @@
       <div v-else class="banner err">No streams yet — waiting for direct QooCam RTSP (or MCM on main).</div>
       <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
       <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
+      </template>
     </section>
 
     <section v-show="tab==='cloud'">
@@ -265,7 +338,7 @@
       <div class="card" style="margin-bottom:12px">
         <h3>Cloud RTMP relay</h3>
         <p class="muted" style="margin-top:4px">
-          Forwards each MCM RTSP camera to <code>{{ cloud.server?.rtmp_base_url || 'rtmp://35.83.28.160/live' }}</code>
+          Forwards each {{ status.ingest==='direct-qoocam' ? 'direct QooCam' : 'MCM' }} RTSP camera to <code>{{ cloud.server?.rtmp_base_url || 'rtmp://35.83.28.160/live' }}</code>
           using one <code>ffmpeg -c:v copy -an -f flv</code> subprocess per cam.
           The destination is hardcoded — only the on/off toggle is operator-facing,
           and the toggle persists across reboots in <code>.br_explorehd_dvr_settings.json</code>.
@@ -367,6 +440,8 @@
   </main>
 </div>
 <script src="/static/mcm_webrtc_live.js"></script>
+<script src="/static/whep_reader.js"></script>
+<script src="/static/view360.js"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -388,6 +463,10 @@ createApp({
       _liveStarting: false,
       _liveSwitchGen: 0,
       _liveSwitchPromise: null,
+      _qoocamWhep: null,
+      _qoocamViews: [],
+      _qoocamStarting: false,
+      _qoocamReconnectTimer: null,
       // Cloud RTMP relay UI state. `form` is what the operator is editing
       // (just the on/off toggle now); `server` is the most recent
       // /cloud/status snapshot we rendered. The destination URL is hardcoded
@@ -484,10 +563,14 @@ createApp({
     },
     async tick() {
       try {
+        const previousIngest = this.status.ingest;
         const r = await fetch('/status');
         this.status = await r.json();
         const n = this.status.streams_count || 0;
         if (n > 0 && this.streams.length !== n) await this.loadStreams();
+        if (previousIngest !== this.status.ingest && this.tab === 'live') {
+          this.scheduleLiveStart();
+        }
       } catch (e) { console.warn(e); }
     },
     async loadStreams() {
@@ -496,9 +579,13 @@ createApp({
         this.streams = await r.json();
         if (this.livePick >= this.streams.length) this.livePick = 0;
         if (this.tab === 'live') {
-          this._ensureMcmStreamsRunning().finally(() => {
+          if (this.status.ingest === 'direct-qoocam') {
             this.$nextTick(() => this.ensureLive());
-          });
+          } else {
+            this._ensureMcmStreamsRunning().finally(() => {
+              this.$nextTick(() => this.ensureLive());
+            });
+          }
         }
       } catch (e) { this.streams = []; }
     },
@@ -531,6 +618,9 @@ createApp({
       }
     },
     async ensureLive() {
+      if (this.status.ingest === 'direct-qoocam') {
+        return this.ensureQooCamPreview();
+      }
       if (!this.liveStreams.length) return;
       if (!window.McmWebRtcLive) {
         this.liveErr = 'Live WebRTC helper failed to load (mcm_webrtc_live.js).';
@@ -562,6 +652,108 @@ createApp({
       } finally {
         this._liveStarting = false;
       }
+    },
+    async ensureQooCamPreview() {
+      if (this._qoocamWhep || this._qoocamStarting || this.tab !== 'live') return;
+      if (!window.QooCamWhep || !window.QooCam360) {
+        this.liveErr = 'QooCam preview helpers failed to load.';
+        return;
+      }
+      var video = this.$refs.qoocamVideo;
+      if (!video) return;
+      this._qoocamStarting = true;
+      this.liveErr = '';
+      try {
+        var statusResponse = await fetch('/preview/status');
+        if (!statusResponse.ok) throw new Error('Preview status HTTP ' + statusResponse.status);
+        var statusPayload = await statusResponse.json();
+        var preview = statusPayload.preview || {};
+        if (!preview.running) {
+          throw new Error(preview.last_error || 'Local WebRTC bridge is not running');
+        }
+        if (window.location.protocol === 'https:') {
+          throw new Error('Local WHEP is HTTP; open this BlueOS extension over HTTP for preview.');
+        }
+        var host = window.location.hostname;
+        if (host.indexOf(':') !== -1 && host[0] !== '[') host = '[' + host + ']';
+        var whepUrl = 'http://' + host + ':' + preview.http_port + preview.whep_path;
+        var self = this;
+        this._qoocamWhep = window.QooCamWhep.create(whepUrl, {
+          onStatus: function (msg) { self.liveStatus = String(msg); },
+          onError: function (err) {
+            self.liveErr = String(err);
+            self._scheduleQooCamReconnect();
+          },
+          onTrack: function (ev) {
+            var stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
+            video.srcObject = stream;
+            var play = video.play();
+            if (play && play.catch) play.catch(function () {});
+            self.$nextTick(function () { self._setupQooCamViewers(); });
+          },
+        });
+        await this._qoocamWhep.connect();
+      } catch (e) {
+        if (this._qoocamWhep) {
+          try { this._qoocamWhep.close(); } catch (ignored) {}
+          this._qoocamWhep = null;
+        }
+        this.liveErr = (e && e.message) ? e.message : String(e);
+        this._scheduleQooCamReconnect();
+      } finally {
+        this._qoocamStarting = false;
+      }
+    },
+    _setupQooCamViewers() {
+      var video = this.$refs.qoocamVideo;
+      var front = this.$refs.qoocamForward;
+      var aft = this.$refs.qoocamAft;
+      if (!video || !front || !aft || !window.QooCam360) return;
+      this._destroyQooCamViewers();
+      try {
+        this._qoocamViews = [
+          window.QooCam360.create(front, video, { yaw: 0, pitch: 0, fov: 80 }),
+          window.QooCam360.create(aft, video, { yaw: Math.PI, pitch: 0, fov: 80 }),
+        ];
+        this.liveErr = '';
+      } catch (e) {
+        this.liveErr = '360° viewer: ' + ((e && e.message) ? e.message : String(e));
+      }
+    },
+    _destroyQooCamViewers() {
+      (this._qoocamViews || []).forEach(function (view) {
+        try { view.destroy(); } catch (e) {}
+      });
+      this._qoocamViews = [];
+    },
+    _scheduleQooCamReconnect() {
+      var self = this;
+      if (this._qoocamReconnectTimer || this.tab !== 'live') return;
+      this._qoocamReconnectTimer = setTimeout(function () {
+        self._qoocamReconnectTimer = null;
+        self.reconnectQooCamPreview();
+      }, 2500);
+    },
+    reconnectQooCamPreview() {
+      this._teardownQooCamPreview();
+      this.$nextTick(() => this.ensureQooCamPreview());
+    },
+    _teardownQooCamPreview() {
+      if (this._qoocamReconnectTimer) {
+        clearTimeout(this._qoocamReconnectTimer);
+        this._qoocamReconnectTimer = null;
+      }
+      this._destroyQooCamViewers();
+      if (this._qoocamWhep) {
+        try { this._qoocamWhep.close(); } catch (e) {}
+        this._qoocamWhep = null;
+      }
+      var video = this.$refs.qoocamVideo;
+      if (video) {
+        try { video.pause(); } catch (e) {}
+        video.srcObject = null;
+      }
+      this._qoocamStarting = false;
     },
     async switchLiveStream() {
       if (!this._live || !this.liveStreams.length) return;
@@ -679,6 +871,7 @@ createApp({
       }
     },
     teardownLive() {
+      this._teardownQooCamPreview();
       this._teardownSingle();
       this._teardownQuad();
       this.liveStatus = '';

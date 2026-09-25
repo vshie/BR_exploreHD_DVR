@@ -1,3 +1,5 @@
+FROM bluenviron/mediamtx:1.21.1 AS mediamtx
+
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,6 +16,7 @@ WORKDIR /app
 
 RUN mkdir -p /app/recordings
 
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 COPY app/ .
 
 ENV PYTHONUNBUFFERED=1
@@ -24,15 +27,18 @@ ENV FLASK_APP=main.py
 ENV QOOCAM_MAC=70:65:a3:11:36:b0
 ENV QOOCAM_STREAM_NAME="QooCam 9"
 
-EXPOSE 4444
+EXPOSE 4444 8889 8189/tcp 8189/udp
 
-LABEL version="1.1.0-qoocam"
+LABEL version="1.1.1-qoocam"
 
 ARG IMAGE_NAME
 LABEL permissions='\
 {\
   "ExposedPorts": {\
-    "4444/tcp": {}\
+    "4444/tcp": {},\
+    "8889/tcp": {},\
+    "8189/tcp": {},\
+    "8189/udp": {}\
   },\
   "HostConfig": {\
     "Binds": [\

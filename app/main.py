@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request, send_file
 
 import cloud_relay
+import local_preview
 from boot_manager import run_boot_sequence
 from settings_store import load_settings, save_settings
 from stream_sources import list_direct_h264_rtsp_streams
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.1.0-qoocam"
+VERSION = "1.1.1-qoocam"
 
 
 _boot_lock = threading.Lock()
@@ -48,10 +49,15 @@ def _current_streams_snapshot() -> List[Dict[str, Any]]:
 
 
 def _start_cloud_from_boot_streams(streams: List[Dict[str, Any]]) -> None:
-    """Start RTMP as soon as direct RTSP sources are reachable."""
+    """Start local WebRTC preview and RTMP as soon as RTSP is reachable."""
     global streams_snapshot
     with _state_lock:
         streams_snapshot = list(streams)
+    try:
+        if streams:
+            local_preview.start(streams[0]["rtsp_url"])
+    except Exception:
+        logger.exception("Local WebRTC preview failed to start")
     try:
         cloud_relay.configure(_current_streams_snapshot)
         cloud_relay.start_if_enabled()
@@ -178,6 +184,17 @@ def route_streams():
             }
         )
     return jsonify(out)
+
+
+@app.route("/preview/status", methods=["GET"])
+def route_preview_status():
+    """Local MediaMTX/WHEP bridge details consumed by the Live tab."""
+    try:
+        local_preview.ensure_running()
+        return jsonify({"preview": local_preview.status()})
+    except Exception as e:
+        logger.exception("preview status failed")
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route("/live/ensure_streams", methods=["POST"])
