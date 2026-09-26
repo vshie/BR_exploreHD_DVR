@@ -171,16 +171,46 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .qoocam-frame {
-      display: block;
-      width: min(100%, calc((100vh - 145px) * 2));
-      height: auto;
-      margin: 0 auto;
-      aspect-ratio: 2 / 1;
-      object-fit: contain;
+    .qoocam-source-video {
+      position: fixed;
+      width: 2px;
+      height: 2px;
+      left: -20px;
+      top: -20px;
+      opacity: 0.01;
+      pointer-events: none;
+    }
+    .qoocam-view-stack {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .qoocam-view {
+      position: relative;
+      width: min(100%, calc((100vh - 160px) / 2));
+      aspect-ratio: 1 / 1;
+      overflow: hidden;
       background: #000;
       border: 1px solid var(--bd);
       border-radius: 8px;
+    }
+    .qoocam-view canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    .qoocam-view-label {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 2;
+      padding: 3px 9px;
+      border-radius: 999px;
+      color: var(--tx);
+      background: rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.2);
+      pointer-events: none;
     }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { border-bottom: 1px solid var(--bd); padding: 8px; text-align: left; }
@@ -210,7 +240,7 @@
       .live-quad-cell { aspect-ratio: 16 / 9; }
       .live-stage { height: auto; min-height: 0; }
       .live-stage video { max-height: 70vh; }
-      .qoocam-frame { width: 100%; }
+      .qoocam-view { width: min(100%, 70vw); }
     }
   </style>
 </head>
@@ -248,10 +278,20 @@
       <template v-if="status.ingest==='direct-qoocam'">
         <div class="row live-toolbar" style="margin-bottom:4px">
           <strong>QooCam 360°</strong>
-          <span class="muted">Full 3840×1920 stitched frame</span>
+          <span class="muted">Up is the left 1920×1920 half, Down is the right</span>
           <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
         </div>
-        <video ref="qoocamVideo" class="qoocam-frame" playsinline autoplay muted></video>
+        <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
+        <div class="qoocam-view-stack">
+          <div class="qoocam-view">
+            <span class="qoocam-view-label">Up</span>
+            <canvas ref="qoocamUp"></canvas>
+          </div>
+          <div class="qoocam-view">
+            <span class="qoocam-view-label">Down</span>
+            <canvas ref="qoocamDown"></canvas>
+          </div>
+        </div>
         <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
         <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
       </template>
@@ -393,6 +433,7 @@
 <script src="/static/mcm_webrtc_live.js"></script>
 <script src="/static/whep_reader.js"></script>
 <script src="/static/hls.min.js"></script>
+<script src="/static/view360.js?v=121"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -415,6 +456,7 @@ createApp({
       _liveSwitchGen: 0,
       _liveSwitchPromise: null,
       _qoocamWhep: null,
+      _qoocamViews: [],
       _qoocamStarting: false,
       _qoocamReconnectTimer: null,
       // Cloud RTMP relay UI state. `form` is what the operator is editing
@@ -605,6 +647,10 @@ createApp({
     },
     async ensureQooCamPreview() {
       if (this._qoocamWhep || this._qoocamStarting || this.tab !== 'live') return;
+      if (!window.QooCam360) {
+        this.liveErr = 'QooCam preview helpers failed to load.';
+        return;
+      }
       var video = this.$refs.qoocamVideo;
       if (!video) return;
       this._qoocamStarting = true;
@@ -636,6 +682,7 @@ createApp({
             self.liveStatus = 'HLS preview connected';
             var play = video.play();
             if (play && play.catch) play.catch(function () {});
+            self.$nextTick(function () { self._setupQooCamViewers(); });
           });
           hls.on(window.Hls.Events.ERROR, function (_event, data) {
             if (!data || !data.fatal) return;
@@ -652,6 +699,7 @@ createApp({
             self.liveStatus = 'HLS preview connected';
             var play = video.play();
             if (play && play.catch) play.catch(function () {});
+            self.$nextTick(function () { self._setupQooCamViewers(); });
           });
         } else {
           throw new Error('This browser does not support HLS preview playback.');
@@ -693,6 +741,28 @@ createApp({
         this._qoocamStallTimer = null;
       }
     },
+    _setupQooCamViewers() {
+      var video = this.$refs.qoocamVideo;
+      var up = this.$refs.qoocamUp;
+      var down = this.$refs.qoocamDown;
+      if (!video || !up || !down || !window.QooCam360) return;
+      this._destroyQooCamViewers();
+      try {
+        this._qoocamViews = [
+          window.QooCam360.create(up, video, { side: 'left' }),
+          window.QooCam360.create(down, video, { side: 'right' }),
+        ];
+        this.liveErr = '';
+      } catch (e) {
+        this.liveErr = '360° viewer: ' + ((e && e.message) ? e.message : String(e));
+      }
+    },
+    _destroyQooCamViewers() {
+      (this._qoocamViews || []).forEach(function (view) {
+        try { view.destroy(); } catch (e) {}
+      });
+      this._qoocamViews = [];
+    },
     _scheduleQooCamReconnect() {
       var self = this;
       if (this._qoocamReconnectTimer || this.tab !== 'live') return;
@@ -707,6 +777,7 @@ createApp({
     },
     _teardownQooCamPreview() {
       this._clearQooCamStallWatch();
+      this._destroyQooCamViewers();
       if (this._qoocamReconnectTimer) {
         clearTimeout(this._qoocamReconnectTimer);
         this._qoocamReconnectTimer = null;
