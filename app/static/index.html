@@ -180,15 +180,38 @@
       opacity: 0.01;
       pointer-events: none;
     }
-    .qoocam-view-stack {
+    #app:has(.qoocam-stage) {
+      height: 100vh;
+      overflow: hidden;
       display: flex;
       flex-direction: column;
-      align-items: stretch;
-      gap: 6px;
+    }
+    main.live-open:has(.qoocam-stage) {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    main.live-open:has(.qoocam-stage) .live-layout {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+    }
+    .qoocam-stage {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      container-type: size;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     .qoocam-view {
       position: relative;
-      width: 100%;
+      width: min(100cqw, 100cqh);
       aspect-ratio: 1 / 1;
       overflow: hidden;
       background: #000;
@@ -277,22 +300,23 @@
       <template v-if="status.ingest==='direct-qoocam'">
         <div class="row live-toolbar" style="margin-bottom:4px">
           <strong>QooCam 360°</strong>
-          <span class="muted">One square per lens, stitch at the outer edges</span>
+          <button class="btn" type="button" :class="{ latched: qoocamLens==='up' }" @click="qoocamLens='up'">Up</button>
+          <button class="btn" type="button" :class="{ latched: qoocamLens==='down' }" @click="qoocamLens='down'">Down</button>
           <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
+          <span class="muted" v-if="liveStatus">{{ liveStatus }}</span>
         </div>
+        <div v-if="liveErr" class="banner err">{{ liveErr }}</div>
         <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
-        <div class="qoocam-view-stack">
-          <div class="qoocam-view">
+        <div class="qoocam-stage">
+          <div class="qoocam-view" v-show="qoocamLens==='up'">
             <span class="qoocam-view-label">Up</span>
             <canvas ref="qoocamUp"></canvas>
           </div>
-          <div class="qoocam-view">
+          <div class="qoocam-view" v-show="qoocamLens==='down'">
             <span class="qoocam-view-label">Down</span>
             <canvas ref="qoocamDown"></canvas>
           </div>
         </div>
-        <div v-if="liveErr" class="banner err" style="margin-top:8px">{{ liveErr }}</div>
-        <div class="muted" v-if="liveStatus" style="margin-top:4px">{{ liveStatus }}</div>
       </template>
       <template v-else>
       <div class="row live-toolbar" style="margin-bottom:4px">
@@ -456,6 +480,7 @@ createApp({
       _liveSwitchPromise: null,
       _qoocamWhep: null,
       _qoocamViews: [],
+      qoocamLens: 'up',
       _qoocamStarting: false,
       _qoocamReconnectTimer: null,
       // Cloud RTMP relay UI state. `form` is what the operator is editing
