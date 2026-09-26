@@ -183,12 +183,12 @@
     .qoocam-view-stack {
       display: flex;
       flex-direction: column;
-      align-items: center;
+      align-items: stretch;
       gap: 6px;
     }
     .qoocam-view {
       position: relative;
-      width: min(100%, calc((100vh - 160px) / 2));
+      width: 100%;
       aspect-ratio: 1 / 1;
       overflow: hidden;
       background: #000;
@@ -240,7 +240,6 @@
       .live-quad-cell { aspect-ratio: 16 / 9; }
       .live-stage { height: auto; min-height: 0; }
       .live-stage video { max-height: 70vh; }
-      .qoocam-view { width: min(100%, 70vw); }
     }
   </style>
 </head>
