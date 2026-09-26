@@ -206,12 +206,14 @@
       width: 100%;
       container-type: size;
       display: flex;
+      flex-direction: row;
       align-items: center;
       justify-content: center;
+      gap: 6px;
     }
     .qoocam-view {
       position: relative;
-      width: min(100cqw, 100cqh);
+      width: min(100cqh, calc((100cqw - 6px) / 2));
       aspect-ratio: 1 / 1;
       overflow: hidden;
       background: #000;
@@ -300,19 +302,17 @@
       <template v-if="status.ingest==='direct-qoocam'">
         <div class="row live-toolbar" style="margin-bottom:4px">
           <strong>QooCam 360°</strong>
-          <button class="btn" type="button" :class="{ latched: qoocamLens==='up' }" @click="qoocamLens='up'">Up</button>
-          <button class="btn" type="button" :class="{ latched: qoocamLens==='down' }" @click="qoocamLens='down'">Down</button>
           <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
           <span class="muted" v-if="liveStatus">{{ liveStatus }}</span>
         </div>
         <div v-if="liveErr" class="banner err">{{ liveErr }}</div>
         <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
         <div class="qoocam-stage">
-          <div class="qoocam-view" v-show="qoocamLens==='up'">
+          <div class="qoocam-view">
             <span class="qoocam-view-label">Up</span>
             <canvas ref="qoocamUp"></canvas>
           </div>
-          <div class="qoocam-view" v-show="qoocamLens==='down'">
+          <div class="qoocam-view">
             <span class="qoocam-view-label">Down</span>
             <canvas ref="qoocamDown"></canvas>
           </div>
@@ -480,7 +480,6 @@ createApp({
       _liveSwitchPromise: null,
       _qoocamWhep: null,
       _qoocamViews: [],
-      qoocamLens: 'up',
       _qoocamStarting: false,
       _qoocamReconnectTimer: null,
       // Cloud RTMP relay UI state. `form` is what the operator is editing
