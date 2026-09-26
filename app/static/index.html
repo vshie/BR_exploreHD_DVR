@@ -712,8 +712,11 @@ createApp({
             var details = data.details || data.type || 'fatal error';
             if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
               self.liveStatus = 'Preview recovering…';
-              hls.startLoad();
-              return;
+              self._qoocamNetworkRecoveries = (self._qoocamNetworkRecoveries || 0) + 1;
+              if (self._qoocamNetworkRecoveries < 3) {
+                hls.startLoad();
+                return;
+              }
             }
             if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && !self._qoocamMediaRecovered) {
               self._qoocamMediaRecovered = true;
@@ -766,6 +769,7 @@ createApp({
           self._qoocamStallAt = Date.now();
           self._qoocamStallNudges = 0;
           self._qoocamMediaRecovered = false;
+          self._qoocamNetworkRecoveries = 0;
           return;
         }
         if (Date.now() - self._qoocamStallAt < 8000) return;
