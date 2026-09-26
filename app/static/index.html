@@ -278,7 +278,7 @@
       <template v-if="status.ingest==='direct-qoocam'">
         <div class="row live-toolbar" style="margin-bottom:4px">
           <strong>QooCam 360°</strong>
-          <span class="muted">Up is the left 1920×1920 half, Down is the right</span>
+          <span class="muted">One square per lens, stitch at the outer edges</span>
           <button class="btn" type="button" @click="reconnectQooCamPreview">Reconnect preview</button>
         </div>
         <video ref="qoocamVideo" class="qoocam-source-video" playsinline autoplay muted></video>
@@ -433,7 +433,7 @@
 <script src="/static/mcm_webrtc_live.js"></script>
 <script src="/static/whep_reader.js"></script>
 <script src="/static/hls.min.js"></script>
-<script src="/static/view360.js?v=121"></script>
+<script src="/static/view360.js?v=122"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -749,8 +749,8 @@ createApp({
       this._destroyQooCamViewers();
       try {
         this._qoocamViews = [
-          window.QooCam360.create(up, video, { side: 'left' }),
-          window.QooCam360.create(down, video, { side: 'right' }),
+          window.QooCam360.create(up, video, { lens: 'edge' }),
+          window.QooCam360.create(down, video, { lens: 'center' }),
         ];
         this.liveErr = '';
       } catch (e) {
