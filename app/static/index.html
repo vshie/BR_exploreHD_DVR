@@ -696,8 +696,8 @@ createApp({
         if (window.Hls && window.Hls.isSupported()) {
           var hls = new window.Hls({
             lowLatencyMode: false,
-            liveSyncDurationCount: 3,
-            liveMaxLatencyDurationCount: 10,
+            liveSyncDurationCount: 7,
+            liveMaxLatencyDurationCount: 11,
           });
           this._qoocamWhep = hls;
           this._armQooCamStallWatch(video);
