@@ -456,7 +456,7 @@
 <script src="/static/mcm_webrtc_live.js"></script>
 <script src="/static/whep_reader.js"></script>
 <script src="/static/hls.min.js"></script>
-<script src="/static/view360.js?v=122"></script>
+<script src="/static/view360.js?v=123"></script>
 <script>
 const { createApp } = Vue;
 createApp({
@@ -696,8 +696,8 @@ createApp({
         if (window.Hls && window.Hls.isSupported()) {
           var hls = new window.Hls({
             lowLatencyMode: false,
-            liveSyncDurationCount: 2,
-            liveMaxLatencyDurationCount: 8,
+            liveSyncDurationCount: 3,
+            liveMaxLatencyDurationCount: 10,
           });
           this._qoocamWhep = hls;
           this._armQooCamStallWatch(video);
@@ -709,7 +709,19 @@ createApp({
           });
           hls.on(window.Hls.Events.ERROR, function (_event, data) {
             if (!data || !data.fatal) return;
-            self.liveErr = 'HLS preview: ' + (data.details || data.type || 'fatal error');
+            var details = data.details || data.type || 'fatal error';
+            if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+              self.liveStatus = 'Preview recovering…';
+              hls.startLoad();
+              return;
+            }
+            if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && !self._qoocamMediaRecovered) {
+              self._qoocamMediaRecovered = true;
+              self.liveStatus = 'Preview recovering…';
+              hls.recoverMediaError();
+              return;
+            }
+            self.liveErr = 'HLS preview: ' + details;
             self._scheduleQooCamReconnect();
           });
           hls.loadSource(hlsUrl);
@@ -743,6 +755,8 @@ createApp({
       this._clearQooCamStallWatch();
       this._qoocamStallTime = -1;
       this._qoocamStallAt = Date.now();
+      this._qoocamStallNudges = 0;
+      this._qoocamMediaRecovered = false;
       this._qoocamStallTimer = setInterval(function () {
         if (!self._qoocamWhep || self.tab !== 'live' || !video) return;
         var t = video.currentTime || 0;
@@ -750,10 +764,20 @@ createApp({
         if (Math.abs(t - self._qoocamStallTime) > 0.05) {
           self._qoocamStallTime = t;
           self._qoocamStallAt = Date.now();
+          self._qoocamStallNudges = 0;
+          self._qoocamMediaRecovered = false;
           return;
         }
-        if (Date.now() - self._qoocamStallAt < 2500) return;
+        if (Date.now() - self._qoocamStallAt < 8000) return;
         self._qoocamStallAt = Date.now();
+        self._qoocamStallNudges = (self._qoocamStallNudges || 0) + 1;
+        if (self._qoocamStallNudges < 3 && self._qoocamWhep && self._qoocamWhep.startLoad) {
+          self.liveStatus = 'Preview catching up…';
+          try { self._qoocamWhep.startLoad(-1); } catch (ignored) {}
+          var play = video.play();
+          if (play && play.catch) play.catch(function () {});
+          return;
+        }
         self.liveStatus = 'Preview stalled, reloading…';
         self.reconnectQooCamPreview();
       }, 1000);

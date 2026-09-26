@@ -29,8 +29,8 @@
     }
     var ctx = this.ctx;
     if (!(video.readyState >= 2 && video.videoWidth && video.videoHeight)) {
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, size, size);
+      // Keep the last painted frame. Clearing here flashes black on every
+      // brief buffer gap, which is what a live-edge stall looks like.
       this.raf = requestAnimationFrame(this._draw);
       return;
     }
