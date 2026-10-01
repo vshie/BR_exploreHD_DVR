@@ -12,7 +12,7 @@ import json
 import logging
 import socket
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,14 @@ TARGET_HEIGHT = 1920
 TARGET_FPS = 30
 TARGET_BITRATE_MBPS = 15
 TARGET_RESOLUTION = f"{TARGET_HEIGHT}*{TARGET_WIDTH}"
+RTSP_PORT = 8554
+
+POWER_CYCLE_HINT = (
+    "Power cycle the QooCam with its circuit breaker in the topside "
+    "electrical box: switch it off, wait 10 seconds, switch it back on. "
+    "The camera takes about a minute to boot into Live; video resumes "
+    "automatically once it does."
+)
 
 
 def _osc(host: str, name: str, parameters: Dict[str, Any] | None = None,
@@ -46,12 +54,53 @@ def _osc(host: str, name: str, parameters: Dict[str, Any] | None = None,
         conn.close()
 
 
-def _rtsp_open(host: str, timeout: float = 2.0) -> bool:
+def rtsp_video_ready(host: str, port: int = RTSP_PORT, path: str = "/",
+                     timeout: float = 6.0) -> bool:
+    """True only when the camera answers DESCRIBE with a video track.
+
+    A TCP connect is not enough: a stalled encoder keeps 8554 listening and
+    answers OPTIONS, but DESCRIBE never returns. Call this only while no other
+    client (MediaMTX) holds the camera; a second session makes it drop both.
+    """
+    url = f"rtsp://{host}:{port}{path}"
+    request = (
+        f"DESCRIBE {url} RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Accept: application/sdp\r\n"
+        "User-Agent: BR_exploreHD_DVR\r\n\r\n"
+    ).encode("ascii")
+    deadline = time.monotonic() + timeout
     try:
-        with socket.create_connection((host, 8554), timeout=timeout):
-            return True
-    except OSError:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(request)
+            data = b""
+            body_len: Optional[int] = None
+            while time.monotonic() < deadline:
+                sock.settimeout(max(0.1, deadline - time.monotonic()))
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                head, sep, body = data.partition(b"\r\n\r\n")
+                if not sep:
+                    continue
+                if body_len is None:
+                    body_len = 0
+                    for line in head.split(b"\r\n")[1:]:
+                        key, _, value = line.partition(b":")
+                        if key.strip().lower() == b"content-length":
+                            body_len = int(value.strip() or 0)
+                if len(body) >= body_len:
+                    break
+    except (OSError, ValueError) as exc:
+        logger.debug("RTSP DESCRIBE %s failed: %s", url, exc)
         return False
+    head, _, body = data.partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].split()
+    ok = len(status) >= 2 and status[1] == b"200" and b"m=video" in body
+    if not ok:
+        logger.info("QooCam RTSP DESCRIBE returned no video: %r", head[:120])
+    return ok
 
 
 def configure_rtsp_preview(host: str, wait_s: float = 30.0) -> None:
@@ -94,8 +143,8 @@ def configure_rtsp_preview(host: str, wait_s: float = 30.0) -> None:
 
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if _rtsp_open(host):
-            logger.info("QooCam 4K/15 Mbps RTSP preview is listening")
+        if rtsp_video_ready(host, timeout=min(6.0, max(1.0, deadline - time.monotonic()))):
+            logger.info("QooCam 4K/15 Mbps RTSP preview is serving video")
             return
         time.sleep(1.0)
-    raise RuntimeError("QooCam RTSP did not return after encoder configuration")
+    raise RuntimeError("QooCam RTSP served no video after encoder configuration")

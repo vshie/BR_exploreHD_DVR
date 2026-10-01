@@ -12,7 +12,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from qoocam_control import configure_rtsp_preview
+from qoocam_control import POWER_CYCLE_HINT, configure_rtsp_preview
 from stream_sources import (
     list_direct_h264_rtsp_streams,
     qoocam_rtsp_url,
@@ -37,8 +37,11 @@ def run_boot_sequence(
 
     Stages:
       source_wait — polling configured RTSP hosts
-      source_error — no RTSP endpoint answered in time
-      ready — streams available; caller has started cloud relay
+      source_error — no RTSP endpoint answered in time, or it served no
+        video after the encoder restart (video_watchdog retries boot once
+        the camera serves video)
+      ready — camera answered DESCRIBE with video; caller has started cloud
+        relay
     """
     def _stage(name: str) -> str:
         if on_stage:
@@ -57,9 +60,8 @@ def run_boot_sequence(
         return (
             [],
             (
-                f"No reachable QooCam RTSP at {qoocam_rtsp_url()}. Confirm "
-                "the camera is powered and Live is running, or set "
-                "QOOCAM_RTSP_URL."
+                f"No reachable QooCam RTSP at {qoocam_rtsp_url()}. "
+                + POWER_CYCLE_HINT
             ),
             _stage("source_error"),
         )
@@ -73,7 +75,8 @@ def run_boot_sequence(
         logger.exception("Could not configure QooCam live encoder")
         return (
             [],
-            f"QooCam encoder configuration failed: {e}",
+            f"The QooCam is on the network but is not sending video ({e}). "
+            + POWER_CYCLE_HINT,
             _stage("source_error"),
         )
 

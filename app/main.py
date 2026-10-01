@@ -14,6 +14,7 @@ from flask import Flask, jsonify, request, send_file
 
 import cloud_relay
 import local_preview
+import video_watchdog
 from boot_manager import run_boot_sequence
 from settings_store import load_settings, save_settings
 from stream_sources import list_direct_h264_rtsp_streams
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.1.4-qoocam"
+VERSION = "1.1.5-qoocam"
 
 
 _boot_lock = threading.Lock()
@@ -76,6 +77,11 @@ def _start_cloud_from_boot_streams(streams: List[Dict[str, Any]]) -> None:
 def _boot_worker():
     global boot_stage, boot_error, streams_snapshot
     with _boot_lock:
+        # The encoder restart and DESCRIBE probe must be the camera's only
+        # RTSP client; on_streams resumes MediaMTX once video is confirmed.
+        local_preview.pause()
+        with _state_lock:
+            boot_error = None
         try:
             streams, err, stage = run_boot_sequence(
                 "",
@@ -99,6 +105,15 @@ def _boot_worker():
             with _state_lock:
                 boot_error = str(e)
                 boot_stage = "error"
+
+
+def _get_boot_stage() -> str:
+    with _state_lock:
+        return boot_stage
+
+
+def _start_boot_retry() -> None:
+    threading.Thread(target=_boot_worker, daemon=True, name="boot-retry").start()
 
 
 @app.route("/")
@@ -159,6 +174,7 @@ def route_status():
             "ingest": "direct-qoocam",
             "telemetry": telem,
             "cloud": cloud_summary,
+            "video": video_watchdog.status(),
         }
     )
     resp.headers["Cache-Control"] = "no-store"
@@ -308,10 +324,11 @@ def route_cloud_toggle():
 
 @app.route("/boot/retry", methods=["POST"])
 def route_boot_retry():
-    threading.Thread(target=_boot_worker, daemon=True, name="boot-retry").start()
+    _start_boot_retry()
     return jsonify({"success": True, "message": "Boot retry scheduled"})
 
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_worker, daemon=True, name="boot").start()
+    video_watchdog.start(_get_boot_stage, _boot_lock.locked, _start_boot_retry)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "4444")))

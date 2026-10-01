@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional
 
@@ -28,6 +29,11 @@ _lock = threading.RLock()
 _proc: Optional[subprocess.Popen] = None
 _rtsp_url = ""
 _last_error = ""
+_paused = False
+# Video is "online" only after MediaMTX logs that the camera's stream is
+# available; any source error on the path drops it again.
+_online = False
+_offline_since = time.monotonic()
 _recent_log: Deque[str] = deque(maxlen=40)
 
 
@@ -75,6 +81,15 @@ paths:
 """
 
 
+def _set_online(online: bool) -> None:
+    global _online, _offline_since
+    if online == _online:
+        return
+    _online = online
+    if not online:
+        _offline_since = time.monotonic()
+
+
 def _note(line: str) -> None:
     global _last_error
     with _lock:
@@ -82,6 +97,12 @@ def _note(line: str) -> None:
         low = line.lower()
         if " war " not in low and ("error" in low or "failed" in low):
             _last_error = line[:500]
+        if f"[path {SOURCE_PATH}]" in line:
+            if "stream is available and online" in line:
+                _set_online(True)
+                _last_error = ""
+            elif " ERR " in line or "stream is not available" in line:
+                _set_online(False)
 
 
 def _log_reader(proc: subprocess.Popen, prefix: str) -> None:
@@ -102,8 +123,9 @@ def _log_reader(proc: subprocess.Popen, prefix: str) -> None:
 
 def start(rtsp_url: str) -> bool:
     """Start or retain the bridge for *rtsp_url*."""
-    global _proc, _rtsp_url, _last_error
+    global _proc, _rtsp_url, _last_error, _paused
     with _lock:
+        _paused = False
         if _proc is not None and _proc.poll() is None and _rtsp_url == rtsp_url:
             return True
         stop()
@@ -144,6 +166,7 @@ def stop() -> None:
     with _lock:
         proc = _proc
         _proc = None
+        _set_online(False)
         if proc is None or proc.poll() is not None:
             return
         try:
@@ -155,14 +178,48 @@ def stop() -> None:
             logger.exception("Could not stop MediaMTX")
 
 
+def pause() -> None:
+    """Stop MediaMTX and keep it stopped so the camera has no RTSP client.
+
+    The video watchdog probes the camera directly while paused; ``resume``
+    (or ``start``) brings the bridge back.
+    """
+    global _paused
+    with _lock:
+        _paused = True
+        stop()
+
+
+def resume() -> bool:
+    with _lock:
+        url = _rtsp_url
+    return bool(url) and start(url)
+
+
 def ensure_running() -> bool:
     """Restart MediaMTX after an unexpected exit, retaining its source."""
     with _lock:
         url = _rtsp_url
         running = _proc is not None and _proc.poll() is None
+        paused = _paused
     if running:
         return True
+    if paused:
+        return False
     return bool(url) and start(url)
+
+
+def video_online() -> bool:
+    with _lock:
+        return _online and _proc is not None and _proc.poll() is None
+
+
+def offline_seconds() -> float:
+    """Seconds since video was last online (0 while online)."""
+    with _lock:
+        if _online:
+            return 0.0
+        return time.monotonic() - _offline_since
 
 
 def status() -> Dict[str, Any]:
@@ -171,6 +228,8 @@ def status() -> Dict[str, Any]:
         exit_code = None if _proc is None else _proc.poll()
         return {
             "running": running,
+            "paused": _paused,
+            "video_online": _online and running,
             "exit_code": exit_code,
             "rtsp_url": _rtsp_url,
             "local_rtsp_url": LOCAL_RTSP_URL,

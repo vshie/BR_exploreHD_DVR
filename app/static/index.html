@@ -291,6 +291,18 @@
         <a class="btn" v-else :href="mcmRoot" target="_blank" rel="noopener">Open MCM (6020)</a>
       </div>
     </div>
+    <div v-else-if="status.video?.power_cycle_needed" class="banner err">
+      <strong>No video from the QooCam</strong> — {{ status.video.message }}
+      <ol style="margin:8px 0 0 18px; padding:0">
+        <li>Open the topside electrical box.</li>
+        <li>Switch the QooCam circuit breaker off, wait 10 seconds, switch it back on.</li>
+        <li>Wait about a minute. Video resumes here automatically; no Retry needed.</li>
+      </ol>
+    </div>
+    <div v-else-if="status.video && ['no_video','recovering'].includes(status.video.state)" class="banner warn">
+      {{ status.video.message }}
+      <span class="muted">({{ Math.round(status.video.offline_s || 0) }} s without video)</span>
+    </div>
     <div v-else-if="status.streams_warning" class="banner warn">
       Only {{ status.streams_count }} H264 RTSP stream(s) from MCM (up to four expected).
     </div>
@@ -433,6 +445,7 @@
         <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · clock {{ status.telemetry?.cpu_clock_mhz }} MHz</div>
         <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
         <div class="muted">Boot stage: {{ status.boot_stage || '—' }} · streams: {{ status.streams_count || 0 }}</div>
+        <div class="muted" v-if="status.video">Video: {{ status.video.state }} · encoder restarts: {{ status.video.encoder_restarts }}</div>
         <div class="muted">
           Cloud relay:
           <span v-if="status.cloud?.enabled">

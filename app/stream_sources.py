@@ -23,7 +23,7 @@ DEFAULT_QOOCAM_STREAM_NAME = "QooCam 9"
 DEFAULT_QOOCAM_RTSP_URL = "rtsp://192.168.84.169:8554/"
 
 
-def _rtsp_tcp_open(rtsp_url: str, timeout: float = 2.0) -> bool:
+def rtsp_tcp_open(rtsp_url: str, timeout: float = 2.0) -> bool:
     try:
         parsed = urlparse(rtsp_url)
         host = parsed.hostname
@@ -54,7 +54,7 @@ def list_direct_h264_rtsp_streams(require_reachable: bool = True) -> List[Dict[s
     out: List[Dict[str, Any]] = []
     for i, src in enumerate(_configured_sources()):
         url = src["rtsp_url"]
-        reachable = _rtsp_tcp_open(url)
+        reachable = rtsp_tcp_open(url)
         if require_reachable and not reachable:
             continue
         out.append(
