@@ -106,6 +106,10 @@ def rtsp_video_ready(host: str, port: int = RTSP_PORT, path: str = "/",
 def configure_rtsp_preview(host: str, wait_s: float = 30.0) -> None:
     """Restart the camera's RTSP preview at 4K/15 Mbps.
 
+    Not called at boot or by the watchdog: on firmware U0U304 the start
+    command never answers and leaves the camera with no video until it is
+    power cycled. Kept for manual experiments only.
+
     ``camera.stopCapture`` does not apply to Live Pro RTSP mode.  The private
     OSC pair used by Kandao's own application is
     ``_stopRtspLivePreview`` / ``_startRtspLivePreview``.  Bitrate is supplied

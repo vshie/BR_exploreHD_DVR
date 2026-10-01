@@ -27,7 +27,7 @@ ENV QOOCAM_STREAM_NAME="QooCam 9"
 
 EXPOSE 4444 8888
 
-LABEL version="1.1.5-qoocam"
+LABEL version="1.1.6-qoocam"
 
 ARG IMAGE_NAME
 LABEL permissions='\

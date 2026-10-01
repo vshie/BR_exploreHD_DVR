@@ -7,13 +7,15 @@ When video has been missing for ``QOOCAM_STALL_S`` it:
 
 1. pauses MediaMTX so the camera has no RTSP client, then probes DESCRIBE
    directly; if the camera serves video, MediaMTX is resumed;
-2. otherwise restarts the camera's RTSP encoder once over OSC;
-3. if video still does not come back, reports ``stalled`` with instructions
+2. otherwise reports ``stalled`` with instructions
    to power cycle the camera at its breaker, and keeps probing every
    ``QOOCAM_PROBE_S`` so video resumes on its own after the power cycle.
 
 If boot failed because the camera never answered, the watchdog re-runs boot
 as soon as the camera serves video.
+
+It never restarts the camera's encoder over OSC: on this firmware
+``camera._startRtspLivePreview`` is what leaves the camera stalled.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 import local_preview
-from qoocam_control import POWER_CYCLE_HINT, configure_rtsp_preview, rtsp_video_ready
+from qoocam_control import POWER_CYCLE_HINT, rtsp_video_ready
 from stream_sources import qoocam_rtsp_url, rtsp_tcp_open
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,6 @@ _thread: Optional[threading.Thread] = None
 _state = "waiting"
 _message = ""
 _since = time.monotonic()
-_encoder_restarts = 0
 _power_cycle_needed = False
 
 
@@ -70,7 +71,6 @@ def status() -> Dict[str, Any]:
             "message": _message,
             "power_cycle_needed": _power_cycle_needed,
             "offline_s": round(local_preview.offline_seconds(), 1),
-            "encoder_restarts": _encoder_restarts,
             "state_age_s": round(time.monotonic() - _since, 1),
         }
 
@@ -98,7 +98,6 @@ class _Watchdog:
         self.get_stage = get_stage
         self.boot_busy = boot_busy
         self.retry_boot = retry_boot
-        self.encoder_tried = False
         self.recoveries = 0
         self.next_probe = 0.0
 
@@ -108,18 +107,6 @@ class _Watchdog:
         time.sleep(2.0)
         return rtsp_video_ready(host)
 
-    def _restart_encoder(self, host: str) -> bool:
-        global _encoder_restarts
-        self.encoder_tried = True
-        with _lock:
-            _encoder_restarts += 1
-        try:
-            configure_rtsp_preview(host)
-            return True
-        except Exception as exc:
-            logger.warning("QooCam encoder restart did not bring video back: %s", exc)
-            return False
-
     def _recover(self, host: str) -> None:
         _set("recovering", "Video stopped; reconnecting to the QooCam.")
         if self.recoveries < MAX_RECOVERIES and self._probe_direct(host):
@@ -128,13 +115,6 @@ class _Watchdog:
             local_preview.resume()
             _restart_clock()
             return
-        if not self.encoder_tried:
-            _set("recovering", "Video stopped; restarting the QooCam live encoder.")
-            if self._restart_encoder(host):
-                self.recoveries = 0
-                local_preview.resume()
-                _restart_clock()
-                return
         self._enter_stuck(host)
 
     def _enter_stuck(self, host: str) -> None:
@@ -150,7 +130,6 @@ class _Watchdog:
         if rtsp_video_ready(host):
             logger.info("QooCam is serving video again; resuming MediaMTX")
             self.recoveries = 0
-            self.encoder_tried = False
             _set("recovering", "QooCam is back; reconnecting video.")
             local_preview.resume()
         else:
@@ -164,7 +143,6 @@ class _Watchdog:
         local_preview.pause()
         if rtsp_video_ready(host):
             logger.info("QooCam is serving video; re-running boot")
-            self.encoder_tried = False
             self.recoveries = 0
             _set("recovering", "QooCam is back; restarting video.")
             self.retry_boot()
@@ -188,9 +166,6 @@ class _Watchdog:
             if _state != "ok":
                 _set("ok")
             self.recoveries = 0
-            # Allow another encoder restart only after a healthy stretch.
-            if time.monotonic() - _since > 5 * 60:
-                self.encoder_tried = False
             return
 
         if _state in ("stalled", "unreachable"):

@@ -445,7 +445,7 @@
         <div class="muted">CPU {{ status.telemetry?.cpu_temp_c }}°C · load {{ status.telemetry?.cpu_load_avg }} · clock {{ status.telemetry?.cpu_clock_mhz }} MHz</div>
         <div class="muted">Time sync: {{ status.telemetry?.time_synced }} · {{ status.telemetry?.system_time }}</div>
         <div class="muted">Boot stage: {{ status.boot_stage || '—' }} · streams: {{ status.streams_count || 0 }}</div>
-        <div class="muted" v-if="status.video">Video: {{ status.video.state }} · encoder restarts: {{ status.video.encoder_restarts }}</div>
+        <div class="muted" v-if="status.video">Video: {{ status.video.state }}</div>
         <div class="muted">
           Cloud relay:
           <span v-if="status.cloud?.enabled">

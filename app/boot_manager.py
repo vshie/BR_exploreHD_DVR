@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from qoocam_control import POWER_CYCLE_HINT, configure_rtsp_preview
+from qoocam_control import POWER_CYCLE_HINT, rtsp_video_ready
 from stream_sources import (
     list_direct_h264_rtsp_streams,
     qoocam_rtsp_url,
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_POLL_S = float(os.environ.get("QOOCAM_POLL_INTERVAL_S", "2"))
 SOURCE_MAX_WAIT_S = float(os.environ.get("QOOCAM_MAX_WAIT_S", "60"))
+VIDEO_MAX_WAIT_S = float(os.environ.get("QOOCAM_VIDEO_WAIT_S", "90"))
 
 StageCallback = Optional[Callable[[str], None]]
 StreamsCallback = Optional[Callable[[List[Dict[str, Any]]], None]]
@@ -38,7 +40,7 @@ def run_boot_sequence(
     Stages:
       source_wait — polling configured RTSP hosts
       source_error — no RTSP endpoint answered in time, or it served no
-        video after the encoder restart (video_watchdog retries boot once
+        video within QOOCAM_VIDEO_WAIT_S (video_watchdog retries boot once
         the camera serves video)
       ready — camera answered DESCRIBE with video; caller has started cloud
         relay
@@ -69,24 +71,21 @@ def run_boot_sequence(
     host = urlparse(streams[0]["rtsp_url"]).hostname
     if not host:
         return [], "Discovered QooCam RTSP URL has no host", _stage("source_error")
-    try:
-        configure_rtsp_preview(host)
-    except Exception as e:
-        logger.exception("Could not configure QooCam live encoder")
-        return (
-            [],
-            f"The QooCam is on the network but is not sending video ({e}). "
-            + POWER_CYCLE_HINT,
-            _stage("source_error"),
-        )
-
-    streams = list_direct_h264_rtsp_streams(require_reachable=True)
-    if not streams:
-        return (
-            [],
-            "QooCam RTSP disappeared after encoder configuration",
-            _stage("source_error"),
-        )
+    # Do not restart the camera's encoder over OSC here. On this firmware
+    # camera._startRtspLivePreview never answers and leaves 8554 open with
+    # no video until the camera is power cycled. The camera's own Live
+    # settings (3840x1920, ~10 Mbps) are what we want; just wait for video.
+    deadline = time.monotonic() + VIDEO_MAX_WAIT_S
+    while not rtsp_video_ready(host):
+        if time.monotonic() >= deadline:
+            return (
+                [],
+                "The QooCam is on the network but is not sending video. "
+                + POWER_CYCLE_HINT,
+                _stage("source_error"),
+            )
+        logger.info("QooCam RTSP is open but serves no video yet; waiting")
+        time.sleep(SOURCE_POLL_S)
 
     logger.info(
         "Direct RTSP ready: %s",

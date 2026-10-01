@@ -10,7 +10,7 @@ On **`qoocam`**, the extension **does not use MCM / BlueOS Video Streams**. It p
 |---------|---------|
 | Source | Fixed QooCam RTSP `rtsp://192.168.84.169:8554/` (`QOOCAM_RTSP_URL`) |
 | Stream name | `QooCam 9` → RTMP key `bom_cam09` (`QOOCAM_STREAM_NAME`) |
-| Version | `1.1.5-qoocam` |
+| Version | `1.1.6-qoocam` |
 | Docker tag after push | `qoocam` |
 
 Keep the camera on **Live** with Ethernet; no MCM stream entry is required.
@@ -18,7 +18,8 @@ The extension runs a local MediaMTX bridge (HLS/fMP4 on TCP 8888). It remuxes
 the camera's original 3840×1920 H.264 stream to both the browser and cloud
 relay without transcoding, so the camera only ever has one RTSP client. The
 HLS playlist keeps 12 seconds and the browser plays about 7 seconds behind
-live. On boot the extension sets that preview to 15 Mbps. The browser shows both
+live. The extension uses the camera's own Live encoder settings and never
+restarts the encoder (that stalls this firmware). The browser shows both
 lenses side by side at the window height, Up on the left and Down on the right.
 
 ### Video watchdog
@@ -26,9 +27,8 @@ lenses side by side at the window height, Up on the left and Down on the right.
 The QooCam can stall with its RTSP port still open: it answers `OPTIONS` but
 never `DESCRIBE`, so no video flows. Boot is only `ready` once `DESCRIBE`
 returns an SDP with a video track. After that, if MediaMTX has no video for
-45 s (`QOOCAM_STALL_S`), the extension pauses MediaMTX, probes the camera
-directly, and restarts the camera's live encoder once over OSC. If video still
-does not return, the UI shows a red banner telling the operator to **power
+45 s (`QOOCAM_STALL_S`), the extension pauses MediaMTX and probes the camera
+directly. If the camera is not serving video, the UI shows a red banner telling the operator to **power
 cycle the QooCam with its circuit breaker in the topside electrical box**. The
 extension keeps probing every 15 s (`QOOCAM_PROBE_S`) and resumes video on its
 own once the camera is back; no Retry is needed. `/status` reports this under
