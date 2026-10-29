@@ -73,6 +73,7 @@ What each piece does:
 | `PORT` | `4444` | Flask listen port (override if needed) |
 | `MCM_POLL_INTERVAL_S` | `1` | MCM `/streams` poll interval during boot |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
+| `DWEOS_BASE` | `http://127.0.0.1:8000` | DWE OS REST base URL (used to set camera bitrate) |
 
 ## API
 
@@ -83,6 +84,57 @@ What each piece does:
 - `GET /cloud/status` — per-cam RTMP relay state, restart counts, errors.
 - `POST /cloud/toggle` — body `{"enabled": true|false}` — flip the persisted toggle and start/stop the relay.
 - `POST /boot/retry` — re-run MCM discovery + relay start (e.g. after fixing MCM).
+
+## Remote control API
+
+For a cloud server process on the same ZeroTier/Tailscale network. There is
+**no authentication**: anything that can reach port 4444 can use it. Streams
+are addressed by their RTMP stream key (`bom_camNN`, see below).
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| GET | `/api/streams` | — | All streams |
+| GET | `/api/streams/<key>` | — | One stream (404 if unknown) |
+| POST | `/api/streams/<key>/start` | — | Resume cloud upload for this stream |
+| POST | `/api/streams/<key>/stop` | — | Stop cloud upload for this stream |
+| POST | `/api/streams/<key>/bitrate` | `{"mbps": 1-10}` | Set the camera's H.264 bitrate |
+
+- **Start/stop is sticky.** By default every stream uploads. A stop is saved
+  in the settings file and survives extension restarts and Pi reboots until a
+  start. It only stops this extension's RTMP push; the camera, MCM and the
+  local Live view keep running. The global Cloud toggle still applies: a
+  stream uploads only when both are on.
+- **Bitrate goes through DWE OS** (`DWEOS_BASE`), which owns the exploreHD
+  camera controls and re-applies them when a camera reconnects. The change is
+  applied live, confirmed by reading it back, and saved here too; at startup
+  the extension re-applies the saved value if DWE OS reports something else.
+  Returns 400 outside 1–10 Mbps and 502 if DWE OS can't be reached or doesn't
+  confirm the value (the value is then not saved).
+
+Each stream object:
+
+```json
+{
+  "stream_key": "bom_cam05", "name": "exploreHD 5", "stream_id": "…",
+  "enabled": true, "relay_state": "running",
+  "relay_restarts": 0, "relay_error": "",
+  "bitrate_mbps_desired": 5.0, "bitrate_mbps_camera": 5.0,
+  "bus_info": "usb-0000:01:00.0-1.2", "device_path": "/dev/video2",
+  "dweos_ok": true, "last_error": ""
+}
+```
+
+`relay_state` is one of `running`, `restarting`, `waiting_for_rtmp_release`,
+`error`, `skipped`, `disabled` (stopped via this API), or `off` (global Cloud
+toggle off).
+
+```bash
+PI=http://<vehicle-vpn-ip>:4444
+curl $PI/api/streams
+curl -X POST $PI/api/streams/bom_cam05/stop
+curl -X POST $PI/api/streams/bom_cam05/start
+curl -X POST -H 'Content-Type: application/json' -d '{"mbps": 4}' $PI/api/streams/bom_cam05/bitrate
+```
 
 ## Cloud RTMP relay
 

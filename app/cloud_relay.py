@@ -235,6 +235,9 @@ class Relay:
         self.stream = stream
         self.stream_key = _stream_key_for_stream(index, stream) or ""
         self.rtmp_url = _rtmp_url_for_key(self.stream_key) or ""
+        # Per-stream sticky toggle from the remote control API. A disabled
+        # relay is never started and reports state "disabled".
+        self.enabled = _stream_enabled(self.stream_key)
 
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
@@ -603,7 +606,8 @@ class Relay:
             "rtsp_url": self.stream.get("rtsp_url"),
             "stream_key": self.stream_key,
             "rtmp_url": self.rtmp_url,
-            "state": self.state,
+            "enabled": self.enabled,
+            "state": self.state if self.enabled else "disabled",
             "last_error": self.last_error,
             "ff_errors": self.ff_errors,
             "restart_count": self.restart_count,
@@ -650,9 +654,22 @@ class RelayManager:
     def start_all(self):
         if not self.relays:
             return
-        logger.info(f"Starting {len(self.relays)} cloud relay(s) → {RTMP_BASE_URL}")
+        enabled = [r for r in self.relays if r.enabled]
+        logger.info(
+            f"Starting {len(enabled)} of {len(self.relays)} cloud relay(s) "
+            f"→ {RTMP_BASE_URL}"
+        )
         for r in self.relays:
-            r.start()
+            if r.enabled:
+                r.start()
+            else:
+                logger.info(f"[relay{r.index}] {r.stream_key} disabled via API; not starting")
+
+    def find(self, stream_key: str) -> Optional[Relay]:
+        for r in self.relays:
+            if r.stream_key == stream_key:
+                return r
+        return None
 
     def stop_all(self):
         for r in self.relays:
@@ -680,6 +697,68 @@ def _read_enabled() -> bool:
         return bool(load_settings().get("cloud_relay_enabled", True))
     except Exception:
         return True
+
+
+def _stream_enabled(stream_key: str) -> bool:
+    """Per-stream sticky toggle; streams without an entry are enabled."""
+    if not stream_key:
+        return True
+    try:
+        from settings_store import get_stream_prefs  # local import on purpose
+        return bool(get_stream_prefs(stream_key).get("enabled", True))
+    except Exception:
+        return True
+
+
+def stream_entries() -> List[Dict[str, Any]]:
+    """Current MCM streams with their RTMP keys, whether or not the relay
+    is running. Keys are computed exactly as RelayManager does."""
+    with _lock:
+        provider = _streams_provider
+    streams = (provider() if provider else None) or []
+    out = []
+    for i, s in enumerate(streams):
+        key = _stream_key_for_stream(i, s)
+        if key:
+            out.append({**s, "stream_key": key})
+    return out
+
+
+def relay_status(stream_key: str) -> Optional[Dict[str, Any]]:
+    with _lock:
+        mgr = _manager
+    relay = mgr.find(stream_key) if mgr is not None else None
+    return relay.status_dict() if relay is not None else None
+
+
+def start_stream(stream_key: str) -> None:
+    """Enable one stream (sticky) and start its relay if the relay is on."""
+    from settings_store import set_stream_pref
+    set_stream_pref(stream_key, enabled=True)
+    with _lock:
+        mgr = _manager
+    relay = mgr.find(stream_key) if mgr is not None else None
+    if relay is not None:
+        relay.enabled = True
+        relay.start()
+        logger.info(f"[relay{relay.index}] {stream_key} enabled via API")
+    elif _read_enabled():
+        # Relay on but this stream had no manager yet (e.g. none existed
+        # because every stream was disabled at boot).
+        start_now()
+
+
+def stop_stream(stream_key: str) -> None:
+    """Disable one stream (sticky) and stop its relay."""
+    from settings_store import set_stream_pref
+    set_stream_pref(stream_key, enabled=False)
+    with _lock:
+        mgr = _manager
+    relay = mgr.find(stream_key) if mgr is not None else None
+    if relay is not None:
+        relay.enabled = False
+        relay.stop()
+        logger.info(f"[relay{relay.index}] {stream_key} disabled via API")
 
 
 def configure(streams_provider: Callable[[], List[Dict[str, Any]]]) -> None:
@@ -750,6 +829,7 @@ def status() -> Dict[str, Any]:
     enabled = _read_enabled()
     cams = mgr.status() if mgr is not None else []
     streaming = sum(1 for c in cams if c.get("state") == "running")
+    disabled = sum(1 for c in cams if not c.get("enabled", True))
     waiting = sum(
         1 for c in cams if c.get("state") == "waiting_for_rtmp_release"
     )
@@ -769,6 +849,7 @@ def status() -> Dict[str, Any]:
         "cams": cams,
         "streaming_count": streaming,
         "waiting_for_rtmp_release_count": waiting,
+        "disabled_count": disabled,
         "total_count": len(cams),
         "total_restarts": total_restarts,
         "total_stale_publisher_waits": total_stale_waits,
@@ -792,6 +873,7 @@ def summary() -> Dict[str, Any]:
         "running": st["running"],
         "streaming_count": st["streaming_count"],
         "waiting_for_rtmp_release_count": st["waiting_for_rtmp_release_count"],
+        "disabled_count": st["disabled_count"],
         "total_count": st["total_count"],
         "total_restarts": st["total_restarts"],
         "total_stale_publisher_waits": st["total_stale_publisher_waits"],

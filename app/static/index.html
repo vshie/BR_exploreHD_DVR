@@ -297,6 +297,7 @@
               <th>Stream key</th>
               <th>Source RTSP</th>
               <th>State</th>
+              <th>Bitrate</th>
               <th>Restarts</th>
               <th>Last error</th>
             </tr>
@@ -312,7 +313,7 @@
                   :class="{
                     run: c.state==='running',
                     bad: c.state==='error' || c.state==='skipped',
-                    warn: c.state==='waiting_for_rtmp_release'
+                    warn: c.state==='waiting_for_rtmp_release' || c.state==='disabled'
                   }"
                   :title="c.state==='waiting_for_rtmp_release' ? 'Upstream RTMP server still holds the previous publisher session for this stream key — waiting it out before retrying.' : ''"
                 >
@@ -330,6 +331,17 @@
                 >
                   ({{ c.stale_publisher_waits }} RTMP release wait{{ c.stale_publisher_waits === 1 ? '' : 's' }})
                 </span>
+                <div v-if="c.state==='disabled'" class="muted" style="font-size:0.8rem">stopped via remote API</div>
+              </td>
+              <td>
+                <template v-if="cloud.api[c.stream_key]">
+                  <span v-if="cloud.api[c.stream_key].bitrate_mbps_camera != null">{{ cloud.api[c.stream_key].bitrate_mbps_camera }} Mbps</span>
+                  <span v-else class="muted">—</span>
+                  <div v-if="cloud.api[c.stream_key].bitrate_mbps_desired != null" class="muted" style="font-size:0.8rem">
+                    set {{ cloud.api[c.stream_key].bitrate_mbps_desired }} via API
+                  </div>
+                </template>
+                <span v-else class="muted">—</span>
               </td>
               <td>{{ c.restart_count || 0 }}</td>
               <td class="muted" style="color:var(--err)">{{ c.last_error || '' }}</td>
@@ -393,6 +405,9 @@ createApp({
       // server-side.
       cloud: {
         form: { enabled: true },
+        // /api/streams by stream key: bitrate from DWE OS (polled slower).
+        api: {},
+        apiTick: 0,
         server: {
           enabled: true,
           running: false,
@@ -720,6 +735,15 @@ createApp({
         const j = await r.json();
         this._applyCloudPayload(j);
         this.cloud.loadError = '';
+        // Bitrate comes from DWE OS; every 5th poll (~10 s) is plenty.
+        if (this.cloud.apiTick++ % 5 === 0) {
+          const a = await fetch('/api/streams');
+          if (a.ok) {
+            const map = {};
+            for (const s of ((await a.json()).streams || [])) map[s.stream_key] = s;
+            this.cloud.api = map;
+          }
+        }
       } catch (e) {
         this.cloud.loadError = String(e);
       }

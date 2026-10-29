@@ -53,6 +53,32 @@ def _is_h264_stream(stream_info: Dict[str, Any]) -> bool:
     return False
 
 
+def _video_source_identity(vas: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Device path and USB bus info of a local (V4L2) MCM source.
+
+    MCM reports e.g. ``{"Local": {"device_path": "/dev/video2",
+    "typ": {"Usb": "usb-0000:01:00.0-1.2"}}}``. The USB string is the V4L2
+    ``bus_info``, which is also how DWE OS identifies a camera.
+    """
+    src = vas.get("video_source") or {}
+    local = src.get("Local") if isinstance(src, dict) else None
+    if not isinstance(local, dict):
+        return {"device_path": None, "bus_info": None}
+    typ = local.get("typ")
+    bus_info = None
+    if isinstance(typ, dict):
+        usb = typ.get("Usb")
+        if isinstance(usb, str):
+            bus_info = usb
+        elif isinstance(usb, dict):
+            bus_info = usb.get("bus_info") or usb.get("usb_bus")
+    device_path = local.get("device_path")
+    return {
+        "device_path": device_path if isinstance(device_path, str) else None,
+        "bus_info": bus_info if isinstance(bus_info, str) else None,
+    }
+
+
 def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> Optional[Dict[str, Any]]:
     """Return normalized stream dict or None if unusable for H264 RTSP recording."""
     try:
@@ -78,6 +104,7 @@ def parse_stream_status(item: Dict[str, Any], base: str = DEFAULT_MCM_BASE) -> O
             "running": bool(item.get("running")),
             "state": item.get("state"),
             "error": item.get("error"),
+            **_video_source_identity(vas),
         }
     except Exception as e:
         logger.warning(f"Failed to parse stream entry: {e}")

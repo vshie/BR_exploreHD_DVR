@@ -21,7 +21,7 @@ ENV FLASK_APP=main.py
 
 EXPOSE 4444
 
-LABEL version="1.0.41"
+LABEL version="1.0.43"
 
 ARG IMAGE_NAME
 LABEL permissions='\

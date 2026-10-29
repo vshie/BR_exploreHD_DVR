@@ -14,9 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, jsonify, request, send_file
 
 import cloud_relay
+import dweos_client
 from boot_manager import run_boot_sequence
 from mcm_client import DEFAULT_MCM_BASE, fetch_streams_raw, kick_streams, list_h264_rtsp_streams
-from settings_store import load_settings, save_settings
+from settings_store import get_stream_prefs, load_settings, save_settings, set_stream_pref
 from system_telemetry import get_all_telemetry
 
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-VERSION = "1.0.42"
+VERSION = "1.0.43"
 
 MCM_BASE = os.environ.get("MCM_BASE", DEFAULT_MCM_BASE).rstrip("/")
 
@@ -35,6 +36,12 @@ _state_lock = threading.Lock()
 boot_stage = "starting"
 boot_error: Optional[str] = None
 streams_snapshot: List[Dict[str, Any]] = []
+# Last bitrate failure per stream key (DWE OS unreachable, read-back mismatch).
+_bitrate_errors: Dict[str, str] = {}
+
+# DWE OS may come up after us; keep trying to re-apply saved bitrates.
+BITRATE_REAPPLY_ATTEMPTS = 12
+BITRATE_REAPPLY_INTERVAL_S = 10.0
 
 
 def _set_boot_stage(stage: str) -> None:
@@ -87,11 +94,99 @@ def _boot_worker():
                 cloud_relay.start_if_enabled()
             except Exception:
                 logger.exception("Cloud relay start_if_enabled failed at boot")
+            threading.Thread(
+                target=_reapply_saved_bitrates, daemon=True, name="bitrate-reapply"
+            ).start()
         except Exception as e:
             logger.exception("Boot worker failed")
             with _state_lock:
                 boot_error = str(e)
                 boot_stage = "error"
+
+
+def _reapply_saved_bitrates() -> None:
+    """Make each camera match the bitrate last set through the API.
+
+    DWE OS normally re-applies it itself; this covers a DWE OS reset or a
+    swapped camera. Failures are recorded per stream and never block the relay.
+    """
+    pending = {
+        e["stream_key"]: e
+        for e in cloud_relay.stream_entries()
+        if get_stream_prefs(e["stream_key"]).get("bitrate_mbps") is not None
+    }
+    for attempt in range(BITRATE_REAPPLY_ATTEMPTS):
+        for key, entry in list(pending.items()):
+            want = get_stream_prefs(key)["bitrate_mbps"]
+            try:
+                have = dweos_client.get_bitrate(entry.get("bus_info"), entry.get("device_path"))
+                if abs(have - want) > 0.05:
+                    logger.info("Re-applying %s bitrate %.2f Mbps (camera at %.2f)", key, want, have)
+                    dweos_client.set_bitrate(entry.get("bus_info"), want, entry.get("device_path"))
+                _bitrate_errors.pop(key, None)
+                del pending[key]
+            except Exception as e:
+                _bitrate_errors[key] = str(e)
+        if not pending:
+            return
+        time.sleep(BITRATE_REAPPLY_INTERVAL_S)
+    for key, err in ((k, _bitrate_errors.get(k)) for k in pending):
+        logger.error("Could not re-apply saved bitrate for %s: %s", key, err)
+
+
+def _stream_object(entry: Dict[str, Any], devices: Optional[List[Dict[str, Any]]],
+                   dweos_error: Optional[str]) -> Dict[str, Any]:
+    key = entry["stream_key"]
+    prefs = get_stream_prefs(key)
+    relay = cloud_relay.relay_status(key)
+    camera_mbps = None
+    error = _bitrate_errors.get(key) or dweos_error
+    if devices is not None:
+        try:
+            device = dweos_client.find_device(entry.get("bus_info"), entry.get("device_path"), devices)
+            camera_mbps = float(dweos_client.bitrate_control(device).get("value"))
+        except Exception as e:
+            error = error or str(e)
+    if relay is not None:
+        relay_state = relay["state"]
+    elif not prefs["enabled"]:
+        relay_state = "disabled"
+    else:
+        relay_state = "off" if not cloud_relay.is_running() else "idle"
+    return {
+        "stream_key": key,
+        "name": entry.get("name"),
+        "stream_id": entry.get("stream_id"),
+        "enabled": prefs["enabled"],
+        "relay_state": relay_state,
+        "relay_restarts": relay["restart_count"] if relay else 0,
+        "relay_error": relay["last_error"] if relay else "",
+        "bitrate_mbps_desired": prefs["bitrate_mbps"],
+        "bitrate_mbps_camera": camera_mbps,
+        "bus_info": entry.get("bus_info"),
+        "device_path": entry.get("device_path"),
+        "dweos_ok": devices is not None,
+        "last_error": error or "",
+    }
+
+
+def _dweos_devices() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    try:
+        return dweos_client.list_devices(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _find_entry(stream_key: str) -> Optional[Dict[str, Any]]:
+    for e in cloud_relay.stream_entries():
+        if e["stream_key"] == stream_key:
+            return e
+    return None
+
+
+def _unknown_stream(stream_key: str):
+    known = [e["stream_key"] for e in cloud_relay.stream_entries()]
+    return jsonify({"success": False, "message": f"Unknown stream {stream_key!r}", "streams": known}), 404
 
 
 @app.route("/")
@@ -311,6 +406,84 @@ def route_cloud_toggle():
         "cloud_relay_enabled": merged.get("cloud_relay_enabled", new),
         "cloud": cloud_relay.summary(),
     })
+
+
+# ---------------------------------------------------------------------------
+# Remote control API for the cloud server (ZeroTier/Tailscale; no auth).
+# Streams are addressed by RTMP stream key, e.g. bom_cam05.
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/streams", methods=["GET"])
+def api_streams():
+    devices, err = _dweos_devices()
+    return jsonify({
+        "success": True,
+        "cloud_relay_enabled": bool(load_settings().get("cloud_relay_enabled", True)),
+        "streams": [_stream_object(e, devices, err) for e in cloud_relay.stream_entries()],
+    })
+
+
+@app.route("/api/streams/<stream_key>", methods=["GET"])
+def api_stream(stream_key: str):
+    entry = _find_entry(stream_key)
+    if entry is None:
+        return _unknown_stream(stream_key)
+    devices, err = _dweos_devices()
+    return jsonify({"success": True, "stream": _stream_object(entry, devices, err)})
+
+
+@app.route("/api/streams/<stream_key>/start", methods=["POST"])
+def api_stream_start(stream_key: str):
+    entry = _find_entry(stream_key)
+    if entry is None:
+        return _unknown_stream(stream_key)
+    cloud_relay.start_stream(stream_key)
+    devices, err = _dweos_devices()
+    return jsonify({"success": True, "stream": _stream_object(entry, devices, err)})
+
+
+@app.route("/api/streams/<stream_key>/stop", methods=["POST"])
+def api_stream_stop(stream_key: str):
+    entry = _find_entry(stream_key)
+    if entry is None:
+        return _unknown_stream(stream_key)
+    cloud_relay.stop_stream(stream_key)
+    devices, err = _dweos_devices()
+    return jsonify({"success": True, "stream": _stream_object(entry, devices, err)})
+
+
+@app.route("/api/streams/<stream_key>/bitrate", methods=["POST"])
+def api_stream_bitrate(stream_key: str):
+    entry = _find_entry(stream_key)
+    if entry is None:
+        return _unknown_stream(stream_key)
+    data = request.get_json(silent=True) or {}
+    mbps = data.get("mbps")
+    if isinstance(mbps, bool) or not isinstance(mbps, (int, float)) or not (
+        dweos_client.BITRATE_MIN_MBPS <= mbps <= dweos_client.BITRATE_MAX_MBPS
+    ):
+        return jsonify({
+            "success": False,
+            "message": (
+                f"Body must be {{\"mbps\": number}} with "
+                f"{dweos_client.BITRATE_MIN_MBPS:g}-{dweos_client.BITRATE_MAX_MBPS:g}"
+            ),
+        }), 400
+    try:
+        dweos_client.set_bitrate(entry.get("bus_info"), float(mbps), entry.get("device_path"))
+    except dweos_client.DweOsError as e:
+        _bitrate_errors[stream_key] = str(e)
+        devices, err = _dweos_devices()
+        return jsonify({
+            "success": False,
+            "message": str(e),
+            "stream": _stream_object(entry, devices, err),
+        }), 502
+    set_stream_pref(stream_key, bitrate_mbps=float(mbps))
+    _bitrate_errors.pop(stream_key, None)
+    devices, err = _dweos_devices()
+    return jsonify({"success": True, "stream": _stream_object(entry, devices, err)})
 
 
 @app.route("/boot/retry", methods=["POST"])
