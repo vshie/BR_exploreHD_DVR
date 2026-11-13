@@ -73,7 +73,8 @@ What each piece does:
 | `PORT` | `4444` | Flask listen port (override if needed) |
 | `MCM_POLL_INTERVAL_S` | `1` | MCM `/streams` poll interval during boot |
 | `MCM_MAX_WAIT_S` | `60` | Max wait polling `/streams` at boot |
-| `DWEOS_BASE` | `http://127.0.0.1:8000` | DWE OS REST base URL (used to set camera bitrate) |
+| `DWEOS_BASE` | *(auto)* | DWE OS REST base URL (used to set camera bitrate). Leave unset: DWE OS's port changes between boots, so it is discovered from the BlueOS helper. Set only to pin a fixed URL. |
+| `BLUEOS_HELPER_BASE` | `http://127.0.0.1:81` | BlueOS helper, whose `/v1.0/web_services` list is used to find DWE OS's current port |
 
 ## API
 
@@ -104,8 +105,10 @@ are addressed by their RTMP stream key (`bom_camNN`, see below).
   start. It only stops this extension's RTMP push; the camera, MCM and the
   local Live view keep running. The global Cloud toggle still applies: a
   stream uploads only when both are on.
-- **Bitrate goes through DWE OS** (`DWEOS_BASE`), which owns the exploreHD
-  camera controls and re-applies them when a camera reconnects. The change is
+- **Bitrate goes through DWE OS**, which owns the exploreHD camera controls
+  and re-applies them when a camera reconnects. DWE OS gets a different port
+  on each boot, so the extension looks it up in the BlueOS helper's service
+  list, caches it, and looks again if a request fails. The change is
   applied live, confirmed by reading it back, and saved here too; at startup
   the extension re-applies the saved value if DWE OS reports something else.
   Returns 400 outside 1–10 Mbps and 502 if DWE OS can't be reached or doesn't
